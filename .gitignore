@@ -1,0 +1,26 @@
+# Dependencies
+node_modules/
+
+# Build output (this package ships TS source directly via pi.extensions)
+dist/
+build/
+
+# Test output
+coverage/
+*.log
+
+# Editor / OS
+.DS_Store
+.vscode/
+.idea/
+*.swp
+
+# pi runtime state (skills + prompts ARE committed; runtime artefacts are not)
+.pi/subagent-schedules/
+.pi/proposal-queue.json
+.pi/flows/agents/
+.pi/flows/results/
+
+# Local environment
+.env
+.env.local
