@@ -393,8 +393,51 @@ export async function runAgentTool(
         const entry = mapSessionEventToEntry(event);
         if (entry) entries.push(entry);
       } else if (event.type === "message_end") {
-        if ((event.message as { role: string }).role === "assistant") {
+        const msg = event.message as { role: string; content?: unknown };
+        if (msg.role === "assistant") {
           turnCount += 1;
+          // Backfill text / thinking entries from message_end content blocks
+          // when streaming `text_end` / `thinking_end` events were NOT
+          // emitted. Some providers (e.g. DeepSeek non-streaming responses)
+          // deliver the entire assistant message in `message_end` only,
+          // never firing the streaming end events. Without this backfill
+          // the timeline shows only tools + reasoning, never assistant
+          // text — and `lastAssistantText(entries)` returns undefined,
+          // making the final result `"(no output)"`.
+          //
+          // Mirror of the same pattern in pi-flows' execution.ts.
+          if (Array.isArray(msg.content)) {
+            // Detect whether the streaming events already pushed these
+            // blocks: walk back through entries and count how many
+            // contiguous text/thinking entries match the suffix of the
+            // message content. If the streaming path already added them,
+            // skip the backfill to avoid duplicates.
+            const textBlocks = msg.content.filter(
+              (b: { type?: string }) => b && (b.type === "text" || b.type === "thinking"),
+            ) as Array<{ type: string; text?: string; thinking?: string; redacted?: boolean }>;
+            // Count contiguous trailing text/thinking entries (excluding tool/error).
+            let trailingNonToolCount = 0;
+            for (let i = entries.length - 1; i >= 0; i--) {
+              const e = entries[i];
+              if (e && (e.kind === "text" || e.kind === "thinking")) trailingNonToolCount++;
+              else break;
+            }
+            if (trailingNonToolCount < textBlocks.length) {
+              const now = Date.now();
+              for (const block of textBlocks.slice(trailingNonToolCount)) {
+                if (block.type === "text" && typeof block.text === "string" && block.text) {
+                  entries.push({ kind: "text", text: block.text, ts: now });
+                } else if (
+                  block.type === "thinking" &&
+                  typeof block.thinking === "string" &&
+                  block.thinking &&
+                  !block.redacted
+                ) {
+                  entries.push({ kind: "thinking", text: block.thinking, ts: now });
+                }
+              }
+            }
+          }
         }
       }
 
