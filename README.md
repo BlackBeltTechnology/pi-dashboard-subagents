@@ -173,6 +173,117 @@ The subagent runs in-memory under the parent pi process. Live progress is
 streamed back to the caller via the standard `AgentDetails` payload plus the
 `entries[]` timeline field. The subagent never appears as a separate session.
 
+## Agent `.md` files
+
+v0.2.0 added YAML frontmatter parsing for agent `.md` definition files plus a
+3-tier resolver and a bundled default Explore agent.
+
+### Frontmatter schema
+
+Every field is optional. Missing fields fall through to current pre-frontmatter
+behaviour, so an `.md` with no frontmatter still works.
+
+```yaml
+---
+description: Fast read-only codebase & docs exploration
+model: anthropic/claude-haiku-4-5      # OR "@role" — see below
+thinking: high                          # (alt: "model: id:high" suffix)
+tools: [read, grep, find, ls, bash]    # allowlist (built-in + extension tools)
+inherit_context: false                  # per-agent override of the global setting
+prompt: |                              # OPTIONAL — body fallback below
+  You are an Explore subagent. Be fast and read-only.
+---
+
+The markdown body becomes the agent prompt when no `prompt:` field is set.
+This matches the convention used by Claude Code and pi-coding-agent's own
+prompt-template / skill files.
+```
+
+| Field             | Effect                                                                                              |
+| ----------------- | --------------------------------------------------------------------------------------------------- |
+| `description`     | Overrides `displayName` on the dashboard card.                                                      |
+| `model`           | Literal `"provider/id"`, `"provider/id:thinking-level"`, or `"@role"` (see Role aliasing).            |
+| `tools`           | Allowlist intersected with the parent's active tool set (minus `Agent`). Unknown names dropped silently. |
+| `inherit_context` | `true` → inherit parent context. `false` → isolated. Per-agent; overrides the global `inheritContext`.|
+| `prompt`          | Prepended as `<agent-prompt>...</agent-prompt>` before the task. Body of the `.md` is used if the field is absent. |
+
+All fields are read once at spawn time. Editing the `.md` while a subagent is
+running has no effect on that subagent; the next spawn picks up changes.
+
+### Three-tier resolution
+
+When the LLM calls `Agent({ subagent_type: "Explore", ... })`, the extension
+looks up `Explore.md` in three tiers, most-specific first:
+
+```
+1. <cwd>/.pi/agents/Explore.md          → source: "project"   (per-project override)
+2. ~/.pi/agent/agents/Explore.md        → source: "user"      (per-user override)
+3. <EXTENSION_ROOT>/agents/Explore.md   → source: "bundled"   (ships with this package)
+```
+
+The first match wins. The tier is surfaced as `AgentDetails.agentMdSource` so
+the dashboard card can render "Explore (bundled)" / "Explore (user)" badges.
+
+### Bundled `Explore` agent
+
+The package ships `agents/Explore.md` — a fast, read-only codebase / docs
+explorer informed by Claude Code's Explore agent and the production guidance
+in Ranjan Kumar's *Subagents: How to Run Parallelism Inside a Single Agent
+Session* (April 2026):
+
+- **Model**: `anthropic/claude-haiku-4-5` (literal; works standalone).
+- **Tools**: `[read, grep, find, ls, bash]` — no write/edit/Agent.
+- **Inherit context**: `false` — fresh window, parent's context not imported.
+- **Output contract**: structured `## Answer / ## Evidence / ## Notes` with
+  hard limits (≤2000 tokens, no raw file dumps).
+
+To customise:
+
+```bash
+mkdir -p ~/.pi/agent/agents
+cp "$(node -e 'console.log(require.resolve("pi-dashboard-subagents/agents/Explore.md"))')" \
+   ~/.pi/agent/agents/Explore.md
+# Edit ~/.pi/agent/agents/Explore.md — e.g. change `model:` to `"@fast"`
+```
+
+The user-global override automatically wins over the bundled file (tier 2 > 3).
+
+### Role aliasing (`@role`)
+
+The `model:` field accepts `@role` syntax (e.g. `model: @fast`). The extension
+resolves the alias by emitting on `pi.events`:
+
+```ts
+const probe = { ref: "@fast" };
+pi.events.emit("role:resolve-model", probe);
+// probe.resolved === "opencode-go/deepseek-v4-flash"  (when a handler is registered)
+```
+
+The handler is supplied by the **`@blackbelt-technology/pi-dashboard-roles-plugin`**
+bridge (a separate dashboard plugin that reads `~/.pi/agent/providers.json`).
+When the handler is NOT registered (e.g. no dashboard, or the roles plugin is
+disabled), `@role` references HARD-FAIL the tool call with an error message
+identifying:
+
+- the unresolved role name,
+- the agent `.md` path that specified it,
+- whether the handler was absent vs the role was unknown,
+- suggested fixes (install/enable roles plugin, or use a literal id).
+
+**Any pi extension** can use this convention — not just `pi-dashboard-subagents`.
+The contract:
+
+```ts
+interface Probe {
+  ref: string;                                 // input: "@fast"
+  resolved?: string;                           // output: "provider/model-id"
+  available?: Record<string, string>;          // output: { fast: "...", coding: "..." }
+}
+```
+
+The `available` field is best-effort — handlers SHOULD populate it on failure
+so callers can list the configured roles in their error messages.
+
 ## Wire-protocol contract
 
 This section locks the producer-side contract consumed by the dashboard inspector.
@@ -227,7 +338,8 @@ The `details` payload (defined in `extensions/events.ts`) carries everything the
 | `durationMs`   | `number`                        | Elapsed milliseconds since `subagents:created`                            |
 | `modelName?`   | `string`                        | Resolved model id (e.g. `"claude-sonnet-4-6"`)                          |
 | `tags?`        | `string[]`                      | Notable config flags (e.g. `["thinking: high"]`)                         |
-| `agentMdPath?` | `string`                        | Absolute path to the `.md` definition (project preferred over global)     |
+| `agentMdPath?` | `string`                        | Absolute path to the `.md` definition (project > user > bundled)         |
+| `agentMdSource?` | `"project" \| "user" \| "bundled"` | Tier that supplied `agentMdPath`. v0.2.0+. Undefined when path is undefined or producer is older. |
 | `error?`       | `string`                        | Set on `failed` emissions                                                |
 
 ### `SubagentTimelineEntry` kinds

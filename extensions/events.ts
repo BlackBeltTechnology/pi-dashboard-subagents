@@ -19,9 +19,9 @@
  * Tier-1 timeline (tool calls, reasoning, assistant text, errors).
  */
 
-import type { ExtensionAPI, ExtensionContext, SessionEntry } from "@mariozechner/pi-coding-agent";
-import type { AgentSessionEvent } from "@mariozechner/pi-coding-agent";
-import type { AssistantMessage } from "@mariozechner/pi-ai";
+import type { ExtensionAPI, ExtensionContext, SessionEntry } from "@earendil-works/pi-coding-agent";
+import type { AgentSessionEvent } from "@earendil-works/pi-coding-agent";
+import type { AssistantMessage } from "@earendil-works/pi-ai";
 
 // ─── Types matching dashboard's wire contract ────────────────────────────
 
@@ -65,6 +65,15 @@ export interface AgentDetails {
    * is anonymous / inline-defined.
    */
   agentMdPath?: string;
+  /**
+   * Which tier of the agent-resolution chain supplied `agentMdPath`.
+   * Additive in v0.2.0 — the dashboard card may render "(bundled)" /
+   * "(user)" / "(project)" badges. Undefined when `agentMdPath` is
+   * undefined or when the producer is older than v0.2.0.
+   *
+   * See change: add-agent-md-frontmatter-and-bundled-explore.
+   */
+  agentMdSource?: "project" | "user" | "bundled";
   error?: string;
 }
 
@@ -459,6 +468,11 @@ export function buildDetails(snapshot: {
   modelName?: string;
   tags?: string[];
   agentMdPath?: string;
+  /**
+   * Which tier of the agent-resolution chain supplied `agentMdPath`.
+   * See `AgentDetails.agentMdSource` for the wire-contract docs.
+   */
+  agentMdSource?: "project" | "user" | "bundled";
   error?: string;
 }): AgentDetails {
   return {
@@ -478,6 +492,7 @@ export function buildDetails(snapshot: {
     modelName: snapshot.modelName,
     tags: snapshot.tags,
     agentMdPath: snapshot.agentMdPath,
+    agentMdSource: snapshot.agentMdSource,
     error: snapshot.error,
   };
 }

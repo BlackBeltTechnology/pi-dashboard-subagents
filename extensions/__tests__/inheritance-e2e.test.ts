@@ -24,7 +24,7 @@ import { invalidateSettingsCache, resolveIsolated, saveSettings } from "../setti
 
 let tmpAgentDir: string;
 
-vi.mock("@mariozechner/pi-coding-agent", () => ({
+vi.mock("@earendil-works/pi-coding-agent", () => ({
   getAgentDir: () => tmpAgentDir,
 }));
 

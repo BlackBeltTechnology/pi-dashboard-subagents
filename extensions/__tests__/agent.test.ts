@@ -23,14 +23,56 @@ import {
   buildAgentParametersSchema,
   createProgressEmitter,
   createUsageAccumulator,
+  parseAgentMd,
   resolveAgentMdPath,
+  resolveModelFromRef,
 } from "../agent.js";
 
 // Re-route getAgentDir() to a tmp dir per-test.
 let tmpAgentDir: string;
 let tmpCwd: string;
 
-vi.mock("@mariozechner/pi-coding-agent", () => ({
+// Tiny YAML parser sufficient for these tests' fixtures — supports flat
+// `key: value` pairs, `key: [a, b]` arrays, and `key: |` literal blocks.
+// Real production code uses pi-coding-agent's `parseFrontmatter`; this stub
+// keeps the test self-contained without an additional yaml dependency.
+function tinyParseFrontmatter<T>(content: string): { frontmatter: T; body: string } {
+  const m = /^---\n([\s\S]*?)\n---\n?([\s\S]*)$/.exec(content);
+  if (!m) return { frontmatter: {} as T, body: content };
+  const yaml = m[1];
+  const body = m[2] ?? "";
+  const out: Record<string, unknown> = {};
+  const lines = yaml.split("\n");
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    const kv = /^([A-Za-z_][A-Za-z0-9_-]*):\s*(.*)$/.exec(line);
+    if (!kv) continue;
+    const key = kv[1];
+    const rest = kv[2];
+    if (rest === "|") {
+      const buf: string[] = [];
+      while (i + 1 < lines.length && /^\s+/.test(lines[i + 1])) {
+        buf.push(lines[++i].replace(/^  /, ""));
+      }
+      out[key] = buf.join("\n");
+    } else if (rest.startsWith("[") && rest.endsWith("]")) {
+      out[key] = rest
+        .slice(1, -1)
+        .split(",")
+        .map((s) => s.trim())
+        .filter((s) => s.length > 0);
+    } else if (rest === "true" || rest === "false") {
+      out[key] = rest === "true";
+    } else if (/^-?\d+(\.\d+)?$/.test(rest)) {
+      out[key] = Number(rest);
+    } else {
+      out[key] = rest;
+    }
+  }
+  return { frontmatter: out as T, body };
+}
+
+vi.mock("@earendil-works/pi-coding-agent", () => ({
   getAgentDir: () => tmpAgentDir,
   // The agent.ts default-export path imports several other symbols (defineTool,
   // createAgentSession, SessionManager). The schema + helper tests in this file
@@ -38,6 +80,7 @@ vi.mock("@mariozechner/pi-coding-agent", () => ({
   defineTool: <T,>(t: T) => t,
   createAgentSession: vi.fn(),
   SessionManager: { inMemory: vi.fn() },
+  parseFrontmatter: tinyParseFrontmatter,
 }));
 
 beforeEach(() => {
@@ -80,42 +123,87 @@ describe("buildAgentParametersSchema", () => {
 // ── resolveAgentMdPath ──────────────────────────────────────────────────
 
 describe("resolveAgentMdPath", () => {
-  it("finds project-level .pi/agents/<type>.md first", () => {
+  // Use a tmp dir for the bundled tier so tests never accidentally see the
+  // real `<EXTENSION_ROOT>/agents/Explore.md` shipped with the package.
+  let tmpBundledDir: string;
+  beforeEach(() => {
+    tmpBundledDir = mkdtempSync(join(tmpdir(), "pi-dashboard-subagents-bundled-"));
+  });
+  afterEach(() => {
+    if (tmpBundledDir && existsSync(tmpBundledDir)) {
+      rmSync(tmpBundledDir, { recursive: true, force: true });
+    }
+  });
+
+  it("finds project-level .pi/agents/<type>.md first (source: \"project\")", () => {
     const projectAgents = join(tmpCwd, ".pi", "agents");
     mkdirSync(projectAgents, { recursive: true });
     const target = join(projectAgents, "Scout.md");
     writeFileSync(target, "# Scout");
-    expect(resolveAgentMdPath("Scout", tmpCwd)).toBe(target);
+    expect(resolveAgentMdPath("Scout", tmpCwd, tmpBundledDir)).toEqual({
+      path: target,
+      source: "project",
+    });
   });
 
-  it("falls back to global ~/.pi/agent/agents/<type>.md when no project file", () => {
+  it("falls back to global ~/.pi/agent/agents/<type>.md when no project file (source: \"user\")", () => {
     const globalAgents = join(tmpAgentDir, "agents");
     mkdirSync(globalAgents, { recursive: true });
     const target = join(globalAgents, "Explore.md");
     writeFileSync(target, "# Explore");
-    expect(resolveAgentMdPath("Explore", tmpCwd)).toBe(target);
+    expect(resolveAgentMdPath("Explore", tmpCwd, tmpBundledDir)).toEqual({
+      path: target,
+      source: "user",
+    });
   });
 
-  it("project wins over global when both exist", () => {
+  it("falls back to bundled <EXTENSION_ROOT>/agents/<type>.md when project + user are absent (source: \"bundled\")", () => {
+    const target = join(tmpBundledDir, "Helper.md");
+    writeFileSync(target, "# Helper");
+    expect(resolveAgentMdPath("Helper", tmpCwd, tmpBundledDir)).toEqual({
+      path: target,
+      source: "bundled",
+    });
+  });
+
+  it("project wins over user wins over bundled", () => {
     const projectAgents = join(tmpCwd, ".pi", "agents");
     mkdirSync(projectAgents, { recursive: true });
     const globalAgents = join(tmpAgentDir, "agents");
     mkdirSync(globalAgents, { recursive: true });
-    const projectPath = join(projectAgents, "Both.md");
-    const globalPath = join(globalAgents, "Both.md");
+    const projectPath = join(projectAgents, "Triple.md");
+    const globalPath = join(globalAgents, "Triple.md");
+    const bundledPath = join(tmpBundledDir, "Triple.md");
     writeFileSync(projectPath, "# project");
-    writeFileSync(globalPath, "# global");
-    expect(resolveAgentMdPath("Both", tmpCwd)).toBe(projectPath);
+    writeFileSync(globalPath, "# user");
+    writeFileSync(bundledPath, "# bundled");
+    expect(resolveAgentMdPath("Triple", tmpCwd, tmpBundledDir)).toEqual({
+      path: projectPath,
+      source: "project",
+    });
   });
 
-  it("returns undefined when no file exists", () => {
-    expect(resolveAgentMdPath("DoesNotExist", tmpCwd)).toBeUndefined();
+  it("user wins over bundled when project is absent", () => {
+    const globalAgents = join(tmpAgentDir, "agents");
+    mkdirSync(globalAgents, { recursive: true });
+    const globalPath = join(globalAgents, "UserOverBundle.md");
+    const bundledPath = join(tmpBundledDir, "UserOverBundle.md");
+    writeFileSync(globalPath, "# user");
+    writeFileSync(bundledPath, "# bundled");
+    expect(resolveAgentMdPath("UserOverBundle", tmpCwd, tmpBundledDir)).toEqual({
+      path: globalPath,
+      source: "user",
+    });
+  });
+
+  it("returns undefined when no file exists at any tier", () => {
+    expect(resolveAgentMdPath("DoesNotExist", tmpCwd, tmpBundledDir)).toBeUndefined();
   });
 
   it("returns undefined for path-traversal attempts in the type name", () => {
-    expect(resolveAgentMdPath("../../etc/passwd", tmpCwd)).toBeUndefined();
-    expect(resolveAgentMdPath("foo/bar", tmpCwd)).toBeUndefined();
-    expect(resolveAgentMdPath("", tmpCwd)).toBeUndefined();
+    expect(resolveAgentMdPath("../../etc/passwd", tmpCwd, tmpBundledDir)).toBeUndefined();
+    expect(resolveAgentMdPath("foo/bar", tmpCwd, tmpBundledDir)).toBeUndefined();
+    expect(resolveAgentMdPath("", tmpCwd, tmpBundledDir)).toBeUndefined();
   });
 });
 
@@ -248,5 +336,283 @@ describe("createUsageAccumulator", () => {
     const acc = createUsageAccumulator();
     acc.observe({ type: "message_end", message: { role: "user" } } as any);
     expect(acc.totals()).toEqual({ input: 0, output: 0, total: 0 });
+  });
+});
+
+// ── parseAgentMd ────────────────────────────────────────────────────────
+
+describe("parseAgentMd", () => {
+  let tmpDir: string;
+  beforeEach(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), "pi-dashboard-subagents-parsemd-"));
+  });
+  afterEach(() => {
+    if (tmpDir && existsSync(tmpDir)) rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  function write(name: string, content: string): string {
+    const p = join(tmpDir, name);
+    writeFileSync(p, content);
+    return p;
+  }
+
+  it("returns fully populated AgentMdConfig for valid frontmatter", () => {
+    const path = write(
+      "Full.md",
+      [
+        "---",
+        "model: anthropic/claude-haiku-4-5",
+        "tools: [read, grep, bash]",
+        "inherit_context: false",
+        "description: Fast read-only exploration",
+        "prompt: |",
+        "  You are an Explore subagent.",
+        "  Stay read-only.",
+        "---",
+        "body content here",
+      ].join("\n"),
+    );
+    const cfg = parseAgentMd(path);
+    expect(cfg).toBeDefined();
+    expect(cfg!.model).toBe("anthropic/claude-haiku-4-5");
+    expect(cfg!.tools).toEqual(["read", "grep", "bash"]);
+    expect(cfg!.inherit_context).toBe(false);
+    expect(cfg!.description).toBe("Fast read-only exploration");
+    expect(cfg!.prompt).toBe("You are an Explore subagent.\nStay read-only.");
+  });
+
+  it("returns undefined when the file is missing", () => {
+    expect(parseAgentMd(join(tmpDir, "DoesNotExist.md"))).toBeUndefined();
+  });
+
+  it("treats the whole file as the prompt body when no frontmatter is present", () => {
+    // Convention: a `.md` without `---` block has its entire body fall into
+    // `prompt`. Power users who want metadata MUST include the `---` block.
+    const path = write("NoFrontmatter.md", "You are a helper agent. Stay safe.");
+    const cfg = parseAgentMd(path);
+    expect(cfg).toBeDefined();
+    expect(cfg!.prompt).toBe("You are a helper agent. Stay safe.");
+    // No other fields populated.
+    expect(cfg!.model).toBeUndefined();
+    expect(cfg!.tools).toBeUndefined();
+  });
+
+  it("returns undefined when frontmatter has no recognised field AND body is empty", () => {
+    const path = write(
+      "EmptyAll.md",
+      ["---", "unrelated: value", "---", ""].join("\n"),
+    );
+    expect(parseAgentMd(path)).toBeUndefined();
+  });
+
+  it("uses the markdown body as the prompt when frontmatter omits the prompt field", () => {
+    const path = write(
+      "BodyAsPrompt.md",
+      [
+        "---",
+        "model: anthropic/claude-haiku-4-5",
+        "tools: [read]",
+        "---",
+        "You are an Explore subagent. Be fast and read-only.",
+      ].join("\n"),
+    );
+    const cfg = parseAgentMd(path);
+    expect(cfg).toBeDefined();
+    expect(cfg!.prompt).toBe("You are an Explore subagent. Be fast and read-only.");
+    expect(cfg!.model).toBe("anthropic/claude-haiku-4-5");
+  });
+
+  it("explicit `prompt:` field wins over the markdown body", () => {
+    const path = write(
+      "ExplicitWins.md",
+      [
+        "---",
+        "prompt: |",
+        "  Frontmatter wins.",
+        "---",
+        "This body should be ignored.",
+      ].join("\n"),
+    );
+    const cfg = parseAgentMd(path);
+    expect(cfg).toBeDefined();
+    expect(cfg!.prompt).toBe("Frontmatter wins.");
+  });
+
+  it("ignores empty/whitespace-only model and description fields", () => {
+    const path = write(
+      "EmptyFields.md",
+      ["---", "model: ", "description:    ", "tools: [read]", "---"].join("\n"),
+    );
+    const cfg = parseAgentMd(path);
+    expect(cfg).toBeDefined();
+    expect(cfg!.model).toBeUndefined();
+    expect(cfg!.description).toBeUndefined();
+    expect(cfg!.tools).toEqual(["read"]);
+  });
+
+  it("drops non-string entries from tools and rejects empty arrays", () => {
+    const path = write(
+      "OddTools.md",
+      ["---", "tools: []", "model: anthropic/claude-haiku-4-5", "---"].join("\n"),
+    );
+    const cfg = parseAgentMd(path);
+    expect(cfg).toBeDefined();
+    expect(cfg!.tools).toBeUndefined();
+    expect(cfg!.model).toBe("anthropic/claude-haiku-4-5");
+  });
+});
+
+// ── resolveModelFromRef ─────────────────────────────────────────────────
+
+describe("resolveModelFromRef", () => {
+  function mkPi(opts: {
+    modelRegistry?: { find: (p: string, m: string) => unknown };
+    roleResolver?: (data: { ref: string; resolved?: string; available?: Record<string, string> }) => void;
+    noEvents?: boolean;
+  }): any {
+    const handlers = new Map<string, Array<(data: any) => void>>();
+    if (opts.roleResolver) {
+      handlers.set("role:resolve-model", [opts.roleResolver]);
+    }
+    return {
+      events: opts.noEvents
+        ? undefined
+        : {
+            emit(channel: string, data: unknown) {
+              for (const h of handlers.get(channel) ?? []) h(data as any);
+            },
+            on() { /* not used */ },
+          },
+      modelRegistry: opts.modelRegistry,
+    };
+  }
+
+  it("resolves a literal \"provider/id\" via modelRegistry.find", () => {
+    const fakeModel = { id: "claude-haiku-4-5", provider: "anthropic" };
+    const pi = mkPi({
+      modelRegistry: { find: (p, m) => (p === "anthropic" && m === "claude-haiku-4-5" ? fakeModel : undefined) },
+    });
+    const out = resolveModelFromRef(pi, "anthropic/claude-haiku-4-5", "/tmp/x.md");
+    expect(out.error).toBeUndefined();
+    expect(out.model).toBe(fakeModel);
+    expect(out.thinkingLevel).toBeUndefined();
+  });
+
+  it("extracts thinking level suffix and resolves the base id", () => {
+    const fakeModel = { id: "claude-haiku-4-5", provider: "anthropic" };
+    const pi = mkPi({
+      modelRegistry: { find: () => fakeModel },
+    });
+    const out = resolveModelFromRef(pi, "anthropic/claude-haiku-4-5:high", "/tmp/x.md");
+    expect(out.error).toBeUndefined();
+    expect(out.model).toBe(fakeModel);
+    expect(out.thinkingLevel).toBe("high");
+  });
+
+  it("ignores unknown :suffix and keeps it as part of the model id", () => {
+    const fakeModel = { id: "weird:foo", provider: "anthropic" };
+    const pi = mkPi({
+      modelRegistry: { find: (p, m) => (p === "anthropic" && m === "weird:foo" ? fakeModel : undefined) },
+    });
+    const out = resolveModelFromRef(pi, "anthropic/weird:foo", "/tmp/x.md");
+    expect(out.error).toBeUndefined();
+    expect(out.model).toBe(fakeModel);
+  });
+
+  it("resolves @role via pi.events handler", () => {
+    const fakeModel = { id: "deepseek-v4-flash", provider: "opencode-go" };
+    const pi = mkPi({
+      roleResolver: (data) => {
+        if (data.ref === "@fast") data.resolved = "opencode-go/deepseek-v4-flash";
+      },
+      modelRegistry: { find: (p, m) => (p === "opencode-go" && m === "deepseek-v4-flash" ? fakeModel : undefined) },
+    });
+    const out = resolveModelFromRef(pi, "@fast", "/tmp/x.md");
+    expect(out.error).toBeUndefined();
+    expect(out.model).toBe(fakeModel);
+  });
+
+  it("fails when @role has no handler (roles-plugin bridge absent)", () => {
+    const pi = mkPi({ modelRegistry: { find: () => undefined } });
+    const out = resolveModelFromRef(pi, "@fast", "/tmp/research.md");
+    expect(out.model).toBeUndefined();
+    expect(out.error).toMatch(/Cannot resolve role "@fast"/);
+    expect(out.error).toMatch(/roles-plugin bridge is not loaded/);
+    expect(out.error).toMatch(/\/tmp\/research\.md/);
+  });
+
+  it("fails when @role handler exists but role is unknown, lists available roles", () => {
+    const pi = mkPi({
+      roleResolver: (data) => {
+        // Handler runs but does not set probe.resolved; surfaces availability.
+        data.available = { fast: "x/y", research: "x/y" };
+      },
+      modelRegistry: { find: () => undefined },
+    });
+    const out = resolveModelFromRef(pi, "@unknownrole", "/tmp/x.md");
+    expect(out.model).toBeUndefined();
+    expect(out.error).toMatch(/Cannot resolve role "@unknownrole"/);
+    expect(out.error).toMatch(/@fast/);
+    expect(out.error).toMatch(/@research/);
+  });
+
+  it("fails on missing slash (not provider/id format)", () => {
+    const pi = mkPi({ modelRegistry: { find: () => undefined } });
+    const out = resolveModelFromRef(pi, "lonely-id", "/tmp/x.md");
+    expect(out.model).toBeUndefined();
+    expect(out.error).toMatch(/expected "provider\/model-id" format/);
+  });
+
+  it("fails when modelRegistry.find returns undefined (model not authenticated)", () => {
+    const pi = mkPi({ modelRegistry: { find: () => undefined } });
+    const out = resolveModelFromRef(pi, "anthropic/claude-opus-99", "/tmp/x.md");
+    expect(out.model).toBeUndefined();
+    expect(out.error).toMatch(/not registered or not authenticated/);
+  });
+
+  it("fails when pi.events is unavailable for an @role reference", () => {
+    const pi = mkPi({ noEvents: true, modelRegistry: { find: () => undefined } });
+    const out = resolveModelFromRef(pi, "@fast", "/tmp/x.md");
+    expect(out.model).toBeUndefined();
+    expect(out.error).toMatch(/pi.events is unavailable/);
+  });
+});
+
+// ── Bundled Explore agent (integration with the real shipped file) ──────
+
+describe("bundled Explore.md", () => {
+  // These tests intentionally hit the real BUNDLED_AGENTS_DIR (no override)
+  // to verify the file shipped in the package is discoverable + parseable.
+
+  it("resolveAgentMdPath('Explore') falls back to the bundled tier when no project/user override exists", async () => {
+    // Use a tmp cwd + override agentDir mock to ensure project and user
+    // tiers are empty. The mock above re-routes getAgentDir() to tmpAgentDir
+    // (empty per beforeEach).
+    const { resolveAgentMdPath: realResolve } = await import("../agent.js");
+    const out = realResolve("Explore", tmpCwd);
+    expect(out).toBeDefined();
+    expect(out!.source).toBe("bundled");
+    expect(out!.path).toMatch(/\/agents\/Explore\.md$/);
+  });
+
+  it("parseAgentMd on the bundled Explore returns the expected frontmatter shape", async () => {
+    const { resolveAgentMdPath: realResolve, parseAgentMd: realParse } = await import("../agent.js");
+    const resolved = realResolve("Explore", tmpCwd);
+    expect(resolved).toBeDefined();
+    const cfg = realParse(resolved!.path);
+    expect(cfg).toBeDefined();
+    // Frontmatter contract: read-only model, read-only tools, isolated context.
+    expect(cfg!.model).toMatch(/^anthropic\//);
+    expect(cfg!.tools).toBeDefined();
+    expect(cfg!.tools).toEqual(expect.arrayContaining(["read"]));
+    expect(cfg!.tools).not.toEqual(expect.arrayContaining(["edit"]));
+    expect(cfg!.tools).not.toEqual(expect.arrayContaining(["write"]));
+    expect(cfg!.tools).not.toEqual(expect.arrayContaining(["Agent"]));
+    expect(cfg!.inherit_context).toBe(false);
+    expect(typeof cfg!.description).toBe("string");
+    expect(cfg!.description!.length).toBeGreaterThan(0);
+    expect(typeof cfg!.prompt).toBe("string");
+    // The system prompt must include the read-only contract heading.
+    expect(cfg!.prompt!).toMatch(/READ-ONLY/);
   });
 });

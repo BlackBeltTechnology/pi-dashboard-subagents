@@ -15,8 +15,9 @@
  */
 
 import { randomUUID } from "node:crypto";
-import { existsSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { existsSync, readFileSync } from "node:fs";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 
 import { Type } from "@sinclair/typebox";
 
@@ -29,8 +30,9 @@ import {
   type ExtensionAPI,
   type ExtensionContext,
   getAgentDir,
+  parseFrontmatter,
   SessionManager,
-} from "@mariozechner/pi-coding-agent";
+} from "@earendil-works/pi-coding-agent";
 
 import {
   type AgentDetails,
@@ -58,6 +60,19 @@ import {
 
 const AGENT_TOOL_NAME = "Agent";
 
+// ─── Extension directory (for the bundled-agents tier) ─────────────────
+//
+// Computed once at module load from `import.meta.url`. Points to the
+// extension's package root (the parent of `extensions/`). The bundled
+// agents directory is `<EXTENSION_ROOT>/agents/`. ESM-only; the package's
+// `"type": "module"` guarantees `import.meta.url` is defined.
+//
+// Tests may override the bundled dir via the third arg to
+// `resolveAgentMdPath`; production callers omit it.
+
+export const EXTENSION_ROOT: string = dirname(dirname(fileURLToPath(import.meta.url)));
+export const BUNDLED_AGENTS_DIR: string = join(EXTENSION_ROOT, "agents");
+
 // ─── Throttling window for progress emissions ────────────────────────────
 
 const PROGRESS_THROTTLE_MS = 250; // → max 4 emissions/sec/subagent (§3.5)
@@ -65,30 +80,155 @@ const PROGRESS_THROTTLE_MS = 250; // → max 4 emissions/sec/subagent (§3.5)
 // ─── Helpers ─────────────────────────────────────────────────────────────
 
 /**
+ * Source tier discriminator returned by `resolveAgentMdPath`. The dashboard
+ * card can render this as a small badge so the operator knows which tier
+ * supplied the agent definition (e.g. "Explore (bundled)" vs "Explore (user)").
+ */
+export type AgentMdSource = "project" | "user" | "bundled";
+
+/** Resolved agent .md file: the absolute path plus the tier that supplied it. */
+export interface ResolvedAgentMd {
+  path: string;
+  source: AgentMdSource;
+}
+
+/**
  * Resolve the absolute path to an agent's `.md` definition file.
  *
- * Lookup order (project-local wins):
- *   1. `<cwd>/.pi/agents/<type>.md`
- *   2. `<getAgentDir()>/agents/<type>.md`
+ * Lookup order (most-specific first; first match wins):
+ *   1. `<cwd>/.pi/agents/<type>.md`        → `source: "project"`
+ *   2. `<getAgentDir()>/agents/<type>.md`  → `source: "user"`
+ *   3. `<EXTENSION_ROOT>/agents/<type>.md` → `source: "bundled"`
  *
- * Returns `undefined` for built-in / anonymous agents.
+ * Returns `undefined` for built-in / anonymous agents that have no
+ * matching `.md` at any tier.
+ *
+ * @param agentType  The `subagent_type` argument from the LLM.
+ * @param cwd        The session's working directory (drives the project tier).
+ * @param bundledDir Optional override for the bundled tier (test seam).
+ *                   Defaults to `BUNDLED_AGENTS_DIR`.
  */
-export function resolveAgentMdPath(agentType: string, cwd: string): string | undefined {
+export function resolveAgentMdPath(
+  agentType: string,
+  cwd: string,
+  bundledDir: string = BUNDLED_AGENTS_DIR,
+): ResolvedAgentMd | undefined {
   // Defensive: reject path-traversal in the type name. The LLM controls
   // this string; we never want it to escape the agents directory.
   if (!agentType || agentType.includes("/") || agentType.includes("\\") || agentType.includes("..")) {
     return undefined;
   }
   const projectPath = resolve(cwd, ".pi", "agents", `${agentType}.md`);
-  if (existsSync(projectPath)) return projectPath;
+  if (existsSync(projectPath)) return { path: projectPath, source: "project" };
   try {
     const globalDir = getAgentDir();
     const globalPath = join(globalDir, "agents", `${agentType}.md`);
-    if (existsSync(globalPath)) return globalPath;
+    if (existsSync(globalPath)) return { path: globalPath, source: "user" };
   } catch {
     // getAgentDir may throw in unusual contexts; treat as no global path.
   }
+  const bundledPath = join(bundledDir, `${agentType}.md`);
+  if (existsSync(bundledPath)) return { path: bundledPath, source: "bundled" };
   return undefined;
+}
+
+// ─── Agent .md frontmatter parsing ─────────────────────────────────────
+//
+// Parses YAML frontmatter from the `.md` file at the resolved path. Backed
+// by pi-coding-agent's `parseFrontmatter` (same parser pi uses for prompt
+// templates and skills). Returns `undefined` on missing file, empty
+// frontmatter, or malformed YAML — so the spawn loop can fall through to
+// current defaults without crashing.
+
+/**
+ * Strongly-typed view of the YAML frontmatter we honour in agent `.md` files.
+ * Each field is optional; an absent field MUST leave the corresponding
+ * subagent behaviour at its pre-frontmatter default.
+ */
+export interface AgentMdConfig {
+  /**
+   * Model reference. Three accepted shapes:
+   *   • `"provider/model-id"`        literal
+   *   • `"provider/model-id:level"`  literal with thinking suffix
+   *   • `"@role"`                    role alias (resolved via
+   *                                   `pi.events.emit("role:resolve-model")`)
+   * Absent / empty → inherit parent default.
+   */
+  model?: string;
+  /** Allowlist of tool names. Absent → all parent tools minus `Agent`. */
+  tools?: string[];
+  /** System-prompt preamble prepended to pi's default. Absent → pi default. */
+  prompt?: string;
+  /** Per-agent override of the global `inheritContext` setting. */
+  inherit_context?: boolean;
+  /** Display-name override for the dashboard card. Absent → falls back to `subagent_type`. */
+  description?: string;
+}
+
+/**
+ * Read and parse the frontmatter of an agent `.md` file.
+ *
+ * Returns `undefined` when:
+ *   • the file does not exist
+ *   • the file has no `---\n...\n---` frontmatter block
+ *   • the frontmatter contains no honoured field (every field is undefined)
+ *   • reading or parsing throws (malformed YAML, permission errors, etc.)
+ *
+ * Errors are logged to stderr but never re-thrown — the spawn loop must keep
+ * working with current defaults when an `.md` is broken.
+ */
+export function parseAgentMd(path: string): AgentMdConfig | undefined {
+  let raw: string;
+  try {
+    raw = readFileSync(path, "utf-8");
+  } catch {
+    return undefined; // missing file or unreadable — treat as no config
+  }
+  let frontmatter: Record<string, unknown>;
+  let body = "";
+  try {
+    const parsed = parseFrontmatter<Record<string, unknown>>(raw);
+    frontmatter = parsed.frontmatter;
+    body = parsed.body ?? "";
+  } catch (err) {
+    console.warn(
+      `[pi-dashboard-subagents] Malformed YAML frontmatter in ${path}:`,
+      err instanceof Error ? err.message : err,
+    );
+    return undefined;
+  }
+  if (!frontmatter || typeof frontmatter !== "object") frontmatter = {};
+
+  const cfg: AgentMdConfig = {};
+  if (typeof frontmatter.model === "string" && frontmatter.model.trim() !== "") {
+    cfg.model = frontmatter.model.trim();
+  }
+  if (Array.isArray(frontmatter.tools)) {
+    const tools = frontmatter.tools.filter((t): t is string => typeof t === "string" && t.trim() !== "");
+    if (tools.length > 0) cfg.tools = tools;
+  }
+  // `prompt:` field takes precedence; otherwise fall back to the markdown
+  // body. The body convention matches Claude Code's agent.md format and
+  // pi-coding-agent's own prompt templates / skills (where the frontmatter
+  // holds metadata and the body holds the actual content). The explicit
+  // field is preserved so power users can ship a .md whose body is human
+  // documentation distinct from the model-facing prompt.
+  if (typeof frontmatter.prompt === "string" && frontmatter.prompt.trim() !== "") {
+    cfg.prompt = frontmatter.prompt;
+  } else if (body.trim() !== "") {
+    cfg.prompt = body.trim();
+  }
+  if (typeof frontmatter.inherit_context === "boolean") {
+    cfg.inherit_context = frontmatter.inherit_context;
+  }
+  if (typeof frontmatter.description === "string" && frontmatter.description.trim() !== "") {
+    cfg.description = frontmatter.description.trim();
+  }
+  // An empty config (no recognised field, no body) is functionally
+  // equivalent to no config — the caller will fall through to defaults
+  // either way. Return `undefined` to keep call sites' nullish-coalescing
+  // terse.
+  return Object.keys(cfg).length > 0 ? cfg : undefined;
 }
 
 /**
@@ -196,6 +336,168 @@ function activityFromEvent(event: AgentSessionEvent): string | null | undefined 
   return undefined; // no change
 }
 
+// ─── Model reference resolution ───────────────────────────────────────────
+//
+// Maps a frontmatter `model:` string to a concrete `Model<any>` object
+// the SDK can pass to `createAgentSession`. Three accepted input shapes:
+//
+//   1. `"@role"`                        → emit `role:resolve-model` on
+//                                          `pi.events`; the roles-plugin
+//                                          bridge (companion change) fills
+//                                          `probe.resolved` with a literal
+//                                          "provider/id" string.
+//   2. `"provider/id"`                   → literal; passed to
+//                                          `pi.modelRegistry.find(provider, id)`.
+//   3. `"provider/id:thinking-level"`    → literal + thinking suffix; the
+//                                          part after the last `:` becomes
+//                                          `thinkingLevel` and the rest is
+//                                          the model reference.
+//
+// Errors are returned as `{ error, ... }` instead of thrown so the caller
+// can decide whether to fail the tool call hard (the design says yes for
+// `@role` failure) or to fall back to the parent default (no model field).
+
+import type { Model } from "@earendil-works/pi-ai";
+
+type ThinkingLevelString = "minimal" | "low" | "medium" | "high" | "xhigh" | "off";
+const VALID_THINKING_LEVELS: readonly ThinkingLevelString[] = [
+  "minimal",
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+  "off",
+];
+
+export interface ModelResolution {
+  /** Resolved Model object (when successful). */
+  model?: Model<any>;
+  /** Thinking-level suffix extracted from the reference (when present). */
+  thinkingLevel?: ThinkingLevelString;
+  /** Human-readable error message (when the reference could not be resolved). */
+  error?: string;
+}
+
+/**
+ * Split a `"provider/id"` or `"provider/id:level"` reference into its parts.
+ * The thinking level suffix is the substring AFTER the LAST `:` only when
+ * it matches a known thinking level (case-insensitive). Anything else after
+ * `:` is treated as part of the model id (so model ids containing `:` for
+ * non-thinking reasons still resolve).
+ */
+function splitModelRef(ref: string): {
+  provider: string | undefined;
+  modelId: string;
+  thinkingLevel: ThinkingLevelString | undefined;
+} {
+  let working = ref;
+  let thinkingLevel: ThinkingLevelString | undefined;
+  const lastColon = working.lastIndexOf(":");
+  if (lastColon > 0) {
+    const suffix = working.slice(lastColon + 1).toLowerCase() as ThinkingLevelString;
+    if (VALID_THINKING_LEVELS.includes(suffix)) {
+      thinkingLevel = suffix;
+      working = working.slice(0, lastColon);
+    }
+  }
+  const firstSlash = working.indexOf("/");
+  if (firstSlash <= 0) {
+    return { provider: undefined, modelId: working, thinkingLevel };
+  }
+  return {
+    provider: working.slice(0, firstSlash),
+    modelId: working.slice(firstSlash + 1),
+    thinkingLevel,
+  };
+}
+
+/**
+ * Resolve a frontmatter `model:` reference to a concrete Model object,
+ * handling `@role` aliases via the `role:resolve-model` event bus convention.
+ *
+ * @param pi          ExtensionAPI handle (needed for events + modelRegistry).
+ * @param ref         Raw string from frontmatter (e.g. "@fast", "anthropic/claude-haiku-4-5").
+ * @param agentMdPath Resolved agent .md path — included in error messages so the operator
+ *                    knows which file specified the unresolvable reference.
+ */
+export function resolveModelFromRef(
+  pi: ExtensionAPI,
+  ref: string,
+  agentMdPath: string | undefined,
+): ModelResolution {
+  const trimmed = ref.trim();
+  if (!trimmed) return { error: "Empty model reference." };
+
+  // ---- @role indirection ----
+  let literal: string = trimmed;
+  if (trimmed.startsWith("@")) {
+    const role = trimmed.slice(1);
+    if (!role) return { error: `Invalid role alias "${ref}": empty role name.` };
+    if (!pi.events) {
+      return {
+        error:
+          `Cannot resolve role "${ref}" — pi.events is unavailable, ` +
+          `so the roles-plugin bridge could not be reached.` +
+          (agentMdPath ? `\nAgent definition: ${agentMdPath}` : ""),
+      };
+    }
+    const probe: { ref: string; resolved?: string; available?: Record<string, string> } = {
+      ref: trimmed,
+    };
+    pi.events.emit("role:resolve-model", probe);
+    if (typeof probe.resolved !== "string" || probe.resolved.trim() === "") {
+      const available = probe.available;
+      const availableList =
+        available && typeof available === "object"
+          ? Object.keys(available).map((r) => `@${r}`).sort().join(", ")
+          : "";
+      return {
+        error:
+          `Cannot resolve role "${ref}".\n` +
+          `Either the roles-plugin bridge is not loaded (no handler for ` +
+          `"role:resolve-model" on pi.events), or the role is not assigned in ` +
+          `~/.pi/agent/providers.json.` +
+          (availableList ? `\nAvailable roles: ${availableList}` : "") +
+          (agentMdPath ? `\nAgent definition: ${agentMdPath}` : "") +
+          `\nFix: install/enable the dashboard's roles plugin, assign the role, ` +
+          `or replace the "@role" reference with a literal "provider/model-id".`,
+      };
+    }
+    literal = probe.resolved.trim();
+  }
+
+  // ---- Parse literal "provider/id[:thinking]" ----
+  const { provider, modelId, thinkingLevel } = splitModelRef(literal);
+  if (!provider) {
+    return {
+      error:
+        `Invalid model reference "${ref}" (resolved to "${literal}"): ` +
+        `expected "provider/model-id" format.` +
+        (agentMdPath ? `\nAgent definition: ${agentMdPath}` : ""),
+    };
+  }
+
+  const registry: { find?: (p: string, m: string) => Model<any> | undefined } | undefined =
+    (pi as unknown as { modelRegistry?: unknown }).modelRegistry as never;
+  if (!registry || typeof registry.find !== "function") {
+    return {
+      error:
+        `Model registry unavailable on pi.modelRegistry — cannot resolve "${ref}".`,
+    };
+  }
+  const model = registry.find(provider, modelId);
+  if (!model) {
+    return {
+      error:
+        `Model "${provider}/${modelId}" is not registered or not authenticated.` +
+        `\nResolved from "${ref}"` +
+        (agentMdPath ? `; agent definition: ${agentMdPath}` : ".") +
+        `\nRun \`/provider\` or check ~/.pi/agent/auth.json.`,
+    };
+  }
+  return { model, thinkingLevel };
+}
+
 // ─── Schema (conditional on exposeInheritanceInTool) ─────────────────────
 
 /**
@@ -291,7 +593,18 @@ export async function runAgentTool(
 ): Promise<AgentToolResultWithError<AgentDetails>> {
   const agentId = randomUUID();
   const startedAt = Date.now();
-  const agentMdPath = resolveAgentMdPath(args.subagent_type, cwd);
+
+  // ── Resolve the agent .md (3-tier: project → user → bundled) ──
+  const resolvedMd = resolveAgentMdPath(args.subagent_type, cwd);
+  const agentMdPath = resolvedMd?.path;
+  const agentMdSource = resolvedMd?.source;
+
+  // ── Parse frontmatter from the resolved .md (or undefined if none) ──
+  // Undefined on missing file, empty frontmatter, or malformed YAML.
+  const agentConfig = agentMdPath ? parseAgentMd(agentMdPath) : undefined;
+
+  // ── displayName: prefer frontmatter description, else subagent_type ──
+  const displayName = agentConfig?.description ?? args.subagent_type;
 
   const entries: SubagentTimelineEntry[] = [];
   let toolUses = 0;
@@ -310,7 +623,7 @@ export async function runAgentTool(
   function snapshotDetails(status: AgentStatus, error?: string): AgentDetails {
     return buildDetails({
       agentId,
-      displayName: args.subagent_type,
+      displayName,
       description: args.description,
       subagentType: args.subagent_type,
       status,
@@ -323,6 +636,7 @@ export async function runAgentTool(
       startedAt,
       modelName,
       agentMdPath,
+      agentMdSource,
       error,
     });
   }
@@ -349,27 +663,89 @@ export async function runAgentTool(
   });
 
   try {
-    // ── Build effective prompt with optional parent-context prefix ──
-    const isolated = resolveIsolated(args.isolated);
+    // ── Frontmatter model: resolve before touching the session ──
+    // Resolving up-front lets us fail the tool call cleanly (errorResult)
+    // when @role can't be resolved, BEFORE we allocate session resources.
+    let resolvedModel: Model<any> | undefined;
+    let resolvedThinkingLevel: ThinkingLevelString | undefined;
+    if (agentConfig?.model) {
+      const resolution = resolveModelFromRef(pi, agentConfig.model, agentMdPath);
+      if (resolution.error || !resolution.model) {
+        // Hard failure: see design Decision 3. Don't silently fall back
+        // to the parent default — the .md author explicitly requested
+        // this model.
+        const failedDetails = snapshotDetails("error", resolution.error);
+        emitSubagentFailed(pi, {
+          agentId,
+          error: resolution.error ?? "Model resolution failed",
+          durationMs: Date.now() - startedAt,
+          toolUses,
+          details: failedDetails,
+        });
+        return errorResult(
+          resolution.error ?? `Could not resolve model reference "${agentConfig.model}".`,
+          failedDetails,
+        );
+      }
+      resolvedModel = resolution.model;
+      resolvedThinkingLevel = resolution.thinkingLevel;
+    }
+
+    // ── Effective inheritance: frontmatter overrides global setting ──
+    // Per design Decision 5: per-agent `inherit_context` wins over the
+    // operator-level `inheritContext` config. Per-call `isolated` (LLM)
+    // wins over both when `exposeInheritanceInTool` is on — that's already
+    // handled by `resolveIsolated`.
+    const isolated =
+      typeof agentConfig?.inherit_context === "boolean"
+        ? !agentConfig.inherit_context
+        : resolveIsolated(args.isolated);
     const inheritanceOpts = isolated
       ? { isolated: true as const }
       : { isolated: false as const, ...getInheritanceCompression() };
     const inherited = buildInheritedContext(ctx, inheritanceOpts);
-    const effectivePrompt = inherited
-      ? `${inherited}\n\n<task>\n${args.prompt}\n</task>`
-      : args.prompt;
+
+    // ── Effective task prompt: parent-context prefix + agent-prompt preamble ──
+    // The .md's `prompt:` block is wrapped in an `<agent-prompt>` block so
+    // it sits visually distinct from pi's default system prompt and the
+    // inherited parent context. Order: parent-context → task-prompt-preamble → task.
+    // Note: the agent-prompt prepends to the SUBAGENT'S effective user-side
+    // prompt, not to pi's built-in system prompt template — we have no SDK
+    // hook to inject into the system prompt directly. This still gives the
+    // subagent strong steering: it appears as the very first thing in the
+    // assistant's instructions and pi's default system prompt sits underneath.
+    const promptSections: string[] = [];
+    if (inherited) promptSections.push(inherited);
+    if (agentConfig?.prompt) {
+      promptSections.push(`<agent-prompt>\n${agentConfig.prompt}\n</agent-prompt>`);
+    }
+    promptSections.push(`<task>\n${args.prompt}\n</task>`);
+    const effectivePrompt = promptSections.join("\n\n");
 
     // ── Construct in-memory subagent session ──
     const sessionManager = SessionManager.inMemory(cwd);
     const createResult = await createAgentSession({
       cwd,
       sessionManager,
+      ...(resolvedModel ? { model: resolvedModel } : {}),
+      ...(resolvedThinkingLevel && resolvedThinkingLevel !== "off"
+        ? { thinkingLevel: resolvedThinkingLevel }
+        : {}),
     });
     session = createResult.session;
     modelName = session.model?.id;
 
-    // ── Exclude the Agent tool from the subagent to prevent recursion ──
-    const activeTools = session.getActiveToolNames().filter((n) => n !== AGENT_TOOL_NAME);
+    // ── Tool allowlist ──
+    // Always strip the `Agent` tool to prevent recursive nesting. When
+    // frontmatter provides a `tools:` allowlist, intersect it with the
+    // session's active tool set (so unknown names in the allowlist are
+    // silently dropped — a typo doesn't crash the spawn) and apply via
+    // `setActiveToolsByName`. Otherwise keep every tool the parent has
+    // except `Agent` (unchanged pre-frontmatter behavior).
+    const availableTools = session.getActiveToolNames().filter((n) => n !== AGENT_TOOL_NAME);
+    const activeTools = agentConfig?.tools
+      ? availableTools.filter((n) => agentConfig.tools!.includes(n))
+      : availableTools;
     session.setActiveToolsByName(activeTools);
 
     // ── Subscribe to events and accumulate the timeline ──

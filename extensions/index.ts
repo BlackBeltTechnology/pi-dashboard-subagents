@@ -29,16 +29,16 @@ import {
   type ToolCallEvent,
   type ToolDefinition,
   type ToolResultEvent,
-} from "@mariozechner/pi-coding-agent";
+} from "@earendil-works/pi-coding-agent";
 
 import type {
   AssistantMessage,
   AssistantMessageEvent,
   Model,
   ToolCall,
-} from "@mariozechner/pi-ai";
+} from "@earendil-works/pi-ai";
 
-import { Box, Component, Container, Text } from "@mariozechner/pi-tui";
+import { Box, Component, Container, Text } from "@earendil-works/pi-tui";
 
 import {
   type AgentDetails,
@@ -74,7 +74,17 @@ import {
   shouldInheritByDefault,
 } from "./settings.js";
 
-import activate from "./agent.js";
+import activate, {
+  type AgentMdConfig,
+  type AgentMdSource,
+  type ModelResolution,
+  type ResolvedAgentMd,
+  BUNDLED_AGENTS_DIR,
+  EXTENSION_ROOT,
+  parseAgentMd,
+  resolveAgentMdPath,
+  resolveModelFromRef,
+} from "./agent.js";
 
 // ─── Public re-exports for downstream consumers ─────────────────────────
 export {
@@ -109,6 +119,20 @@ export {
   saveSettings,
   shouldExposeInheritanceInTool,
   shouldInheritByDefault,
+};
+
+// Agent .md frontmatter + 3-tier resolution + role-alias resolver.
+// See change: add-agent-md-frontmatter-and-bundled-explore.
+export {
+  type AgentMdConfig,
+  type AgentMdSource,
+  type ModelResolution,
+  type ResolvedAgentMd,
+  BUNDLED_AGENTS_DIR,
+  EXTENSION_ROOT,
+  parseAgentMd,
+  resolveAgentMdPath,
+  resolveModelFromRef,
 };
 
 // ─── Extension entry point (pi.ExtensionFactory) ────────────────────────
