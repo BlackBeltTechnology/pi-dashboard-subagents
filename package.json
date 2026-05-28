@@ -1,8 +1,15 @@
 {
-  "name": "pi-dashboard-subagents",
+  "name": "@blackbelt-technology/pi-dashboard-subagents",
   "version": "0.2.0",
   "description": "A lightweight subagent spawning and managing system for pi.",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/BlackBeltTechnology/pi-dashboard-subagents.git"
+  },
   "license": "MIT",
+  "publishConfig": {
+    "access": "public"
+  },
   "keywords": [
     "pi-package",
     "pi-coding-agent",

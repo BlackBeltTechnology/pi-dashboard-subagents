@@ -134,7 +134,7 @@ pi-agent-dashboard inspector.
 ## Install
 
 ```bash
-npm install -g pi-dashboard-subagents
+npm install -g @blackbelt-technology/pi-dashboard-subagents
 ```
 
 Then add to `~/.pi/agent/settings.json`:
@@ -142,7 +142,7 @@ Then add to `~/.pi/agent/settings.json`:
 ```json
 {
   "packages": [
-    "npm:pi-dashboard-subagents"
+    "npm:@blackbelt-technology/pi-dashboard-subagents"
   ]
 }
 ```
@@ -248,7 +248,7 @@ To customise (e.g. to run without the dashboard, or to pin a specific model):
 
 ```bash
 mkdir -p ~/.pi/agent/agents
-cp "$(node -e 'console.log(require.resolve("pi-dashboard-subagents/agents/Explore.md"))')" \
+cp "$(node -e 'console.log(require.resolve("@blackbelt-technology/pi-dashboard-subagents/agents/Explore.md"))')" \
    ~/.pi/agent/agents/Explore.md
 # Edit ~/.pi/agent/agents/Explore.md — e.g. change `model:` to a literal
 # "provider/model-id" so it works without the roles-plugin bridge.

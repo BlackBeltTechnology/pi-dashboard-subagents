@@ -66,7 +66,7 @@ jobs:
           # Detect SemVer prerelease (anything with a `-` suffix on the
           # X.Y.Z core, e.g. `0.3.0-rc.1`). Prereleases publish to npm
           # under the `next` dist-tag so consumers running plain
-          # `npm install pi-dashboard-subagents` keep getting the last
+          # `npm install @blackbelt-technology/pi-dashboard-subagents` keep getting the last
           # stable release. Matches pi-agent-dashboard's release pattern.
           is_prerelease=$([[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+- ]] && echo true || echo false)
           echo "Resolved: version=$version tag=$tag is_prerelease=$is_prerelease"
@@ -179,11 +179,11 @@ jobs:
           # Skip if already published — lets re-runs after a partial
           # failure resume cleanly instead of erroring on "cannot publish
           # over previously published version".
-          if npm view "pi-dashboard-subagents@$VERSION" version >/dev/null 2>&1; then
-            echo "::notice::pi-dashboard-subagents@$VERSION already published — skip"
+          if npm view "@blackbelt-technology/pi-dashboard-subagents@$VERSION" version >/dev/null 2>&1; then
+            echo "::notice::@blackbelt-technology/pi-dashboard-subagents@$VERSION already published — skip"
             exit 0
           fi
-          echo "::group::Publishing pi-dashboard-subagents@$VERSION (is_prerelease=$PRERELEASE)"
+          echo "::group::Publishing @blackbelt-technology/pi-dashboard-subagents@$VERSION (is_prerelease=$PRERELEASE)"
           npm publish --provenance --access public $TAG_ARG
           echo "::endgroup::"
 
