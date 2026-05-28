@@ -57,27 +57,39 @@ YAML frontmatter.
 - **WHEN** the LLM invokes `Agent({ subagent_type: "Explore", ... })` and no project or user-level `Explore.md` exists
 - **THEN** `resolveAgentMdPath("Explore", cwd)` SHALL return `{ path: "<extensionDir>/agents/Explore.md", source: "bundled" }`
 
-### Requirement: The bundled Explore agent SHALL use a literal model reference
+### Requirement: The bundled Explore agent SHALL use a role alias for its model
 
-The bundled `Explore.md` SHALL specify `model:` as a literal `"provider/model-id"` string
-(not `@role`). This ensures the bundled agent works standalone without the roles-plugin
-bridge or pi-flows.
+The bundled `Explore.md` SHALL specify `model:` as the role alias `"@fast"`. Operators
+pick the actual model behind `@fast` via the dashboard's roles plugin (Settings → Roles),
+which edits `~/.pi/agent/providers.json` — the same store consulted by the
+`role:resolve-model` event-bus handler the roles-plugin bridge registers on `pi.events`.
 
-#### Scenario: Bundled Explore works without role infrastructure
+This intentionally makes the bundled Explore dependent on the roles-plugin bridge: model
+choice is operator-controlled at runtime, not baked into the shipped file.
 
-- **GIVEN** the roles-plugin bridge is NOT loaded and pi-flows is NOT loaded
+#### Scenario: Bundled Explore resolves @fast through the roles-plugin bridge
+
+- **GIVEN** the roles-plugin bridge is loaded and `~/.pi/agent/providers.json#roles.fast` is assigned (e.g. `"anthropic/claude-haiku-4-5"`)
 - **WHEN** the bundled Explore agent is spawned
-- **THEN** the model SHALL resolve from the literal value in the frontmatter
-- **AND** no `@role` resolution SHALL be attempted
-- **AND** the spawn SHALL succeed (assuming the model is authenticated)
+- **THEN** `pi.events.emit("role:resolve-model", { ref: "@fast" })` SHALL be called
+- **AND** `probe.resolved` SHALL be filled with the assigned `"provider/model-id"` string
+- **AND** that string SHALL be resolved to a Model object via `pi.modelRegistry.find()` and passed to `createAgentSession({ model })`
 
-#### Scenario: Power user overrides bundled model to @role
+#### Scenario: Bundled Explore hard-fails when the roles-plugin bridge is not loaded
 
-- **GIVEN** the user has copied the bundled `Explore.md` to `<getAgentDir()>/agents/Explore.md` and changed `model:` to `@fast`
+- **GIVEN** the roles-plugin bridge is NOT loaded (no `role:resolve-model` handler on `pi.events`)
+- **WHEN** the bundled Explore agent is spawned
+- **THEN** the tool call SHALL return `isError: true`
+- **AND** the error message SHALL name `"@fast"` and the resolved Explore.md path
+- **AND** the error message SHALL suggest enabling the dashboard's roles plugin OR overriding the bundled file with a literal model reference (per the override mechanic below)
+
+#### Scenario: Operator overrides @fast to a literal model id via user-global tier
+
+- **GIVEN** the user has copied the bundled `Explore.md` to `<getAgentDir()>/agents/Explore.md` and changed `model:` to a literal `"provider/model-id"`
 - **WHEN** an Explore subagent is spawned
 - **THEN** the user-global override SHALL win (tier 2)
-- **AND** the `@fast` role SHALL be resolved via `role:resolve-model`
-- **AND** the original bundled model SHALL NOT be used
+- **AND** the literal model SHALL be resolved directly (no `role:resolve-model` emit)
+- **AND** the spawn SHALL succeed without the roles-plugin bridge being loaded
 
 ### Requirement: The bundled Explore SHALL have a read-only tool set
 

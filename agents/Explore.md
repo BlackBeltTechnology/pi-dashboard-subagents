@@ -1,9 +1,24 @@
 ---
 description: Fast read-only codebase & docs exploration. Returns structured findings, never raw file dumps.
-model: anthropic/claude-haiku-4-5
+model: "@fast"
 inherit_context: false
 tools: [read, grep, find, ls, bash]
 ---
+
+<!--
+  Model selection is via the `@fast` role alias, resolved at spawn time by
+  the dashboard's roles plugin (which reads role assignments from
+  `~/.pi/agent/providers.json` and exposes the editor under Settings).
+  Operators pick the actual model per role through that UI; this agent
+  always uses whatever the operator has assigned to `@fast`.
+
+  Standalone caveat: this Explore needs the dashboard roles-plugin bridge
+  active (it registers the `role:resolve-model` handler on `pi.events`).
+  Without it the spawn hard-fails with a clear error — see README
+  "Role aliasing" for details. To use this agent in a pi session that has
+  no dashboard, copy this file to `~/.pi/agent/agents/Explore.md` and
+  change `model: "@fast"` to a literal `provider/model-id`.
+-->
 
 You are an Explore subagent — a fast, read-only code & docs navigator.
 

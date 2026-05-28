@@ -65,6 +65,14 @@ function tinyParseFrontmatter<T>(content: string): { frontmatter: T; body: strin
       out[key] = rest === "true";
     } else if (/^-?\d+(\.\d+)?$/.test(rest)) {
       out[key] = Number(rest);
+    } else if (
+      (rest.startsWith('"') && rest.endsWith('"') && rest.length >= 2) ||
+      (rest.startsWith("'") && rest.endsWith("'") && rest.length >= 2)
+    ) {
+      // Strip surrounding quotes — matches real YAML parser behaviour for
+      // "@fast" style references that need quoting per YAML 1.2 reserved
+      // indicators.
+      out[key] = rest.slice(1, -1);
     } else {
       out[key] = rest;
     }
@@ -601,8 +609,9 @@ describe("bundled Explore.md", () => {
     expect(resolved).toBeDefined();
     const cfg = realParse(resolved!.path);
     expect(cfg).toBeDefined();
-    // Frontmatter contract: read-only model, read-only tools, isolated context.
-    expect(cfg!.model).toMatch(/^anthropic\//);
+    // Frontmatter contract: role-aliased model (resolved via roles-plugin
+    // bridge at spawn time), read-only tools, isolated context.
+    expect(cfg!.model).toBe("@fast");
     expect(cfg!.tools).toBeDefined();
     expect(cfg!.tools).toEqual(expect.arrayContaining(["read"]));
     expect(cfg!.tools).not.toEqual(expect.arrayContaining(["edit"]));

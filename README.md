@@ -231,19 +231,27 @@ explorer informed by Claude Code's Explore agent and the production guidance
 in Ranjan Kumar's *Subagents: How to Run Parallelism Inside a Single Agent
 Session* (April 2026):
 
-- **Model**: `anthropic/claude-haiku-4-5` (literal; works standalone).
+- **Model**: `"@fast"` — role alias resolved at spawn time by the dashboard's
+  roles plugin. Operators pick the underlying model behind `@fast` via
+  Settings → Roles. This makes model choice operator-controlled at runtime
+  rather than baked into the shipped file.
 - **Tools**: `[read, grep, find, ls, bash]` — no write/edit/Agent.
 - **Inherit context**: `false` — fresh window, parent's context not imported.
 - **Output contract**: structured `## Answer / ## Evidence / ## Notes` with
   hard limits (≤2000 tokens, no raw file dumps).
 
-To customise:
+The bundled Explore **requires** the roles-plugin bridge to be loaded (it
+registers the `role:resolve-model` handler on `pi.events` — see Role aliasing
+below). Without it the spawn hard-fails with a clear error.
+
+To customise (e.g. to run without the dashboard, or to pin a specific model):
 
 ```bash
 mkdir -p ~/.pi/agent/agents
 cp "$(node -e 'console.log(require.resolve("pi-dashboard-subagents/agents/Explore.md"))')" \
    ~/.pi/agent/agents/Explore.md
-# Edit ~/.pi/agent/agents/Explore.md — e.g. change `model:` to `"@fast"`
+# Edit ~/.pi/agent/agents/Explore.md — e.g. change `model:` to a literal
+# "provider/model-id" so it works without the roles-plugin bridge.
 ```
 
 The user-global override automatically wins over the bundled file (tier 2 > 3).
