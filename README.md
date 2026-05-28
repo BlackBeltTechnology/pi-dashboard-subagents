@@ -202,7 +202,7 @@ prompt-template / skill files.
 | Field             | Effect                                                                                              |
 | ----------------- | --------------------------------------------------------------------------------------------------- |
 | `description`     | Overrides `displayName` on the dashboard card.                                                      |
-| `model`           | Literal `"provider/id"`, `"provider/id:thinking-level"`, or `"@role"` (see Role aliasing).            |
+| `model`           | `"@role"`, `"provider/model-id"`, `"provider/model-id:thinking"`, or bare `"model-id"`. See [Model resolution](#model-resolution-model). |
 | `tools`           | Allowlist intersected with the parent's active tool set (minus `Agent`). Unknown names dropped silently. |
 | `inherit_context` | `true` → inherit parent context. `false` → isolated. Per-agent; overrides the global `inheritContext`.|
 | `prompt`          | Prepended as `<agent-prompt>...</agent-prompt>` before the task. Body of the `.md` is used if the field is absent. |
@@ -240,9 +240,12 @@ Session* (April 2026):
 - **Output contract**: structured `## Answer / ## Evidence / ## Notes` with
   hard limits (≤2000 tokens, no raw file dumps).
 
-The bundled Explore **requires** the roles-plugin bridge to be loaded (it
-registers the `role:resolve-model` handler on `pi.events` — see Role aliasing
-below). Without it the spawn hard-fails with a clear error.
+The bundled Explore **requires** a `model:resolve` handler to be loaded (so
+`@fast` can be looked up in `~/.pi/agent/providers.json`). The handler ships
+with **pi-agent-dashboard** and (optionally) **pi-flows**. Without one of
+them, `@role` references HARD-FAIL the spawn; literal model ids still resolve
+via the in-process registry fallback. See [Model resolution](#model-resolution-model)
+below.
 
 To customise (e.g. to run without the dashboard, or to pin a specific model):
 
@@ -256,41 +259,146 @@ cp "$(node -e 'console.log(require.resolve("@blackbelt-technology/pi-dashboard-s
 
 The user-global override automatically wins over the bundled file (tier 2 > 3).
 
-### Role aliasing (`@role`)
+### Model resolution (`model:`)
 
-The `model:` field accepts `@role` syntax (e.g. `model: @fast`). The extension
-resolves the alias by emitting on `pi.events`:
+The `model:` field accepts four input forms, in priority order:
+
+| Form                              | Example                            | How it resolves                                                    |
+| --------------------------------- | ---------------------------------- | ------------------------------------------------------------------ |
+| `@role` (role alias)              | `@fast`                            | Handler reads `~/.pi/agent/providers.json#roles` — needs handler.   |
+| `provider/model-id`               | `anthropic/claude-opus-4`          | `pi.modelRegistry.find(provider, id)`.                              |
+| `provider/model-id:thinking`      | `anthropic/claude-haiku-4-5:high`  | Same as above; `:thinking` parsed off and surfaced separately.      |
+| Bare `model-id` ("like" query)    | `claude-haiku-4-5`                 | `pi.modelRegistry.getAll().find(m => m.id === ref)` — first wins.   |
+
+The extension resolves the field in two phases:
+
+**1. Primary — `model:resolve` event.** The extension emits a probe on
+`pi.events`:
 
 ```ts
-const probe = { ref: "@fast" };
-pi.events.emit("role:resolve-model", probe);
-// probe.resolved === "opencode-go/deepseek-v4-flash"  (when a handler is registered)
+const probe = { ref: "@fast" };       // or "anthropic/opus", or "opus-4-5"
+pi.events.emit("model:resolve", probe);
+if (probe.model)   { /* success */ }
+if (probe.error)   { /* handler reported a miss */ }
+// else: silent emit (no handler) — fall through to the fallback below
 ```
 
-The handler is supplied by the **`@blackbelt-technology/pi-dashboard-roles-plugin`**
-bridge (a separate dashboard plugin that reads `~/.pi/agent/providers.json`).
-When the handler is NOT registered (e.g. no dashboard, or the roles plugin is
-disabled), `@role` references HARD-FAIL the tool call with an error message
-identifying:
+A handler is provided by **pi-agent-dashboard** (always) and (optionally)
+**pi-flows**. The handler is responsible for all four input forms above.
 
-- the unresolved role name,
-- the agent `.md` path that specified it,
-- whether the handler was absent vs the role was unknown,
-- suggested fixes (install/enable roles plugin, or use a literal id).
+**2. Fallback — in-process registry.** When the emit returns with both
+`probe.model` and `probe.error` unset (no handler reacted), the extension
+resolves literal forms locally via `pi.modelRegistry`:
 
-**Any pi extension** can use this convention — not just `pi-dashboard-subagents`.
-The contract:
+- `provider/model-id[:thinking]` → `registry.find(provider, id)`
+- Bare `model-id[:thinking]` → `registry.getAll().find(m => m.id === ref)`
+- `@role` → **NOT** supported by the fallback (no `providers.json` access);
+  fails with a clear "install pi-agent-dashboard or pi-flows" message.
+
+This means: **subagents using literal or bare-id models always work**, with
+or without the dashboard. Only `@role` requires a handler.
+
+#### Failure surface
+
+When resolution fails (handler error, fallback miss, no handler for `@role`),
+the tool call returns `isError: true` with a structured message that:
+
+- names the unresolved ref,
+- includes the agent `.md` path that specified it,
+- distinguishes "role unknown" vs "model unknown" vs "no resolver available",
+- suggests the right fix (install plugin, use literal form, add to
+  `providers.json`, etc.),
+- on bare-id misses includes a hint of registered model ids (capped at 20).
+
+#### Implementing a `model:resolve` handler
+
+Any pi extension can register a handler. Use the cooperative early-return
+idiom so multiple handlers (e.g. pi-flows + pi-agent-dashboard) coexist
+without fighting:
 
 ```ts
-interface Probe {
-  ref: string;                                 // input: "@fast"
-  resolved?: string;                           // output: "provider/model-id"
-  available?: Record<string, string>;          // output: { fast: "...", coding: "..." }
+pi.events.on("model:resolve", (probe) => {
+  if (probe.model) return;                  // someone else already handled it
+
+  // 1. @role indirection (if you own roles)
+  // 2. provider/model split + registry.find()
+  // 3. bare-id “like” query against registry.getAll()
+
+  if (resolvedSuccessfully) {
+    probe.resolved      = "provider/id";    // canonical literal
+    probe.model         = m;                // Model object
+    probe.thinkingLevel = thk;              // parsed from ":high" suffix, optional
+    probe.auth          = a;                // optional, registry-defined shape
+  } else {
+    probe.error    ??= reason;              // first error sticks
+    probe.available ??= { roles, models };  // optional diagnostics
+  }
+});
+```
+
+Probe shape (TypeScript):
+
+```ts
+interface ModelResolveProbe {
+  ref: string;                                          // input
+  resolved?: string;                                    // "provider/model-id"
+  model?: Model<any>;
+  thinkingLevel?: "minimal" | "low" | "medium" | "high" | "xhigh" | "off";
+  auth?: { ok?: boolean; error?: string; [k: string]: unknown };
+  error?: string;
+  available?: {
+    roles?: Record<string, string>;
+    models?: string[];
+  };
 }
 ```
 
-The `available` field is best-effort — handlers SHOULD populate it on failure
-so callers can list the configured roles in their error messages.
+#### Standalone behaviour matrix
+
+|                                 | `@role`      | `provider/id` | bare `id`  |
+| ------------------------------- | ------------ | ------------- | ---------- |
+| With pi-agent-dashboard         | event ✅      | event ✅       | event ✅    |
+| With pi-flows (optional handler)| event ✅      | event ✅       | event ✅    |
+| Neither — standalone pi         | ❌ (install)  | fallback ✅    | fallback ✅ |
+
+When neither handler is loaded, only `@role` fails. Literal `provider/model`
+and bare `model-id` continue to work via the in-process registry fallback.
+
+#### Per-call model override (`model` tool-call param)
+
+The `Agent` tool's parameter schema accepts an optional `model` field that
+short-circuits any frontmatter `model:` value:
+
+```js
+Agent({
+  subagent_type: "research-spike",   // any label — no `.md` required
+  description:   "audit auth flow",
+  prompt:        "Review extensions/agent.ts for auth issues.",
+  model:         "@fast",            // OR "anthropic/claude-haiku-4-5"
+                                     // OR bare "claude-haiku-4-5"
+})
+```
+
+The `model` arg accepts the **same three forms** as the frontmatter field
+(`@role`, `provider/model[:thinking]`, bare `model-id`) and resolves via the
+**same `model:resolve` event-bus + in-process fallback** pipeline. No
+duplication, no second resolver — it's the identical machinery.
+
+**Precedence (highest wins):**
+
+```
+  args.model      (tool-call argument)
+   > agentConfig.model    (`.md` frontmatter)
+    > pi default (settings.json)
+```
+
+When `args.model` is non-empty it WINS and the `.md`'s `model:` is ignored.
+When `args.model` is omitted (or empty/whitespace) the `.md` value applies.
+When both are absent, the parent's default model is inherited.
+
+Failure modes are identical to the frontmatter path. Error messages cite
+the source of the unresolvable ref — either the `.md` file path or the
+literal label `(tool-call argument)` — so operators can trace bad refs.
 
 ## Wire-protocol contract
 

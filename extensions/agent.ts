@@ -147,11 +147,14 @@ export function resolveAgentMdPath(
  */
 export interface AgentMdConfig {
   /**
-   * Model reference. Three accepted shapes:
+   * Model reference. Four accepted shapes (resolved in order by the handler):
+   *   • `"@role"`                    role alias (handler-only; needs a
+   *                                   `model:resolve` listener — typically
+   *                                   pi-agent-dashboard or pi-flows).
    *   • `"provider/model-id"`        literal
    *   • `"provider/model-id:level"`  literal with thinking suffix
-   *   • `"@role"`                    role alias (resolved via
-   *                                   `pi.events.emit("role:resolve-model")`)
+   *   • `"model-id"`                 bare; "like" query — first registry
+   *                                   entry whose `m.id === ref` wins.
    * Absent / empty → inherit parent default.
    */
   model?: string;
@@ -341,21 +344,27 @@ function activityFromEvent(event: AgentSessionEvent): string | null | undefined 
 // Maps a frontmatter `model:` string to a concrete `Model<any>` object
 // the SDK can pass to `createAgentSession`. Three accepted input shapes:
 //
-//   1. `"@role"`                        → emit `role:resolve-model` on
-//                                          `pi.events`; the roles-plugin
-//                                          bridge (companion change) fills
-//                                          `probe.resolved` with a literal
-//                                          "provider/id" string.
-//   2. `"provider/id"`                   → literal; passed to
-//                                          `pi.modelRegistry.find(provider, id)`.
-//   3. `"provider/id:thinking-level"`    → literal + thinking suffix; the
-//                                          part after the last `:` becomes
-//                                          `thinkingLevel` and the rest is
-//                                          the model reference.
+// Resolution path: primary (event-bus) → fallback (in-process registry).
+//
+//   PRIMARY  pi.events.emit("model:resolve", probe)
+//            Handler (typically in pi-agent-dashboard or pi-flows)
+//            consumes any of three forms — `@role`, `provider/id`, bare
+//            `id` — and fills `probe.model` + `probe.thinkingLevel` +
+//            `probe.resolved` + `probe.auth`. On miss it fills
+//            `probe.error` (and may fill `probe.available` as a hint).
+//
+//   FALLBACK Used only when the emit returns with BOTH `probe.model` and
+//            `probe.error` unset (silent emit — no handler reacted).
+//            Handles two forms via `pi.modelRegistry` directly:
+//              • `"provider/id[:thk]"` → `registry.find(provider, id)`
+//              • bare `id[:thk]`       → `registry.getAll().find(m=>m.id===id)`
+//            Does NOT handle `@role` (no providers.json access here — that
+//            policy is owned by the dashboard/flows handler).
 //
 // Errors are returned as `{ error, ... }` instead of thrown so the caller
 // can decide whether to fail the tool call hard (the design says yes for
-// `@role` failure) or to fall back to the parent default (no model field).
+// any resolution failure) or to fall back to the parent default (no
+// model field at all).
 
 import type { Model } from "@earendil-works/pi-ai";
 
@@ -376,6 +385,48 @@ export interface ModelResolution {
   thinkingLevel?: ThinkingLevelString;
   /** Human-readable error message (when the reference could not be resolved). */
   error?: string;
+}
+
+/**
+ * Shape of the cooperative probe payload emitted on the `model:resolve`
+ * event. Handlers MUST follow the early-return idiom:
+ *
+ *   pi.events.on("model:resolve", (probe) => {
+ *     if (probe.model) return;             // someone else handled it
+ *     // … attempt resolution …
+ *     if (success) {
+ *       probe.resolved = "provider/id";    // canonical literal
+ *       probe.model = m;                   // Model object
+ *       probe.thinkingLevel = thk;         // optional
+ *       probe.auth = a;                    // optional
+ *     } else {
+ *       probe.error ??= reason;            // first error sticks
+ *       probe.available ??= hint;          // optional diagnostics
+ *     }
+ *   });
+ *
+ * The emitter checks `probe.model` first, then `probe.error`. When both
+ * are unset the emit is treated as silent (no handler) and the in-process
+ * fallback runs.
+ */
+export interface ModelResolveProbe {
+  /** Input — the raw frontmatter string. */
+  ref: string;
+  /** Output — canonical literal "provider/model-id" (no thinking suffix). */
+  resolved?: string;
+  /** Output — the resolved Model object. */
+  model?: Model<any>;
+  /** Output — thinking-level parsed off the suffix, if any. */
+  thinkingLevel?: ThinkingLevelString;
+  /** Output — optional auth resolution (handler-defined shape). */
+  auth?: { ok?: boolean; error?: string; [k: string]: unknown };
+  /** Output — human-readable error when resolution fails. */
+  error?: string;
+  /** Output — diagnostics on failure: known roles / known model ids. */
+  available?: {
+    roles?: Record<string, string>;
+    models?: string[];
+  };
 }
 
 /**
@@ -411,12 +462,34 @@ function splitModelRef(ref: string): {
   };
 }
 
+/** Internal: shape of `pi.modelRegistry` we actually use. Keeps the cast
+ *  centralized; the SDK doesn't declare modelRegistry on ExtensionAPI yet. */
+interface ModelRegistryShape {
+  find?: (provider: string, id: string) => Model<any> | undefined;
+  getAll?: () => Array<Model<any> & { id: string; provider?: string }>;
+}
+
+function getModelRegistry(pi: ExtensionAPI): ModelRegistryShape | undefined {
+  const reg = (pi as unknown as { modelRegistry?: ModelRegistryShape }).modelRegistry;
+  return reg && (typeof reg.find === "function" || typeof reg.getAll === "function")
+    ? reg
+    : undefined;
+}
+
+/** Cap on the size of the `available.models` hint baked into error
+ *  messages. Twenty ids is plenty for a human to spot a typo without
+ *  swamping the tool-result string. */
+const AVAILABLE_MODELS_HINT_CAP = 20;
+
 /**
- * Resolve a frontmatter `model:` reference to a concrete Model object,
- * handling `@role` aliases via the `role:resolve-model` event bus convention.
+ * Resolve a frontmatter `model:` reference to a concrete Model object.
  *
- * @param pi          ExtensionAPI handle (needed for events + modelRegistry).
- * @param ref         Raw string from frontmatter (e.g. "@fast", "anthropic/claude-haiku-4-5").
+ * Primary path: emit `model:resolve` and let a handler answer.
+ * Fallback path: in-process resolution via `pi.modelRegistry` for the two
+ * literal forms (`provider/id`, bare `id`). `@role` requires a handler.
+ *
+ * @param pi          ExtensionAPI handle (events + modelRegistry).
+ * @param ref         Raw frontmatter string (`@fast` | `anthropic/opus` | `opus` | `…:high`).
  * @param agentMdPath Resolved agent .md path — included in error messages so the operator
  *                    knows which file specified the unresolvable reference.
  */
@@ -428,74 +501,154 @@ export function resolveModelFromRef(
   const trimmed = ref.trim();
   if (!trimmed) return { error: "Empty model reference." };
 
-  // ---- @role indirection ----
-  let literal: string = trimmed;
+  // ============== PRIMARY: model:resolve event bus ==============
+  if (pi.events) {
+    const probe: ModelResolveProbe = { ref: trimmed };
+    try {
+      pi.events.emit("model:resolve", probe);
+    } catch (err) {
+      // Handler threw — treat as a hard failure (handler bug).
+      return {
+        error:
+          `"model:resolve" handler threw while resolving "${ref}": ` +
+          `${err instanceof Error ? err.message : String(err)}.` +
+          mdPathLine(agentMdPath),
+      };
+    }
+    if (probe.model) {
+      return { model: probe.model, thinkingLevel: probe.thinkingLevel };
+    }
+    if (typeof probe.error === "string" && probe.error.length > 0) {
+      // Handler ran but rejected the ref — surface its error verbatim and
+      // append diagnostics + the agent md path so the operator can act.
+      return {
+        error:
+          probe.error +
+          formatAvailable(probe.available) +
+          mdPathLine(agentMdPath),
+      };
+    }
+    // Silent emit (no handler, or handler chose not to fill anything) —
+    // fall through to in-process fallback.
+  }
+
+  // ============== FALLBACK: in-process registry =================
+  // The fallback intentionally does NOT read `~/.pi/agent/providers.json`
+  // — role storage policy belongs to the handler. `@role` fails here.
   if (trimmed.startsWith("@")) {
-    const role = trimmed.slice(1);
-    if (!role) return { error: `Invalid role alias "${ref}": empty role name.` };
-    if (!pi.events) {
-      return {
-        error:
-          `Cannot resolve role "${ref}" — pi.events is unavailable, ` +
-          `so the roles-plugin bridge could not be reached.` +
-          (agentMdPath ? `\nAgent definition: ${agentMdPath}` : ""),
-      };
-    }
-    const probe: { ref: string; resolved?: string; available?: Record<string, string> } = {
-      ref: trimmed,
-    };
-    pi.events.emit("role:resolve-model", probe);
-    if (typeof probe.resolved !== "string" || probe.resolved.trim() === "") {
-      const available = probe.available;
-      const availableList =
-        available && typeof available === "object"
-          ? Object.keys(available).map((r) => `@${r}`).sort().join(", ")
-          : "";
-      return {
-        error:
-          `Cannot resolve role "${ref}".\n` +
-          `Either the roles-plugin bridge is not loaded (no handler for ` +
-          `"role:resolve-model" on pi.events), or the role is not assigned in ` +
-          `~/.pi/agent/providers.json.` +
-          (availableList ? `\nAvailable roles: ${availableList}` : "") +
-          (agentMdPath ? `\nAgent definition: ${agentMdPath}` : "") +
-          `\nFix: install/enable the dashboard's roles plugin, assign the role, ` +
-          `or replace the "@role" reference with a literal "provider/model-id".`,
-      };
-    }
-    literal = probe.resolved.trim();
-  }
-
-  // ---- Parse literal "provider/id[:thinking]" ----
-  const { provider, modelId, thinkingLevel } = splitModelRef(literal);
-  if (!provider) {
     return {
       error:
-        `Invalid model reference "${ref}" (resolved to "${literal}"): ` +
-        `expected "provider/model-id" format.` +
-        (agentMdPath ? `\nAgent definition: ${agentMdPath}` : ""),
+        `Cannot resolve role "${ref}": no "model:resolve" handler is registered.\n` +
+        `Role aliasing requires pi-agent-dashboard (or pi-flows with the optional ` +
+        `model:resolve handler) to be loaded.\n` +
+        `Fix: install/enable pi-agent-dashboard or pi-flows, or replace the ` +
+        `"@role" reference with a literal "provider/model-id" or bare model id.` +
+        mdPathLine(agentMdPath),
     };
   }
 
-  const registry: { find?: (p: string, m: string) => Model<any> | undefined } | undefined =
-    (pi as unknown as { modelRegistry?: unknown }).modelRegistry as never;
-  if (!registry || typeof registry.find !== "function") {
+  const registry = getModelRegistry(pi);
+  if (!registry) {
     return {
       error:
-        `Model registry unavailable on pi.modelRegistry — cannot resolve "${ref}".`,
+        `Model registry unavailable on pi.modelRegistry — cannot resolve "${ref}".` +
+        mdPathLine(agentMdPath),
     };
   }
-  const model = registry.find(provider, modelId);
-  if (!model) {
-    return {
-      error:
-        `Model "${provider}/${modelId}" is not registered or not authenticated.` +
-        `\nResolved from "${ref}"` +
-        (agentMdPath ? `; agent definition: ${agentMdPath}` : ".") +
-        `\nRun \`/provider\` or check ~/.pi/agent/auth.json.`,
-    };
+
+  // Parse the thinking suffix before any lookup. `splitModelRef` is
+  // tolerant: when there's no `/` it returns provider=undefined, modelId=
+  // the bare literal. We use that to dispatch between find() and getAll().
+  const { provider, modelId, thinkingLevel } = splitModelRef(trimmed);
+
+  let model: Model<any> | undefined;
+  if (provider) {
+    // provider/model[:thk] form
+    if (typeof registry.find === "function") {
+      model = registry.find(provider, modelId);
+    }
+    if (!model) {
+      return {
+        error:
+          `Model "${provider}/${modelId}" is not registered or not authenticated.\n` +
+          `Resolved from "${ref}".\n` +
+          `Run \`/provider\` or check ~/.pi/agent/auth.json.` +
+          mdPathLine(agentMdPath),
+      };
+    }
+  } else {
+    // Bare-id "like" query. First match in registry.getAll() iteration
+    // order wins. Operators wanting determinism should use the provider/
+    // form.
+    const all = typeof registry.getAll === "function" ? registry.getAll() : [];
+    model = all.find((m) => m && m.id === modelId);
+    if (!model) {
+      const hint = all
+        .map((m) => m && m.id)
+        .filter((s): s is string => typeof s === "string" && s.length > 0)
+        .slice(0, AVAILABLE_MODELS_HINT_CAP);
+      return {
+        error:
+          `No model matched "${ref}" via bare-id lookup.\n` +
+          `Try the explicit "provider/model-id" form, or pick from the registered models.` +
+          (hint.length > 0 ? `\nAvailable model ids: ${hint.join(", ")}` : "") +
+          mdPathLine(agentMdPath),
+      };
+    }
   }
+
   return { model, thinkingLevel };
+}
+
+/** Internal: format the standard "\nAgent definition: <path>" footer. */
+function mdPathLine(p: string | undefined): string {
+  return p ? `\nAgent definition: ${p}` : "";
+}
+
+/** Internal: render `probe.available` as a multi-line hint block. */
+function formatAvailable(av: ModelResolveProbe["available"]): string {
+  if (!av) return "";
+  const parts: string[] = [];
+  if (av.roles && typeof av.roles === "object") {
+    const roleNames = Object.keys(av.roles).sort();
+    if (roleNames.length > 0) {
+      parts.push(`Available roles: ${roleNames.map((r) => `@${r}`).join(", ")}`);
+    }
+  }
+  if (Array.isArray(av.models) && av.models.length > 0) {
+    const ids = av.models.slice(0, AVAILABLE_MODELS_HINT_CAP);
+    parts.push(`Available model ids: ${ids.join(", ")}`);
+  }
+  return parts.length > 0 ? `\n${parts.join("\n")}` : "";
+}
+
+// ─── Effective model-ref selection (precedence: args > config) ────────
+
+export interface EffectiveModelRef {
+  /** The chosen ref string, or undefined if neither source had a non-empty value. */
+  ref: string | undefined;
+  /** Which source the ref came from — informs error message attribution. */
+  source: "args" | "config" | "none";
+}
+
+/**
+ * Apply the precedence rule for model resolution: tool-call `args.model`
+ * wins over `agentConfig.model` when both are non-empty (after trimming).
+ * Empty / whitespace-only values are treated as absent so a buggy caller
+ * sending `model: ""` doesn't shadow a real `.md` value.
+ *
+ * Spec: agent-md-frontmatter "Frontmatter `model` field SHALL drive subagent
+ * model selection" (precedence rule).
+ */
+export function selectEffectiveModelRef(
+  argsModel: string | undefined,
+  configModel: string | undefined,
+): EffectiveModelRef {
+  const a = typeof argsModel === "string" ? argsModel.trim() : "";
+  const c = typeof configModel === "string" ? configModel.trim() : "";
+  if (a.length > 0) return { ref: a, source: "args" };
+  if (c.length > 0) return { ref: c, source: "config" };
+  return { ref: undefined, source: "none" };
 }
 
 // ─── Schema (conditional on exposeInheritanceInTool) ─────────────────────
@@ -510,7 +663,7 @@ export function buildAgentParametersSchema(exposeIsolated: boolean) {
   const base = {
     subagent_type: Type.String({
       description:
-        "Agent type (e.g. 'Explore', 'reviewer'). Resolved against ./.pi/agents/<type>.md or ~/.pi/agent/agents/<type>.md.",
+        "Agent type label. If it matches an `.md` in ./.pi/agents/<type>.md or ~/.pi/agent/agents/<type>.md, that file's frontmatter supplies model/tools/prompt defaults. Otherwise any label works — spawn runs with parent defaults (override via `model` below).",
     }),
     description: Type.String({
       description: "Short human-readable description of the task (5–10 words).",
@@ -518,6 +671,17 @@ export function buildAgentParametersSchema(exposeIsolated: boolean) {
     prompt: Type.String({
       description: "The full task prompt for the subagent.",
     }),
+    // Per-call model override. Accepts the same three forms as the .md
+    // `model:` frontmatter field, resolved through the IDENTICAL
+    // `resolveModelFromRef` mechanism. Wins over `.md` model when both are
+    // present. See spec subagent-emission, capability "`args.model` SHALL be
+    // resolved via the same `resolveModelFromRef` mechanism as `agentConfig.model`".
+    model: Type.Optional(
+      Type.String({
+        description:
+          'Optional model override. Accepts "@role" (e.g. "@fast"), "provider/model-id[:thinking]" (e.g. "anthropic/claude-haiku-4-5:high"), or bare "model-id". Overrides the agent .md `model:` field when both are present. Omit to use the .md value, or to inherit the parent default when no .md matches.',
+      }),
+    ),
   };
   if (!exposeIsolated) {
     return Type.Object(base);
@@ -539,6 +703,13 @@ interface AgentToolArgs {
   subagent_type: string;
   description: string;
   prompt: string;
+  /**
+   * Optional per-call model override. Accepts the same three forms as
+   * frontmatter `model:` ("@role", "provider/model[:thinking]", bare
+   * "model-id"). When non-empty, takes precedence over `agentConfig.model`.
+   * Empty / whitespace strings are treated as absent.
+   */
+  model?: string;
   isolated?: boolean;
 }
 
@@ -549,6 +720,7 @@ function makeAgentTool(exposeIsolated: boolean) {
     description: [
       "Spawn a foreground subagent in-memory with a focused task.",
       "Runs synchronously; returns when the subagent finishes.",
+      "Two modes: (1) curated — when `subagent_type` matches a project/user/bundled `.md`, that file's frontmatter supplies model/tools/prompt defaults; (2) inline — any label works without a `.md`; pass `model` to pick @role / provider/model / bare id at call time.",
       "Subagent's full timeline (tool calls, reasoning, assistant text) is",
       "streamed to the dashboard inspector and embedded in the returned result.",
     ].join(" "),
@@ -663,17 +835,32 @@ export async function runAgentTool(
   });
 
   try {
-    // ── Frontmatter model: resolve before touching the session ──
+    // ── Effective model ref: tool-call `args.model` > .md frontmatter ──
+    // Per spec agent-md-frontmatter precedence rule + spec subagent-emission
+    // "Tool-call `args.model` SHALL take precedence over `agentConfig.model`".
+    const { ref: effectiveModelRef, source: modelRefOrigin } = selectEffectiveModelRef(
+      args.model,
+      agentConfig?.model,
+    );
+    // Source label for error messages: synthetic for tool-call refs, real
+    // path for frontmatter refs. Helps operators trace bad refs.
+    const modelRefSource: string | undefined =
+      modelRefOrigin === "args"
+        ? "(tool-call argument)"
+        : (modelRefOrigin === "config" ? agentMdPath : undefined);
+
+    // ── Resolve before touching the session ──
     // Resolving up-front lets us fail the tool call cleanly (errorResult)
     // when @role can't be resolved, BEFORE we allocate session resources.
     let resolvedModel: Model<any> | undefined;
     let resolvedThinkingLevel: ThinkingLevelString | undefined;
-    if (agentConfig?.model) {
-      const resolution = resolveModelFromRef(pi, agentConfig.model, agentMdPath);
+    if (effectiveModelRef) {
+      const resolution = resolveModelFromRef(pi, effectiveModelRef, modelRefSource);
       if (resolution.error || !resolution.model) {
-        // Hard failure: see design Decision 3. Don't silently fall back
-        // to the parent default — the .md author explicitly requested
-        // this model.
+        // Hard failure: see design Decision 3 of `add-model-resolve-event-
+        // with-fallback`. Don't silently fall back to the parent default —
+        // the caller (tool-call OR .md author) explicitly requested this
+        // model.
         const failedDetails = snapshotDetails("error", resolution.error);
         emitSubagentFailed(pi, {
           agentId,
@@ -683,7 +870,7 @@ export async function runAgentTool(
           details: failedDetails,
         });
         return errorResult(
-          resolution.error ?? `Could not resolve model reference "${agentConfig.model}".`,
+          resolution.error ?? `Could not resolve model reference "${effectiveModelRef}".`,
           failedDetails,
         );
       }

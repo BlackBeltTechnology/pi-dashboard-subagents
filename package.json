@@ -24,7 +24,9 @@
   "files": [
     "extensions/",
     "agents/",
-    "README.md"
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE"
   ],
   "pi": {
     "extensions": [
@@ -32,6 +34,8 @@
     ]
   },
   "scripts": {
+    "lint": "eslint extensions",
+    "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest"
   },
@@ -45,7 +49,12 @@
     "@earendil-works/pi-ai": "^0.75.5",
     "@earendil-works/pi-coding-agent": "^0.75.5",
     "@earendil-works/pi-tui": "^0.75.5",
+    "@eslint/js": "^10.0.1",
     "@sinclair/typebox": "^0.34.49",
+    "@types/node": "^25.8.0",
+    "eslint": "^10.4.0",
+    "typescript": "^6.0.3",
+    "typescript-eslint": "^8.59.3",
     "vitest": "^4.0.0"
   }
 }

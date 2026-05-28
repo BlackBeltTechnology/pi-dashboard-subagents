@@ -116,12 +116,13 @@ describe("saveSettings (atomic write + cache update)", () => {
     expect(s.inheritance.maxChars).toBe(DEFAULT_SETTINGS.inheritance.maxChars);
   });
 
-  it("writes via tmp+rename (no partial files left)", () => {
+  it("writes via tmp+rename (no partial files left)", async () => {
     saveSettings({ inheritContext: false });
     // The settings dir should NOT contain any .tmp-* leftover
     const path = getSettingsPath();
     const dir = path.substring(0, path.lastIndexOf("/"));
-    const entries = require("node:fs").readdirSync(dir);
+    const { readdirSync } = await import("node:fs");
+    const entries = readdirSync(dir);
     const leftover = entries.filter((e: string) => e.includes(".tmp-"));
     expect(leftover.length).toBe(0);
   });
