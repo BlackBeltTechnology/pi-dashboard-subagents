@@ -1,0 +1,234 @@
+name: Release
+
+# Two ways to fire this workflow:
+#
+#   1. Push a tag matching `v*`. The `prepare` job extracts the version
+#      from the tag, then `publish` runs.
+#
+#   2. Click "Run workflow" in the GitHub Actions UI (workflow_dispatch)
+#      and type the version string (e.g. "0.2.0"). The `prepare` job
+#      bumps package.json, commits, tags, and pushes; `publish` runs
+#      against the freshly-pushed tag.
+#
+# Mirrors pi-agent-dashboard's `publish.yml` for the auth path (Trusted
+# Publisher / OIDC — no NPM_TOKEN secret). Stripped for a SINGLE-package
+# repo: no workspace bumps, no Electron matrix, no asset uploads.
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to release (e.g. 0.2.0 or 0.3.0-rc.1)'
+        type: string
+        required: true
+
+jobs:
+  # ── prepare: resolve version + (on dispatch) bump + tag + push ────────────
+  prepare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write  # Used on workflow_dispatch (commit + tag + push).
+    outputs:
+      version:       ${{ steps.resolve.outputs.version }}
+      tag:           ${{ steps.resolve.outputs.tag }}
+      is_prerelease: ${{ steps.resolve.outputs.is_prerelease }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Resolve version
+        id: resolve
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${{ github.event_name }}" == "push" ]]; then
+            tag="${GITHUB_REF_NAME}"
+            version="${tag#v}"
+          else
+            version="${{ github.event.inputs.version }}"
+            if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.-]+)?(\+[A-Za-z0-9.-]+)?$ ]]; then
+              echo "::error::'$version' is not valid semver (X.Y.Z[-prerelease])"
+              exit 1
+            fi
+            if git ls-remote --tags origin "v$version" | grep -q "v$version$"; then
+              echo "::error::tag v$version already exists on origin"
+              exit 1
+            fi
+            tag="v$version"
+          fi
+          # Detect SemVer prerelease (anything with a `-` suffix on the
+          # X.Y.Z core, e.g. `0.3.0-rc.1`). Prereleases publish to npm
+          # under the `next` dist-tag so consumers running plain
+          # `npm install pi-dashboard-subagents` keep getting the last
+          # stable release. Matches pi-agent-dashboard's release pattern.
+          is_prerelease=$([[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+- ]] && echo true || echo false)
+          echo "Resolved: version=$version tag=$tag is_prerelease=$is_prerelease"
+          echo "version=$version"             >> "$GITHUB_OUTPUT"
+          echo "tag=$tag"                     >> "$GITHUB_OUTPUT"
+          echo "is_prerelease=$is_prerelease" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Node.js
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      - name: Install dependencies
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        run: npm ci
+
+      - name: Bump package.json version
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        env:
+          VERSION: ${{ steps.resolve.outputs.version }}
+        run: npm version "$VERSION" --no-git-tag-version --allow-same-version
+
+      - name: Commit, tag, push
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        env:
+          VERSION: ${{ steps.resolve.outputs.version }}
+        run: |
+          set -euo pipefail
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add package.json package-lock.json
+          # Skip the commit step if nothing changed (allow-same-version case).
+          if git diff --cached --quiet; then
+            echo "::notice::package.json already at $VERSION — no version commit needed"
+          else
+            git commit -m "chore(release): v${VERSION}"
+            git push origin "HEAD:${GITHUB_REF_NAME}"
+          fi
+          git tag "v${VERSION}"
+          git push origin "v${VERSION}"
+
+  # ── ci: lint, build, test ─────────────────────────────────────────────────
+  ci:
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.tag }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run tests
+        run: npm test
+
+  # ── publish: npm (Trusted Publisher / OIDC — NO NPM_TOKEN) ───────────────
+  publish:
+    needs: [prepare, ci]
+    runs-on: ubuntu-latest
+    environment: npm-publish  # Matches npm Trusted Publisher config;
+                              # acts as a required-reviewer gate if configured.
+    permissions:
+      contents: read
+      id-token: write  # Required for OIDC token exchange with npm registry.
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Always check out the resolved tag so dispatch-cut releases
+          # publish the freshly-bumped tree, not the branch tip we may
+          # have moved past.
+          ref: ${{ needs.prepare.outputs.tag }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+
+      # Trusted Publishing requires npm CLI ≥ 11.5.1. Node 24 ships a recent
+      # npm, but upgrade explicitly to guarantee the feature is available.
+      # Same step as pi-agent-dashboard's publish.yml.
+      - name: Upgrade npm to latest (trusted publishing)
+        run: npm install -g npm@latest
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Set version from resolved tag
+        # Idempotent: package.json may already be at this version (the
+        # workflow_dispatch path committed it; the tag-push path inherited
+        # it). `--allow-same-version` makes this a no-op when matching.
+        run: npm version "${{ needs.prepare.outputs.version }}" --no-git-tag-version --allow-same-version
+
+      - name: Publish to npm (idempotent, OIDC, provenance-signed)
+        run: |
+          set -uo pipefail
+          VERSION="${{ needs.prepare.outputs.version }}"
+          PRERELEASE="${{ needs.prepare.outputs.is_prerelease }}"
+          # Prereleases land on `next`; stable on default `latest`.
+          TAG_ARG=""
+          if [ "$PRERELEASE" = "true" ]; then TAG_ARG="--tag next"; fi
+          # Skip if already published — lets re-runs after a partial
+          # failure resume cleanly instead of erroring on "cannot publish
+          # over previously published version".
+          if npm view "pi-dashboard-subagents@$VERSION" version >/dev/null 2>&1; then
+            echo "::notice::pi-dashboard-subagents@$VERSION already published — skip"
+            exit 0
+          fi
+          echo "::group::Publishing pi-dashboard-subagents@$VERSION (is_prerelease=$PRERELEASE)"
+          npm publish --provenance --access public $TAG_ARG
+          echo "::endgroup::"
+
+  # ── github-release: create a draft release with notes ────────────────────
+  github-release:
+    needs: [prepare, publish]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.tag }}
+
+      - name: Extract release notes from CHANGELOG (best-effort)
+        id: notes
+        shell: bash
+        run: |
+          set -u
+          version="${{ needs.prepare.outputs.version }}"
+          if [ -f CHANGELOG.md ]; then
+            awk -v ver="${version}" '
+              BEGIN { found=0 }
+              /^## \[/ {
+                if (found) exit
+                if ($0 ~ "^## \\[" ver "\\]") { found=1; next }
+              }
+              found { print }
+            ' CHANGELOG.md > release-notes.md
+            if [ ! -s release-notes.md ]; then
+              echo "::warning::No CHANGELOG section for ${version} — auto-notes will be used"
+              echo "fallback=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "fallback=false" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            echo "::warning::CHANGELOG.md not found — auto-notes will be used"
+            echo "fallback=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.prepare.outputs.tag }}
+          body_path: ${{ steps.notes.outputs.fallback == 'true' && '' || 'release-notes.md' }}
+          generate_release_notes: ${{ steps.notes.outputs.fallback == 'true' }}
+          draft: true
+          prerelease: ${{ needs.prepare.outputs.is_prerelease == 'true' }}

@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  push:
+    branches: [develop, main]
+  pull_request:
+    branches: [develop, main]
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+      - run: npm test
+
+      # Confirm the package can be packed cleanly (catches files[] regressions
+      # — e.g. forgetting to include `agents/` in the publishable artifact).
+      - name: Verify package layout
+        run: |
+          set -euo pipefail
+          npm pack --dry-run --json > pack.json
+          echo "===packed file count==="
+          node -e 'const r=require("./pack.json")[0]; console.log("files:",r.files.length,"size:",r.size,"unpackedSize:",r.unpackedSize)'
+          echo "===packed files (paths)==="
+          node -e 'const r=require("./pack.json")[0]; for (const f of r.files) console.log(" ",f.path)'
+          # Hard-assert critical paths are included.
+          node -e '
+            const r=require("./pack.json")[0];
+            const paths=r.files.map(f=>f.path);
+            const must=[
+              "package.json","README.md",
+              "extensions/index.ts","extensions/agent.ts","extensions/events.ts","extensions/settings.ts",
+              "agents/Explore.md"
+            ];
+            const missing=must.filter(p=>!paths.includes(p));
+            if (missing.length){ console.error("::error::missing from pack:",missing.join(",")); process.exit(1);}
+          '
