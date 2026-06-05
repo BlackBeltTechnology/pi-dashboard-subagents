@@ -6,6 +6,15 @@ All notable changes to this package are documented here. Format follows
 
 ## [Unreleased]
 
+### Changed
+
+- **Release workflow hardening** (`.github/workflows/release.yml`). The
+  `publish` job no longer re-stamps the version with
+  `npm version --allow-same-version`; it now verifies that `package.json`
+  matches the resolved tag and fails loud on drift. `prepare` is the single
+  source of truth for versioning. Prevents silently publishing a tarball
+  whose version was never bumped.
+
 ### Changed — **BREAKING**
 
 - **Renamed event** `role:resolve-model` → `model:resolve` for frontmatter
