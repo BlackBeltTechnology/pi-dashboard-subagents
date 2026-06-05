@@ -1,6 +1,6 @@
 {
   "name": "@blackbelt-technology/pi-dashboard-subagents",
-  "version": "0.2.0",
+  "version": "0.5.5",
   "description": "A lightweight subagent spawning and managing system for pi.",
   "repository": {
     "type": "git",
