@@ -19,13 +19,6 @@ subagent inspector and pop out into a new tab.
 
 ## Context inheritance
 
-> **Status note (v0.1.1 → v0.1.2):** the shipped v0.1.1 of `events.ts`
-> attempted to read parent messages via a non-existent `ReadonlySessionManager.getMessages()`
-> method, so inheritance silently returned an empty prefix. The fix — reading
-> via `getBranch()` + filtering to message entries — lands together with the
-> `extensions/agent.ts` tool registration (see openspec change
-> `scaffold-foreground-subagent-extension` task §9).
-
 By default, every subagent inherits a **compressed copy** of the parent's
 recent conversation. The compression strategy is verbatim-compaction (zero
 hallucination risk, no extra LLM calls):
