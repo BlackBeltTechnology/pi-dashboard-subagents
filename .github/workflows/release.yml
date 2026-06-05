@@ -162,11 +162,24 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Set version from resolved tag
-        # Idempotent: package.json may already be at this version (the
-        # workflow_dispatch path committed it; the tag-push path inherited
-        # it). `--allow-same-version` makes this a no-op when matching.
-        run: npm version "${{ needs.prepare.outputs.version }}" --no-git-tag-version --allow-same-version
+      - name: Verify package.json matches resolved version
+        # `prepare` owns versioning: on workflow_dispatch it bumps + commits
+        # + tags; on tag-push the tag's tree already carries the bumped
+        # package.json. Publish does NOT mutate the version — it asserts the
+        # checked-out tree matches the tag and fails loud on drift (a
+        # hand-pushed tag whose package.json was never bumped). Surfacing the
+        # mismatch beats silently re-stamping it.
+        shell: bash
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          actual=$(node -p "require('./package.json').version")
+          if [ "$actual" != "$VERSION" ]; then
+            echo "::error::package.json version ($actual) does not match release version ($VERSION). The tag must point at a commit whose package.json was bumped by the prepare job."
+            exit 1
+          fi
+          echo "package.json version $actual matches release version $VERSION"
 
       - name: Publish to npm (idempotent, OIDC, provenance-signed)
         run: |
