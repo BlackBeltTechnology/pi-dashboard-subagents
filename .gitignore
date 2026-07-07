@@ -20,6 +20,7 @@ coverage/
 .pi/proposal-queue.json
 .pi/flows/agents/
 .pi/flows/results/
+.pi/dashboard/kb/
 
 # Local environment
 .env
