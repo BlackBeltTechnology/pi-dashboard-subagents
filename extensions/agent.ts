@@ -15,7 +15,7 @@
  */
 
 import { randomUUID } from "node:crypto";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -26,12 +26,14 @@ import {
   type AgentToolResult,
   type AgentToolUpdateCallback,
   createAgentSession,
+  DefaultPackageManager,
   defineTool,
   type ExtensionAPI,
   type ExtensionContext,
   getAgentDir,
   parseFrontmatter,
   SessionManager,
+  SettingsManager,
 } from "@earendil-works/pi-coding-agent";
 
 import {
@@ -83,14 +85,31 @@ const PROGRESS_THROTTLE_MS = 250; // → max 4 emissions/sec/subagent (§3.5)
  * Source tier discriminator returned by `resolveAgentMdPath`. The dashboard
  * card can render this as a small badge so the operator knows which tier
  * supplied the agent definition (e.g. "Explore (bundled)" vs "Explore (user)").
+ *
+ * `"package"` (tier 4, added in the package-agent-discovery change) means the
+ * definition came from another installed pi package's `agents/` directory; the
+ * originating package `source` string is carried alongside in `ResolvedAgentMd.pkg`.
  */
-export type AgentMdSource = "project" | "user" | "bundled";
+export type AgentMdSource = "project" | "user" | "bundled" | "package";
 
 /** Resolved agent .md file: the absolute path plus the tier that supplied it. */
 export interface ResolvedAgentMd {
   path: string;
   source: AgentMdSource;
+  /**
+   * Originating package `source` string (e.g. `@acme/pi-reviewers`). Set ONLY
+   * when `source === "package"`; undefined for the project/user/bundled tiers.
+   */
+  pkg?: string;
 }
+
+/**
+ * Tier-4 package-agent discovery index: agent type (file basename minus `.md`)
+ * → the absolute path of its definition plus the `source` string of the package
+ * that shipped it. Built by `buildPackageAgentIndex`, cached module-side, and
+ * consulted by `resolveAgentMdPath` after the project/user/bundled tiers miss.
+ */
+export type PackageAgentIndex = Map<string, { path: string; pkg: string }>;
 
 /**
  * Resolve the absolute path to an agent's `.md` definition file.
@@ -99,22 +118,32 @@ export interface ResolvedAgentMd {
  *   1. `<cwd>/.pi/agents/<type>.md`        → `source: "project"`
  *   2. `<getAgentDir()>/agents/<type>.md`  → `source: "user"`
  *   3. `<EXTENSION_ROOT>/agents/<type>.md` → `source: "bundled"`
+ *   4. `<installedPath>/agents/<type>.md`  → `source: "package"` (via `packageIndex`)
+ *
+ * The package tier (4) is consulted ONLY when tiers 1–3 all miss — no name that
+ * resolves via a higher tier can be shadowed by a package agent.
  *
  * Returns `undefined` for built-in / anonymous agents that have no
  * matching `.md` at any tier.
  *
- * @param agentType  The `subagent_type` argument from the LLM.
- * @param cwd        The session's working directory (drives the project tier).
- * @param bundledDir Optional override for the bundled tier (test seam).
- *                   Defaults to `BUNDLED_AGENTS_DIR`.
+ * @param agentType    The `subagent_type` argument from the LLM.
+ * @param cwd          The session's working directory (drives the project tier).
+ * @param bundledDir   Optional override for the bundled tier (test seam).
+ *                     Defaults to `BUNDLED_AGENTS_DIR`.
+ * @param packageIndex Tier-4 discovery index. Defaults to an EMPTY Map (pure-
+ *                     function test seam) so callers that omit it never consult
+ *                     module state; production callers pass the cached index
+ *                     from `ensurePackageAgentIndex`.
  */
 export function resolveAgentMdPath(
   agentType: string,
   cwd: string,
   bundledDir: string = BUNDLED_AGENTS_DIR,
+  packageIndex: PackageAgentIndex = new Map(),
 ): ResolvedAgentMd | undefined {
   // Defensive: reject path-traversal in the type name. The LLM controls
-  // this string; we never want it to escape the agents directory.
+  // this string; we never want it to escape the agents directory. This MUST
+  // short-circuit before any filesystem access or package-index lookup.
   if (!agentType || agentType.includes("/") || agentType.includes("\\") || agentType.includes("..")) {
     return undefined;
   }
@@ -129,7 +158,139 @@ export function resolveAgentMdPath(
   }
   const bundledPath = join(bundledDir, `${agentType}.md`);
   if (existsSync(bundledPath)) return { path: bundledPath, source: "bundled" };
+  // Tier 4: package discovery index (only reached when 1–3 all missed).
+  const pkgEntry = packageIndex.get(agentType);
+  if (pkgEntry) return { path: pkgEntry.path, source: "package", pkg: pkgEntry.pkg };
   return undefined;
+}
+
+// ─── Package-agent discovery (tier 4) ─────────────────────────────
+//
+// USER-SCOPE ONLY. The installed SDK exposes no project-trust signal to
+// extensions, so project-scoped packages are never indexed for agents (see
+// design Decision 5). Only packages installed into `<agentDir>` (scope
+// "user") — an explicit operator act — contribute spawnable agents.
+
+/**
+ * Minimal structural view of the SDK's `ConfiguredPackage` (the concrete type
+ * is not re-exported from the package entry point). Only the fields discovery
+ * reads are declared.
+ */
+interface ConfiguredPackageLike {
+  source: string;
+  scope: "user" | "project";
+  filtered: boolean;
+  installedPath?: string;
+}
+
+/**
+ * Scan installed pi packages for `agents/*.md` and build the tier-4 discovery
+ * index (see `PackageAgentIndex`).
+ *
+ * Behaviour (all defensive — this function NEVER throws):
+ *   - Constructs `SettingsManager.create(cwd, agentDir)` +
+ *     `new DefaultPackageManager(…)` and calls `listConfiguredPackages()` inside
+ *     a try/catch; any failure (construction or listing) yields an EMPTY index.
+ *   - Keeps ONLY `scope === "user"` packages (project scope is never indexed),
+ *     that are not `filtered`, and that have a defined `installedPath`.
+ *   - De-dupes by `source` (a source listed twice collapses to one logical
+ *     package — no spurious self-collision warning).
+ *   - Scans packages in a stable order (ascending by `source`); the first
+ *     package to claim a given basename wins. A later duplicate from a
+ *     DIFFERENT source is dropped and logged to stderr naming both sources.
+ *   - A missing/unreadable `agents/` dir or a non-`.md` entry is skipped
+ *     silently.
+ *
+ * @param cwd      The session working directory (drives project-settings load).
+ * @param agentDir The user agent dir (`getAgentDir()` in production).
+ */
+export function buildPackageAgentIndex(cwd: string, agentDir: string): PackageAgentIndex {
+  const index: PackageAgentIndex = new Map();
+
+  let packages: ConfiguredPackageLike[];
+  try {
+    const settingsManager = SettingsManager.create(cwd, agentDir);
+    const pm = new DefaultPackageManager({ cwd, agentDir, settingsManager });
+    packages = pm.listConfiguredPackages() as ConfiguredPackageLike[];
+  } catch (err) {
+    console.warn(
+      "[pi-dashboard-subagents] Package-agent discovery skipped (package manager unavailable):",
+      err instanceof Error ? err.message : err,
+    );
+    return index;
+  }
+
+  // User-scope only + drop filtered + require an installed path on disk.
+  const eligible = (packages ?? []).filter(
+    (p): p is ConfiguredPackageLike & { installedPath: string } =>
+      !!p && p.scope === "user" && !p.filtered && typeof p.installedPath === "string" && p.installedPath.length > 0,
+  );
+
+  // De-dupe by source (keep first); a source listed twice is one package.
+  const bySource = new Map<string, ConfiguredPackageLike & { installedPath: string }>();
+  for (const p of eligible) {
+    if (!bySource.has(p.source)) bySource.set(p.source, p);
+  }
+
+  // Stable cross-package order for deterministic collision winners.
+  const ordered = [...bySource.values()].sort((a, b) =>
+    a.source < b.source ? -1 : a.source > b.source ? 1 : 0,
+  );
+
+  for (const pkg of ordered) {
+    let entries: string[];
+    try {
+      entries = readdirSync(join(pkg.installedPath, "agents"));
+    } catch {
+      continue; // no agents/ dir, unreadable, or not a directory — skip
+    }
+    for (const entry of entries) {
+      if (!entry.endsWith(".md")) continue;
+      const type = entry.slice(0, -3);
+      if (!type) continue;
+      const path = join(pkg.installedPath, "agents", entry);
+      const existing = index.get(type);
+      if (existing) {
+        if (existing.pkg !== pkg.source) {
+          console.warn(
+            `[pi-dashboard-subagents] Agent "${type}" is shipped by multiple packages; ` +
+              `keeping "${existing.pkg}" (${existing.path}), dropping "${pkg.source}" (${path}).`,
+          );
+        }
+        continue; // first match wins
+      }
+      index.set(type, { path, pkg: pkg.source });
+    }
+  }
+  return index;
+}
+
+// Module-level cache, keyed by the cwd it was built for. Rebuilt on a cwd
+// change (in-process session switch) or a `resources_discover` reload.
+let packageAgentIndex: PackageAgentIndex | undefined;
+let indexedCwd: string | undefined;
+
+/**
+ * Rebuild the cached package-agent index unconditionally for `cwd` and return
+ * it. Called from the `resources_discover` handler (startup + reload).
+ */
+export function refreshPackageAgentIndex(cwd: string, agentDir: string): PackageAgentIndex {
+  packageAgentIndex = buildPackageAgentIndex(cwd, agentDir);
+  indexedCwd = cwd;
+  return packageAgentIndex;
+}
+
+/**
+ * Return the cached package-agent index, building it lazily when unbuilt or
+ * when `cwd` has changed since the last build (so an in-process cwd switch
+ * rebuilds rather than serving stale results). Used as the first-spawn
+ * fallback for hosts that never fire `resources_discover`.
+ */
+export function ensurePackageAgentIndex(cwd: string, agentDir: string): PackageAgentIndex {
+  if (!packageAgentIndex || cwd !== indexedCwd) {
+    return refreshPackageAgentIndex(cwd, agentDir);
+  }
+  return packageAgentIndex;
 }
 
 // ─── Agent .md frontmatter parsing ─────────────────────────────────────
@@ -766,10 +927,20 @@ export async function runAgentTool(
   const agentId = randomUUID();
   const startedAt = Date.now();
 
-  // ── Resolve the agent .md (3-tier: project → user → bundled) ──
-  const resolvedMd = resolveAgentMdPath(args.subagent_type, cwd);
+  // ── Resolve the agent .md (4-tier: project → user → bundled → package) ──
+  // Ensure the package discovery index is built (fallback for hosts that never
+  // fire `resources_discover`, and the cwd-change rebuild path). Best-effort:
+  // a failed/empty index must never block the spawn.
+  let pkgIndex: PackageAgentIndex | undefined;
+  try {
+    pkgIndex = ensurePackageAgentIndex(cwd, getAgentDir());
+  } catch {
+    // Discovery unavailable — resolve without tier 4 (undefined → empty Map).
+  }
+  const resolvedMd = resolveAgentMdPath(args.subagent_type, cwd, BUNDLED_AGENTS_DIR, pkgIndex);
   const agentMdPath = resolvedMd?.path;
   const agentMdSource = resolvedMd?.source;
+  const agentMdPkg = resolvedMd?.pkg;
 
   // ── Parse frontmatter from the resolved .md (or undefined if none) ──
   // Undefined on missing file, empty frontmatter, or malformed YAML.
@@ -809,6 +980,7 @@ export async function runAgentTool(
       modelName,
       agentMdPath,
       agentMdSource,
+      agentMdPkg,
       error,
     });
   }
@@ -1133,4 +1305,18 @@ export default function activate(pi: ExtensionAPI): void {
   capturedPi = pi;
   const exposeIsolated = shouldExposeInheritanceInTool();
   pi.registerTool(makeAgentTool(exposeIsolated));
+
+  // Build/refresh the package-agent discovery index whenever pi (re)discovers
+  // resources. `cwd` is NOT available at activate() — it arrives on the event.
+  // Fires on BOTH `reason: "startup"` and `"reload"` (not gated on reason).
+  // Side-effect-only: returns undefined (no ResourcesDiscoverResult fabricated).
+  // A discovery failure must never block resource discovery or tool registration.
+  pi.on("resources_discover", (event) => {
+    try {
+      refreshPackageAgentIndex(event.cwd, getAgentDir());
+    } catch {
+      /* best-effort — never throw out of a lifecycle handler */
+    }
+    return undefined;
+  });
 }

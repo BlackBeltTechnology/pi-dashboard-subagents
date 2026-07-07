@@ -78,10 +78,14 @@ import activate, {
   type AgentMdConfig,
   type AgentMdSource,
   type ModelResolution,
+  type PackageAgentIndex,
   type ResolvedAgentMd,
+  buildPackageAgentIndex,
   BUNDLED_AGENTS_DIR,
+  ensurePackageAgentIndex,
   EXTENSION_ROOT,
   parseAgentMd,
+  refreshPackageAgentIndex,
   resolveAgentMdPath,
   resolveModelFromRef,
 } from "./agent.js";
@@ -121,16 +125,21 @@ export {
   shouldInheritByDefault,
 };
 
-// Agent .md frontmatter + 3-tier resolution + role-alias resolver.
-// See change: add-agent-md-frontmatter-and-bundled-explore.
+// Agent .md frontmatter + 4-tier resolution + role-alias resolver.
+// See change: add-agent-md-frontmatter-and-bundled-explore,
+//             add-package-agent-discovery-tier (package tier + discovery index).
 export {
   type AgentMdConfig,
   type AgentMdSource,
   type ModelResolution,
+  type PackageAgentIndex,
   type ResolvedAgentMd,
+  buildPackageAgentIndex,
   BUNDLED_AGENTS_DIR,
+  ensurePackageAgentIndex,
   EXTENSION_ROOT,
   parseAgentMd,
+  refreshPackageAgentIndex,
   resolveAgentMdPath,
   resolveModelFromRef,
 };
