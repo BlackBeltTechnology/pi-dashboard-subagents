@@ -68,12 +68,21 @@ export interface AgentDetails {
   /**
    * Which tier of the agent-resolution chain supplied `agentMdPath`.
    * Additive in v0.2.0 — the dashboard card may render "(bundled)" /
-   * "(user)" / "(project)" badges. Undefined when `agentMdPath` is
+   * "(user)" / "(project)" / "(package)" badges. Undefined when `agentMdPath` is
    * undefined or when the producer is older than v0.2.0.
    *
-   * See change: add-agent-md-frontmatter-and-bundled-explore.
+   * See change: add-agent-md-frontmatter-and-bundled-explore,
+   *             add-package-agent-discovery-tier (`"package"` tier).
    */
-  agentMdSource?: "project" | "user" | "bundled";
+  agentMdSource?: "project" | "user" | "bundled" | "package";
+  /**
+   * Originating package `source` string when `agentMdSource === "package"`
+   * (e.g. `@acme/pi-reviewers`). Lets the dashboard card render
+   * "reviewer (package: @acme/pi-reviewers)". Undefined for other tiers.
+   *
+   * See change: add-package-agent-discovery-tier.
+   */
+  agentMdPkg?: string;
   error?: string;
 }
 
@@ -472,7 +481,12 @@ export function buildDetails(snapshot: {
    * Which tier of the agent-resolution chain supplied `agentMdPath`.
    * See `AgentDetails.agentMdSource` for the wire-contract docs.
    */
-  agentMdSource?: "project" | "user" | "bundled";
+  agentMdSource?: "project" | "user" | "bundled" | "package";
+  /**
+   * Originating package `source` string when `agentMdSource === "package"`.
+   * See `AgentDetails.agentMdPkg` for the wire-contract docs.
+   */
+  agentMdPkg?: string;
   error?: string;
 }): AgentDetails {
   return {
@@ -493,6 +507,7 @@ export function buildDetails(snapshot: {
     tags: snapshot.tags,
     agentMdPath: snapshot.agentMdPath,
     agentMdSource: snapshot.agentMdSource,
+    agentMdPkg: snapshot.agentMdPkg,
     error: snapshot.error,
   };
 }

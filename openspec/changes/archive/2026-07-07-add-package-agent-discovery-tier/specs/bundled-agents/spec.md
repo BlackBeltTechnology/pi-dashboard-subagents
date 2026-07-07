@@ -1,3 +1,8 @@
+## RENAMED Requirements
+
+- FROM: `### Requirement: Agent resolution SHALL use a three-tier fallback`
+- TO: `### Requirement: Agent resolution SHALL use a four-tier fallback`
+
 ## MODIFIED Requirements
 
 ### Requirement: Agent resolution SHALL use a four-tier fallback

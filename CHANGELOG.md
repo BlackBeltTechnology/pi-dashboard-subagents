@@ -6,6 +6,23 @@ All notable changes to this package are documented here. Format follows
 
 ## [Unreleased]
 
+### Added
+
+- **Package agent-discovery tier.** The `Agent` tool now resolves agent `.md`
+  files across **four** tiers: project → user → bundled → **package**. Any
+  installed pi package that ships `agents/<name>.md` (and includes `agents/` in
+  its `files[]`) contributes `<name>` as a spawnable agent — no manual copying
+  into `.pi/agents/` required. The package tier ranks last, so nothing that
+  resolves today can be shadowed. Discovery is **user-scope only** (packages
+  installed into `~/.pi/agent`); project-scoped packages are never indexed, so
+  an untrusted checkout cannot register spawnable agents. Cross-package name
+  collisions resolve deterministically (smaller `source` string wins) with a
+  stderr warning naming both. Discovery is lazy + cached, rebuilding on
+  `/reload` or a working-directory change. Package-sourced agents carry
+  `source: "package"` plus the originating package string (`agentMdPkg`) into
+  `AgentDetails` so the dashboard card can render "reviewer (package:
+  @acme/pi-reviewers)".
+
 ### Changed
 
 - **Release workflow hardening** (`.github/workflows/release.yml`). The

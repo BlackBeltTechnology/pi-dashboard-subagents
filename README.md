@@ -203,19 +203,60 @@ prompt-template / skill files.
 All fields are read once at spawn time. Editing the `.md` while a subagent is
 running has no effect on that subagent; the next spawn picks up changes.
 
-### Three-tier resolution
+### Four-tier resolution
 
 When the LLM calls `Agent({ subagent_type: "Explore", ... })`, the extension
-looks up `Explore.md` in three tiers, most-specific first:
+looks up `Explore.md` in four tiers, most-specific first:
 
 ```
 1. <cwd>/.pi/agents/Explore.md          → source: "project"   (per-project override)
 2. ~/.pi/agent/agents/Explore.md        → source: "user"      (per-user override)
 3. <EXTENSION_ROOT>/agents/Explore.md   → source: "bundled"   (ships with this package)
+4. <installedPath>/agents/Explore.md    → source: "package"   (any other installed pi package)
 ```
 
 The first match wins. The tier is surfaced as `AgentDetails.agentMdSource` so
-the dashboard card can render "Explore (bundled)" / "Explore (user)" badges.
+the dashboard card can render "Explore (bundled)" / "Explore (user)" badges;
+for tier 4 the originating package is also carried in `AgentDetails.agentMdPkg`
+("reviewer (package: @acme/pi-reviewers)").
+
+### Shipping agents from a package
+
+Any installed pi package can ship spawnable agents — no manual copying into
+`.pi/agents/` required. Drop `agents/<name>.md` into the package, make sure
+`agents/` is included in the package's `files[]` (so it ends up in the
+published tarball), install the package, and `Agent({ subagent_type: "<name>" })`
+can spawn it. The `.md` uses the exact same [frontmatter schema](#frontmatter-schema)
+as project/user/bundled agents.
+
+```jsonc
+// the providing package's package.json
+{
+  "files": ["agents/", "..."]
+}
+```
+
+Resolution rules for the package tier:
+
+- **Ranks last (tier 4).** Package agents fill a name only when the project,
+  user, and bundled tiers all miss — no name that resolves today can be
+  shadowed by a newly installed package. Place a `.pi/agents/<name>.md` in your
+  project (or `~/.pi/agent/agents/<name>.md`) to override a package agent.
+- **User-scope only.** Only packages installed into `~/.pi/agent` (user scope)
+  are scanned. Project-scoped packages (declared in a repo's `.pi/settings.json`)
+  are **never** indexed for agents — an untrusted checkout cannot register
+  spawnable agents. (The installed pi SDK exposes no project-trust signal to
+  gate on, so discovery stays user-scope-only.)
+- **Deterministic collisions.** If two packages ship the same basename, the
+  package whose `source` string sorts first wins; the loser is dropped and a
+  warning naming both is written to stderr.
+- **`filtered` packages skipped.** A package configured with a resource
+  allowlist (`{ source, skills: [...] }` form) contributes no agents — there is
+  no `agents` filter key, so it is treated as not opted in.
+- **Discovery is lazy + cached.** The index is built on `resources_discover`
+  (startup / `/reload`) and, as a fallback, on the first spawn; it rebuilds on
+  `/reload` or a working-directory change. A newly installed package becomes
+  spawnable after `/reload` (no full restart needed).
 
 ### Bundled `Explore` agent
 
@@ -447,8 +488,9 @@ The `details` payload (defined in `extensions/events.ts`) carries everything the
 | `durationMs`   | `number`                        | Elapsed milliseconds since `subagents:created`                            |
 | `modelName?`   | `string`                        | Resolved model id (e.g. `"claude-sonnet-4-6"`)                          |
 | `tags?`        | `string[]`                      | Notable config flags (e.g. `["thinking: high"]`)                         |
-| `agentMdPath?` | `string`                        | Absolute path to the `.md` definition (project > user > bundled)         |
-| `agentMdSource?` | `"project" \| "user" \| "bundled"` | Tier that supplied `agentMdPath`. v0.2.0+. Undefined when path is undefined or producer is older. |
+| `agentMdPath?` | `string`                        | Absolute path to the `.md` definition (project > user > bundled > package) |
+| `agentMdSource?` | `"project" \| "user" \| "bundled" \| "package"` | Tier that supplied `agentMdPath`. v0.2.0+ (`"package"` added in the package-discovery tier). Undefined when path is undefined or producer is older. |
+| `agentMdPkg?`  | `string`                        | Originating package `source` string when `agentMdSource === "package"` (e.g. `"@acme/pi-reviewers"`); undefined otherwise |
 | `error?`       | `string`                        | Set on `failed` emissions                                                |
 
 ### `SubagentTimelineEntry` kinds

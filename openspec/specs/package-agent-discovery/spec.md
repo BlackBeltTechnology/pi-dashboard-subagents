@@ -1,5 +1,8 @@
-## ADDED Requirements
+# package-agent-discovery Specification
 
+## Purpose
+TBD - created by archiving change add-package-agent-discovery-tier. Update Purpose after archive.
+## Requirements
 ### Requirement: The extension SHALL discover agents shipped by installed pi packages
 
 The extension SHALL scan every installed pi package for an `agents/` directory and register
@@ -40,19 +43,19 @@ any network activity (i.e. it SHALL NOT call `PackageManager.resolve()` with an 
 - **WHEN** the discovery index is built
 - **THEN** that package SHALL be skipped for agent discovery even if it ships `agents/*.md`
 
-#### Scenario: Same source in both scopes is de-duplicated (project wins)
+#### Scenario: Same source in both scopes is de-duplicated (user entry kept, project ignored)
 
 - **GIVEN** the same package `source` is configured in BOTH `user` and `project` scope, and both ship `agents/reviewer.md`
 - **WHEN** the discovery index is built
-- **THEN** the source SHALL be de-duplicated to a single entry, keeping the `project`-scope entry (mirroring pi's `dedupePackages`)
+- **THEN** the source SHALL contribute a single entry from its `user`-scope form (the `project`-scope form is never indexed — see the user-scope-only requirement)
 - **AND** NO cross-package collision warning SHALL be emitted for this single logical package
 
 ### Requirement: Package discovery SHALL be built lazily, cached, and rebuilt on reload
 
 The extension SHALL NOT build the index at `activate(pi)` (the extension factory receives no `cwd`).
 It SHALL build the index lazily from an `ExtensionContext` — from the `resources_discover` handler's
-`ctx` (on `reason` `"startup"` or `"reload"`) and/or on the first `Agent` spawn's `ctx` — using
-`ctx.cwd` and `ctx.isProjectTrusted()`. It SHALL cache the result (keyed by `cwd`) and reuse it for
+`ctx`/event (on `reason` `"startup"` or `"reload"`) and/or on the first `Agent` spawn's `ctx` — using
+`cwd` (there is no trust signal to read — see the user-scope-only requirement). It SHALL cache the result (keyed by `cwd`) and reuse it for
 per-spawn resolution, which SHALL NOT walk the filesystem across all packages on each call. It SHALL
 rebuild when `cwd` changes or on `resources_discover` `reason: "reload"`.
 
@@ -74,7 +77,7 @@ rebuild when `cwd` changes or on `resources_discover` `reason: "reload"`.
 
 - **GIVEN** the host never fires `resources_discover` AND the index is unbuilt
 - **WHEN** the first `Agent` tool call runs with `ctx`
-- **THEN** the index SHALL be built from `ctx.cwd` + `ctx.isProjectTrusted()` before resolution
+- **THEN** the index SHALL be built from `ctx.cwd` before resolution
 
 #### Scenario: Index rebuilds on reload
 
@@ -102,9 +105,9 @@ winning path.
 
 ### Requirement: Package discovery SHALL degrade safely and never break higher tiers
 
-Any failure in the discovery step SHALL degrade to an empty-or-partial index and SHALL NOT throw
-(package-manager construction failure, unreadable directory, settings errors, or a mid-iteration
-throw from `listConfiguredPackages()`). The project, user, and bundled resolution tiers SHALL
+Any failure in the discovery step SHALL degrade to an empty index and SHALL NOT throw
+(package-manager construction failure, unreadable directory, settings errors, or a throw from
+`listConfiguredPackages()`). The project, user, and bundled resolution tiers SHALL
 continue to function even when package discovery fails entirely.
 
 #### Scenario: Discovery failure yields empty index, higher tiers still work
@@ -117,34 +120,38 @@ continue to function even when package discovery fails entirely.
 
 #### Scenario: listConfiguredPackages throwing mid-iteration is contained
 
-- **GIVEN** `listConfiguredPackages()` throws partway through enumeration (e.g. a project-scope trust assert)
+- **GIVEN** `listConfiguredPackages()` throws during enumeration (e.g. a settings read error)
 - **WHEN** the discovery index is built
 - **THEN** the throw SHALL be caught
-- **AND** the index SHALL contain any user-scope entries already gathered where recoverable, else be empty
+- **AND** the index SHALL be empty
 - **AND** no error SHALL propagate
 
-### Requirement: Package discovery SHALL be scope-split by trust and SHALL surface provenance
+### Requirement: Package discovery SHALL be user-scope-only and SHALL surface provenance
 
-Discovery SHALL thread the session's real trust state into the constructed settings manager via
-`SettingsManager.create(cwd, agentDir, { projectTrusted: ctx.isProjectTrusted() })` — the option
-SHALL NOT be omitted (omission defaults to trusted and bypasses pi's project-trust gate).
-User-scoped package agents SHALL always be discovered. Project-scoped package agents SHALL be
-discovered ONLY when the project is trusted, matching pi's `assertProjectTrustedForScope`.
+Discovery SHALL scan ONLY packages with `scope === "user"` (installed into `<agentDir>` by the
+operator). Project-scoped packages SHALL NOT be indexed for agents, regardless of any trust state.
+The rationale is an SDK constraint: the installed `@earendil-works/pi-coding-agent` exposes no
+project-trust signal to extensions (`ExtensionContext` has no `isProjectTrusted()`,
+`SettingsManager.create(cwd, agentDir?)` takes no trust option, and `listConfiguredPackages()`
+performs no trust assert), so trust cannot be read to gate project scope. User-scope-only is
+strictly more conservative than a trust gate and closes the untrusted-checkout injection surface
+entirely.
+
 Provenance SHALL be surfaced: a package-sourced agent SHALL carry `source: "package"` and the
 originating package `source` string through to `AgentDetails`, and the operator SHALL be able to
 shadow any package agent by placing a project- or user-tier `.md` of the same name.
 
-#### Scenario: Untrusted project does not expose project-scoped package agents
+#### Scenario: Project-scoped package agents are never discovered
 
-- **GIVEN** the project is untrusted AND a project-scoped local package declares `agents/pwn.md`
-- **WHEN** the discovery index is built with `projectTrusted: false`
+- **GIVEN** a project-scoped local package declares `agents/pwn.md`
+- **WHEN** the discovery index is built
 - **THEN** `pwn` SHALL NOT be registered in the index
 - **AND** `Agent({ subagent_type: "pwn" })` SHALL NOT spawn a package-sourced agent
 
-#### Scenario: User-scoped package agents are discovered regardless of project trust
+#### Scenario: User-scoped package agents are discovered
 
-- **GIVEN** the project is untrusted AND a user-scoped package (installed under `<agentDir>`) ships `agents/reviewer.md`
-- **WHEN** the discovery index is built with `projectTrusted: false`
+- **GIVEN** a user-scoped package (installed under `<agentDir>`) ships `agents/reviewer.md`
+- **WHEN** the discovery index is built
 - **THEN** `reviewer` SHALL be registered with `source: "package"`
 
 #### Scenario: Operator shadows a package agent locally
@@ -153,3 +160,4 @@ shadow any package agent by placing a project- or user-tier `.md` of the same na
 - **WHEN** the operator creates `<cwd>/.pi/agents/reviewer.md`
 - **THEN** `resolveAgentMdPath("reviewer", cwd)` SHALL return `source: "project"`
 - **AND** the package-tier definition SHALL NOT be used
+
