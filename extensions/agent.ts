@@ -1086,6 +1086,13 @@ export async function runAgentTool(
     const createResult = await createAgentSession({
       cwd,
       sessionManager,
+      // Inherit the parent session's live registry so the subagent sees every
+      // provider registered on it — including custom providers from
+      // providers.json (models AND providerRequestConfigs auth). Without this,
+      // createAgentSession builds a fresh disk registry that lacks custom
+      // providers → "No API key found for <provider>".
+      ...(ctx.modelRegistry ? { modelRegistry: ctx.modelRegistry } : {}),
+      ...(ctx.modelRegistry?.authStorage ? { authStorage: ctx.modelRegistry.authStorage } : {}),
       ...(resolvedModel ? { model: resolvedModel } : {}),
       ...(resolvedThinkingLevel && resolvedThinkingLevel !== "off"
         ? { thinkingLevel: resolvedThinkingLevel }
