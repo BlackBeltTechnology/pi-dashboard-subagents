@@ -166,10 +166,15 @@ export function resolveAgentMdPath(
 
 // ─── Package-agent discovery (tier 4) ─────────────────────────────
 //
-// USER-SCOPE ONLY. The installed SDK exposes no project-trust signal to
-// extensions, so project-scoped packages are never indexed for agents (see
-// design Decision 5). Only packages installed into `<agentDir>` (scope
-// "user") — an explicit operator act — contribute spawnable agents.
+// USER-SCOPE ONLY (deliberate design choice, not an SDK limitation). Only
+// packages installed into `<agentDir>` (scope "user") — an explicit operator
+// act — contribute spawnable agents. Project-scoped packages are intentionally
+// NOT indexed: skipping them closes the untrusted-checkout injection surface
+// entirely without having to reason about trust (see design Decision 5).
+// NOTE: the SDK *does* expose a project-trust signal
+// (`ExtensionContext.isProjectTrusted()`, `SettingsManagerCreateOptions.projectTrusted`),
+// so a future opt-in could gate project scope on trust — deferred by choice,
+// not a capability gap.
 
 /**
  * Minimal structural view of the SDK's `ConfiguredPackage` (the concrete type

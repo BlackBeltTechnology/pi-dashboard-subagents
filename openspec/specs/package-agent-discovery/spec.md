@@ -130,12 +130,12 @@ continue to function even when package discovery fails entirely.
 
 Discovery SHALL scan ONLY packages with `scope === "user"` (installed into `<agentDir>` by the
 operator). Project-scoped packages SHALL NOT be indexed for agents, regardless of any trust state.
-The rationale is an SDK constraint: the installed `@earendil-works/pi-coding-agent` exposes no
-project-trust signal to extensions (`ExtensionContext` has no `isProjectTrusted()`,
-`SettingsManager.create(cwd, agentDir?)` takes no trust option, and `listConfiguredPackages()`
-performs no trust assert), so trust cannot be read to gate project scope. User-scope-only is
-strictly more conservative than a trust gate and closes the untrusted-checkout injection surface
-entirely.
+The rationale is a deliberate conservative design choice, NOT an SDK limitation: installing a
+package into `<agentDir>` is the operator's explicit consent, and skipping project-scoped packages
+closes the untrusted-checkout injection surface entirely without having to reason about trust.
+(The SDK *does* expose a project-trust signal — `ExtensionContext.isProjectTrusted()` and
+`SettingsManagerCreateOptions.projectTrusted` exist — so a future opt-in MAY gate project scope on
+trust; that is deferred by choice, not a capability gap.)
 
 Provenance SHALL be surfaced: a package-sourced agent SHALL carry `source: "package"` and the
 originating package `source` string through to `AgentDetails`, and the operator SHALL be able to

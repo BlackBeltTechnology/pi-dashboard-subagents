@@ -245,8 +245,12 @@ Resolution rules for the package tier:
 - **User-scope only.** Only packages installed into `~/.pi/agent` (user scope)
   are scanned. Project-scoped packages (declared in a repo's `.pi/settings.json`)
   are **never** indexed for agents — an untrusted checkout cannot register
-  spawnable agents. (The installed pi SDK exposes no project-trust signal to
-  gate on, so discovery stays user-scope-only.)
+  spawnable agents. This is a deliberate conservative default, not an SDK
+  limitation: skipping project scope closes the untrusted-checkout injection
+  surface without having to reason about trust. (The SDK *does* expose a
+  project-trust signal — `ExtensionContext.isProjectTrusted()` /
+  `SettingsManagerCreateOptions.projectTrusted` — so a future opt-in could gate
+  project scope on trust; deferred by choice.)
 - **Deterministic collisions.** If two packages ship the same basename, the
   package whose `source` string sorts first wins; the loser is dropped and a
   warning naming both is written to stderr.
