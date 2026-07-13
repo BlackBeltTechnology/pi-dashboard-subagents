@@ -1,4 +1,4 @@
-## MODIFIED Requirements
+## ADDED Requirements
 
 ### Requirement: Frontmatter `model:` field SHALL be resolved via `model:resolve` event when a handler is available
 
