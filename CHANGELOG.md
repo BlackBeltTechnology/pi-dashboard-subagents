@@ -6,6 +6,21 @@ All notable changes to this package are documented here. Format follows
 
 ## [Unreleased]
 
+## [0.2.3] - 2026-07-13
+
+### Fixed
+
+- **Subagent cross-provider spawn now inherits the parent model registry.**
+  `createAgentSession` receives the parent session's live `ModelRegistry`
+  (and its `authStorage`), so a subagent spawned on a **custom-provider**
+  model (an `openai/`, `google/`, `deepseek/`, … id registered via
+  `~/.pi/agent/providers.json`) no longer builds a fresh disk registry that
+  lacks the provider. Previously such spawns failed at request time with
+  `No API key found for <provider>` and surfaced as **empty output** — which
+  callers (e.g. the doubt-driven-review cross-model probe) misread as "model
+  unavailable" and escalated away from internal models. Matches the flows
+  spawn path. Change: inherit-parent-model-registry.
+
 ### Added
 
 - **Package agent-discovery tier.** The `Agent` tool now resolves agent `.md`
