@@ -6,6 +6,8 @@ All notable changes to this package are documented here. Format follows
 
 ## [Unreleased]
 
+## [0.2.4] - 2026-08-10
+
 ### Fixed
 
 - **Second and subsequent `Agent` calls in a session failed** with "This
