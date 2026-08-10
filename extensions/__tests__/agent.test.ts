@@ -27,6 +27,7 @@ import {
   resolveAgentMdPath,
   selectEffectiveModelRef,
 } from "../agent.js";
+import activate from "../agent.js";
 
 // Re-route getAgentDir() to a tmp dir per-test.
 let tmpAgentDir: string;
@@ -535,3 +536,61 @@ describe("parseAgentMd", () => {
 // resolveModelFromRef tests live in extensions/__tests__/model-resolve.test.ts
 // (split out as part of change `add-model-resolve-event-with-fallback`).
 
+
+// ── Activation-handle isolation (change: fix-stale-pi-handle-on-reactivation) ──
+//
+// The `pi` handle must be bound per-activation via lexical closure. A second
+// activate() (as a nested subagent session triggers when it re-loads the
+// extension set) must not rebind the handle used by an already-registered tool.
+
+describe("activation handle isolation", () => {
+  function fakeHandle() {
+    const emitted: any[] = [];
+    const tools: any[] = [];
+    const pi: any = {
+      events: { emit: (channel: string, data: any) => emitted.push({ channel, data }) },
+      registerTool: (t: any) => tools.push(t),
+      on: () => {},
+    };
+    return { pi, emitted, tools };
+  }
+
+  /** Simulates AgentSession.dispose() invalidating an extension runtime. */
+  function invalidate(handle: ReturnType<typeof fakeHandle>) {
+    const stale = () => {
+      throw new Error("This extension ctx is stale after session replacement or reload.");
+    };
+    handle.pi.events = {
+      get emit(): never {
+        return stale();
+      },
+    };
+    handle.pi.registerTool = stale;
+  }
+
+  const args = { subagent_type: "test", description: "d", prompt: "p" };
+
+  it("a tool registered by activate(piA) emits through piA after activate(piB)", async () => {
+    const a = fakeHandle();
+    const b = fakeHandle();
+    activate(a.pi);
+    activate(b.pi);
+
+    await a.tools[0].execute("call-1", { ...args }, undefined, undefined, { cwd: tmpCwd });
+
+    expect(a.emitted.length).toBeGreaterThan(0);
+    expect(b.emitted.length).toBe(0);
+  });
+
+  it("invalidating piB does not break the tool registered by activate(piA)", async () => {
+    const a = fakeHandle();
+    const b = fakeHandle();
+    activate(a.pi);
+    activate(b.pi);
+    invalidate(b);
+
+    await expect(
+      a.tools[0].execute("call-1", { ...args }, undefined, undefined, { cwd: tmpCwd }),
+    ).resolves.toBeDefined();
+  });
+});

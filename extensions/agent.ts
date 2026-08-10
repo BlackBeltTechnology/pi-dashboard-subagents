@@ -879,7 +879,7 @@ interface AgentToolArgs {
   isolated?: boolean;
 }
 
-function makeAgentTool(exposeIsolated: boolean) {
+function makeAgentTool(pi: ExtensionAPI, exposeIsolated: boolean) {
   return defineTool({
     name: AGENT_TOOL_NAME,
     label: "Agent",
@@ -899,25 +899,16 @@ function makeAgentTool(exposeIsolated: boolean) {
       onUpdate: AgentToolUpdateCallback<AgentDetails> | undefined,
       ctx: ExtensionContext,
     ): Promise<AgentToolResult<AgentDetails>> {
-      return runAgentTool(ctx.cwd, params, signal, onUpdate, ctx, getPi()) as Promise<AgentToolResult<AgentDetails>>;
+      return runAgentTool(ctx.cwd, params, signal, onUpdate, ctx, pi) as Promise<AgentToolResult<AgentDetails>>;
     },
   });
 }
 
-// ─── pi handle captured at activate() time ───────────────────────────────
-//
 // The tool's `execute` callback receives `ctx: ExtensionContext` but NOT the
-// `pi: ExtensionAPI` handle. We capture `pi` in a module-level closure at
-// activation so emit helpers can reach it.
-
-let capturedPi: ExtensionAPI | undefined;
-
-function getPi(): ExtensionAPI {
-  if (!capturedPi) {
-    throw new Error("pi-dashboard-subagents: Agent tool invoked before activate() captured pi handle");
-  }
-  return capturedPi;
-}
+// `pi: ExtensionAPI` handle. `pi` is threaded in lexically by `activate()`.
+// It MUST NOT be held in module-level state: a nested subagent session
+// re-activates this same module instance and would clobber the parent's handle,
+// which its own dispose() then invalidates.
 
 // ─── The main spawn loop ────────────────────────────────────────────────
 
@@ -1314,9 +1305,8 @@ function errorResult(text: string, details: AgentDetails): AgentToolResultWithEr
  * fixed thereafter — settings changes require `/reload`.
  */
 export default function activate(pi: ExtensionAPI): void {
-  capturedPi = pi;
   const exposeIsolated = shouldExposeInheritanceInTool();
-  pi.registerTool(makeAgentTool(exposeIsolated));
+  pi.registerTool(makeAgentTool(pi, exposeIsolated));
 
   // Build/refresh the package-agent discovery index whenever pi (re)discovers
   // resources. `cwd` is NOT available at activate() — it arrives on the event.

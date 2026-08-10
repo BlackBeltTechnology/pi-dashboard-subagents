@@ -6,6 +6,15 @@ All notable changes to this package are documented here. Format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- **Second and subsequent `Agent` calls in a session failed** with "This
+  extension ctx is stale after session replacement or reload". The `pi` handle
+  was held in module-level state, so a nested subagent session re-activating the
+  same module instance clobbered the parent's handle — which its own
+  `session.dispose()` then invalidated. The handle is now bound per-activation
+  via lexical closure (`makeAgentTool(pi, exposeIsolated)`).
+
 ## [0.2.3] - 2026-07-13
 
 ### Fixed
