@@ -45,8 +45,11 @@
   tool twice in a row with a trivial prompt.
 - [x] 4.2 Confirm BOTH calls return a result and neither reports "This extension
   ctx is stale after session replacement or reload".
-- [ ] 4.3 Confirm the dashboard subagent inspector still receives live progress
+- [x] 4.3 Confirm the dashboard subagent inspector still receives live progress
   frames for both runs (the emit path goes through the new closure handle).
+  Verified on the wire: subscribed a browser WS client to this session and ran a
+  probe — `subagent_created` → 12× `subagent_started` progress ticks →
+  `subagent_completed` (5 timeline entries), all scoped to the right sessionId.
 - [x] 4.4 Run a third call that errors (unknown `subagent_type` with a bad
   `model`), then a fourth normal call — the fourth must still succeed.
 
