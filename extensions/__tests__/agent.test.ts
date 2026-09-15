@@ -15,7 +15,7 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -570,7 +570,7 @@ describe("activation handle isolation", () => {
 
   const args = { subagent_type: "test", description: "d", prompt: "p" };
 
-  it("a tool registered by activate(piA) emits through piA after activate(piB)", async () => {
+  it("each activation's tool emits through its own handle", async () => {
     const a = fakeHandle();
     const b = fakeHandle();
     activate(a.pi);
@@ -580,6 +580,12 @@ describe("activation handle isolation", () => {
 
     expect(a.emitted.length).toBeGreaterThan(0);
     expect(b.emitted.length).toBe(0);
+
+    const aCount = a.emitted.length;
+    await b.tools[0].execute("call-2", { ...args }, undefined, undefined, { cwd: tmpCwd });
+
+    expect(b.emitted.length).toBeGreaterThan(0);
+    expect(a.emitted.length).toBe(aCount);
   });
 
   it("invalidating piB does not break the tool registered by activate(piA)", async () => {
@@ -592,5 +598,18 @@ describe("activation handle isolation", () => {
     await expect(
       a.tools[0].execute("call-1", { ...args }, undefined, undefined, { cwd: tmpCwd }),
     ).resolves.toBeDefined();
+  });
+
+  // Guards the spec scenario "no module-level handle remains": a future edit
+  // must not reintroduce a module-scoped ExtensionAPI cell (or a getPi()-style
+  // accessor reading one), which is what made the handle clobberable.
+  it("agent.ts holds no module-scoped ExtensionAPI", () => {
+    const source = readFileSync(join(import.meta.dirname, "..", "agent.ts"), "utf8");
+
+    const moduleScopedHandle = /^(?:let|var|const)\s+\w+\s*:\s*ExtensionAPI\b/m;
+    expect(source).not.toMatch(moduleScopedHandle);
+
+    const piAccessor = /^\s*(?:export\s+)?function\s+getPi\s*\(/m;
+    expect(source).not.toMatch(piAccessor);
   });
 });
