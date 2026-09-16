@@ -23,6 +23,13 @@ jobs:
       - run: npm run typecheck
       - run: npm test
 
+      # The real-runtime fan-out test is skipped by `npm test` because it needs
+      # a GC handle (`describe.skipIf(typeof global.gc !== "function")`). Run it
+      # explicitly so a push actually exercises 20 faux-provider child sessions
+      # under the concurrency cap and asserts retained heap stays bounded.
+      - name: Fan-out memory integration (real sessions, --expose-gc)
+        run: npm run test:fanout-memory
+
       # Confirm the package can be packed cleanly (catches files[] regressions
       # — e.g. forgetting to include `agents/` in the publishable artifact).
       - name: Verify package layout
