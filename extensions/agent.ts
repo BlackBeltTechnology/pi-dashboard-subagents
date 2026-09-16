@@ -27,6 +27,7 @@ import {
   type AgentToolUpdateCallback,
   createAgentSession,
   DefaultPackageManager,
+  DefaultResourceLoader,
   defineTool,
   type ExtensionAPI,
   type ExtensionContext,
@@ -54,6 +55,7 @@ import {
 
 import {
   getInheritanceCompression,
+  getMaxConcurrent,
   resolveIsolated,
   shouldExposeInheritanceInTool,
 } from "./settings.js";
@@ -401,40 +403,43 @@ export function parseAgentMd(path: string): AgentMdConfig | undefined {
 }
 
 /**
- * Throttled wrapper around `emitSubagentProgress`. Coalesces updates within
- * a fixed window. `flush()` always sends the latest state regardless of
- * throttle window — call before `completed`/`failed` so the dashboard sees
- * the final snapshot.
+ * Throttled progress fan-out. Coalesces updates within a fixed window and
+ * hands the latest snapshot to `sink` (which fans out to
+ * `emitSubagentProgress` AND the tool's `onUpdate` — design Decision 2).
+ *
+ * `schedule` takes a *producer*, not a snapshot: coalesced events never pay
+ * for a `buildDetails` call. `flush()` always sends the latest state
+ * regardless of throttle window — call before `completed`/`failed` so the
+ * dashboard sees the final snapshot.
  */
 export function createProgressEmitter(
-  pi: ExtensionAPI,
-  agentId: string,
+  sink: (details: AgentDetails) => void,
   windowMs: number = PROGRESS_THROTTLE_MS,
 ): {
-  schedule(details: AgentDetails): void;
+  schedule(produce: () => AgentDetails): void;
   flush(): void;
   dispose(): void;
 } {
-  let pending: AgentDetails | undefined;
+  let pending: (() => AgentDetails) | undefined;
   let lastEmitAt = 0;
   let timer: ReturnType<typeof setTimeout> | undefined;
 
-  function emitNow(details: AgentDetails): void {
+  function emitNow(produce: () => AgentDetails): void {
     lastEmitAt = Date.now();
     pending = undefined;
     if (timer) {
       clearTimeout(timer);
       timer = undefined;
     }
-    emitSubagentProgress(pi, { agentId, details });
+    sink(produce());
   }
 
   return {
-    schedule(details: AgentDetails) {
-      pending = details;
+    schedule(produce: () => AgentDetails) {
+      pending = produce;
       const elapsed = Date.now() - lastEmitAt;
       if (elapsed >= windowMs) {
-        emitNow(details);
+        emitNow(produce);
         return;
       }
       if (timer) return; // already scheduled
@@ -458,6 +463,91 @@ export function createProgressEmitter(
       }
     },
   };
+}
+
+// ─── Per-child resource loader ────────────────────────────────────
+
+/**
+ * Build a fresh, lean resource loader for one child session (design
+ * Decision 1). One loader → one `Extension[]` + one `runtime` per child:
+ * sharing a loader is unsafe (`ExtensionRunner.bindCore` overwrites the
+ * single `runtime`, and the first `dispose()` poisons it for siblings).
+ *
+ * Skills, prompt templates and themes are not read by a headless child, so
+ * they are skipped — same tool surface, ~350 MB less RSS at n=7.
+ */
+async function createChildLoader(cwd: string): Promise<DefaultResourceLoader> {
+  const loader = new DefaultResourceLoader({
+    cwd,
+    agentDir: getAgentDir(),
+    noSkills: true,
+    noPromptTemplates: true,
+    noThemes: true,
+  });
+  await loader.reload();
+  return loader;
+}
+
+// ─── Spawn concurrency gate ───────────────────────────────────────
+//
+// Process-wide FIFO semaphore bounding how many child sessions run at once
+// (design Decision 3). Nested subagents are impossible (`Agent` is stripped
+// from children), so one gate per process is the right scope.
+
+/** Thrown by `acquireSpawnSlot` when the parent aborts while queued. */
+class SpawnAbortedError extends Error {}
+
+let activeSpawns = 0;
+const spawnWaiters: Array<{ start: () => void; onAbort?: () => void }> = [];
+
+function dispatchSpawnWaiters(): void {
+  const limit = getMaxConcurrent();
+  while (spawnWaiters.length > 0 && (limit === 0 || activeSpawns < limit)) {
+    const next = spawnWaiters.shift()!;
+    activeSpawns += 1;
+    next.start();
+  }
+}
+
+/**
+ * Wait for a spawn slot. Resolves with the release function. Rejects with
+ * `SpawnAbortedError` when `signal` aborts before the slot is granted — in
+ * that case no slot is consumed.
+ */
+function acquireSpawnSlot(signal: AbortSignal | undefined): Promise<() => void> {
+  let released = false;
+  const release = (): void => {
+    if (released) return;
+    released = true;
+    activeSpawns -= 1;
+    dispatchSpawnWaiters();
+  };
+
+  if (signal?.aborted) return Promise.reject(new SpawnAbortedError("aborted by parent"));
+
+  const limit = getMaxConcurrent();
+  if (limit === 0 || activeSpawns < limit) {
+    activeSpawns += 1;
+    return Promise.resolve(release);
+  }
+
+  return new Promise<() => void>((resolve, reject) => {
+    const waiter: { start: () => void; onAbort?: () => void } = {
+      start: () => {
+        if (waiter.onAbort && signal) signal.removeEventListener("abort", waiter.onAbort);
+        resolve(release);
+      },
+    };
+    if (signal) {
+      waiter.onAbort = () => {
+        const idx = spawnWaiters.indexOf(waiter);
+        if (idx >= 0) spawnWaiters.splice(idx, 1); // slot never consumed
+        reject(new SpawnAbortedError("aborted by parent"));
+      };
+      signal.addEventListener("abort", waiter.onAbort, { once: true });
+    }
+    spawnWaiters.push(waiter);
+  });
 }
 
 /**
@@ -953,7 +1043,15 @@ export async function runAgentTool(
 
   const tracker = createToolCallTracker();
   const usage = createUsageAccumulator();
-  const progress = createProgressEmitter(pi, agentId);
+  // One throttled emitter feeding BOTH legs (dashboard progress + the tool's
+  // `onUpdate`), so a chatty child cannot flood the parent's event loop.
+  const progress = createProgressEmitter((details) => {
+    emitSubagentProgress(pi, { agentId, details });
+    onUpdate?.({
+      content: [{ type: "text", text: activity ?? "(running…)" }],
+      details,
+    });
+  });
 
   let session: Awaited<ReturnType<typeof createAgentSession>>["session"] | undefined;
   let unsubscribe: (() => void) | undefined;
@@ -982,14 +1080,19 @@ export async function runAgentTool(
   }
 
   function pushUpdate(status: AgentStatus): void {
-    const details = snapshotDetails(status);
-    progress.schedule(details);
-    if (onUpdate) {
-      onUpdate({
-        content: [{ type: "text", text: activity ?? "(running…)" }],
-        details,
-      });
-    }
+    // Lazy: coalesced events never build a details snapshot.
+    progress.schedule(() => snapshotDetails(status));
+  }
+
+  /**
+   * Terminal snapshot for the tool's `onUpdate` leg. Always delivered
+   * synchronously (the throttle window never swallows a final state).
+   */
+  function pushTerminalUpdate(details: AgentDetails): void {
+    onUpdate?.({
+      content: [{ type: "text", text: details.error ?? activity ?? "(done)" }],
+      details,
+    });
   }
 
   // Emit created BEFORE we touch any other infrastructure so the dashboard
@@ -1001,6 +1104,37 @@ export async function runAgentTool(
     description: args.description,
     details: initialDetails,
   });
+
+  // ── Concurrency gate ──
+  // Acquired AFTER the card is on screen (status `queued`) and BEFORE any
+  // loader / session work, so queued spawns cost nothing but a promise.
+  let releaseSlot: (() => void) | undefined;
+  try {
+    releaseSlot = await acquireSpawnSlot(signal);
+  } catch (err) {
+    // Only an abort-while-queued is expected here; anything else is reported
+    // as a genuine failure rather than masquerading as a parent abort.
+    const aborted = err instanceof SpawnAbortedError;
+    const message = aborted
+      ? "aborted by parent"
+      : err instanceof Error
+        ? err.message
+        : String(err);
+    const details = snapshotDetails(aborted ? "aborted" : "error", message);
+    emitSubagentFailed(pi, {
+      agentId,
+      error: message,
+      durationMs: Date.now() - startedAt,
+      toolUses,
+      details,
+    });
+    pushTerminalUpdate(details);
+    progress.dispose();
+    return errorResult(
+      aborted ? "Subagent aborted by parent." : `Subagent failed: ${message}`,
+      details,
+    );
+  }
 
   try {
     // ── Effective model ref: tool-call `args.model` > .md frontmatter ──
@@ -1037,6 +1171,7 @@ export async function runAgentTool(
           toolUses,
           details: failedDetails,
         });
+        pushTerminalUpdate(failedDetails);
         return errorResult(
           resolution.error ?? `Could not resolve model reference "${effectiveModelRef}".`,
           failedDetails,
@@ -1079,9 +1214,14 @@ export async function runAgentTool(
 
     // ── Construct in-memory subagent session ──
     const sessionManager = SessionManager.inMemory(cwd);
+    const resourceLoader = await createChildLoader(cwd);
     const createResult = await createAgentSession({
       cwd,
       sessionManager,
+      // Lean, per-child loader — full extension isolation, no skills/prompt
+      // templates/themes (design Decision 1). Without this the SDK builds a
+      // full DefaultResourceLoader per child, in the parent's event loop.
+      resourceLoader,
       // Inherit the parent session's live registry so the subagent sees every
       // provider registered on it — including custom providers from
       // providers.json (models AND providerRequestConfigs auth). Without this,
@@ -1215,6 +1355,7 @@ export async function runAgentTool(
         toolUses,
         details: abortedDetails,
       });
+      pushTerminalUpdate(abortedDetails);
       return errorResult("Subagent aborted by parent.", abortedDetails);
     }
 
@@ -1230,6 +1371,7 @@ export async function runAgentTool(
       toolUses,
       details: completedDetails,
     });
+    pushTerminalUpdate(completedDetails);
     return {
       content: [{ type: "text", text: finalText }],
       details: completedDetails,
@@ -1245,8 +1387,10 @@ export async function runAgentTool(
       toolUses,
       details: failedDetails,
     });
+    pushTerminalUpdate(failedDetails);
     return errorResult(`Subagent failed: ${message}`, failedDetails);
   } finally {
+    releaseSlot?.();
     if (abortHandler && signal) {
       try {
         signal.removeEventListener("abort", abortHandler);

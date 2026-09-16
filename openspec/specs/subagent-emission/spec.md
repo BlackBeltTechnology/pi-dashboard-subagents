@@ -29,7 +29,7 @@ The extension's `activate` entry point SHALL call `pi.registerTool` exactly once
 
 ### Requirement: The extension SHALL emit lifecycle events on pi's event bus using the `subagents:*` channel namespace
 
-The dashboard bridge's emit intercept maps `subagents:*` channels to `subagent_*` protocol events. The extension SHALL emit on these channels (not its own namespace) so the dashboard's existing reducer + renderer light up without dashboard-side changes.
+The dashboard bridge's emit intercept maps `subagents:*` channels to `subagent_*` protocol events. The extension SHALL emit on these channels (not its own namespace) so the dashboard's existing reducer + renderer light up without dashboard-side changes. The tool's `onUpdate` callback (surfaced as `tool_execution_update`) SHALL be coalesced within the same throttle window as the `subagents:started` progress leg; terminal snapshots SHALL always be delivered.
 
 #### Scenario: subagents:created fires on tool invocation start
 
@@ -57,6 +57,19 @@ The dashboard bridge's emit intercept maps `subagents:*` channels to `subagent_*
 - **WHEN** progress emissions are coalesced
 - **THEN** the extension SHALL emit at most 4 progress updates per second per subagent
 - **AND** the final `subagents:started` emission BEFORE `subagents:completed` SHALL flush the latest state regardless of throttle
+
+#### Scenario: onUpdate is coalesced in the same window
+
+- **GIVEN** 100 child session events arrive within 250 ms
+- **WHEN** the run is in progress
+- **THEN** `onUpdate` SHALL be invoked at most 2 times for that burst
+- **AND** `snapshotDetails` SHALL NOT be computed for the coalesced events
+
+#### Scenario: terminal onUpdate always flushes
+
+- **WHEN** the run reaches `completed`, `error`, or `aborted`
+- **THEN** the last `onUpdate` call SHALL carry `details.status` equal to that terminal status
+- **AND** it SHALL be delivered synchronously before the tool result resolves
 
 #### Scenario: subagents:completed fires on successful prompt resolution
 
