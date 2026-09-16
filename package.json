@@ -37,6 +37,7 @@
     "lint": "eslint extensions",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
+    "test:fanout-memory": "vitest run --execArgv=--expose-gc --disableConsoleIntercept extensions/__tests__/fanout-memory.test.ts",
     "test:watch": "vitest"
   },
   "peerDependencies": {
