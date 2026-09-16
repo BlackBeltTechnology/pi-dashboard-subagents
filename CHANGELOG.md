@@ -6,6 +6,8 @@ All notable changes to this package are documented here. Format follows
 
 ## [Unreleased]
 
+## [0.2.5] - 2026-09-16
+
 ### Fixed
 
 - **Parent session no longer stalls on a wide `Agent` fan-out.** Two runtime
@@ -27,6 +29,16 @@ All notable changes to this package are documented here. Format follows
   `queued` card until a slot frees, and a parent abort while queued resolves as
   `aborted` without ever spawning a session. The value is re-read per spawn, so
   retuning it needs no `/reload`.
+- **Real-runtime fan-out regression test** (`npm run test:fanout-memory`, also
+  run by CI on push). Spawns 20 child sessions in two capped batches against
+  pi-ai's faux provider — real per-child `DefaultResourceLoader`, real
+  `createAgentSession`, real streamed events, only the model boundary faked.
+  Asserts the tool allowlist the provider actually receives matches the agent
+  `.md` frontmatter (seeded-random non-empty subsets), that every child reaches
+  `completed` with the response queue drained, and that retained heap stays
+  bounded across batches under forced GC (measured: ~104 KB second-batch
+  growth over 20 sessions). Self-skips under plain `npm test`, which cannot
+  expose a GC handle to the Vitest worker.
 
 ## [0.2.4] - 2026-08-10
 
