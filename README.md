@@ -45,6 +45,7 @@ Two persistent settings live at:
 {
   "inheritContext": true,
   "exposeInheritanceInTool": false,
+  "maxConcurrent": 4,
   "inheritance": {
     "recentTurns": 6,
     "toolOutputWindow": 2,
@@ -60,6 +61,23 @@ Two persistent settings live at:
 | `inheritance.recentTurns`  | Verbatim turn pairs kept (default 6).                                                            |
 | `inheritance.toolOutputWindow` | Recent turns where tool outputs stay verbatim (default 2).                                   |
 | `inheritance.maxChars`     | Hard cap on the compressed context (default 24000 chars ≈ 6K tokens).                            |
+| `maxConcurrent`            | Maximum subagents running at once in this process (default 4). Extra spawns wait FIFO and their dashboard card shows `queued` until a slot frees. `0` = unlimited (the pre-0.2.5 behaviour). Re-read from disk per spawn — no `/reload` needed. |
+
+#### Why a concurrency cap
+
+Subagents run **in the parent process** (one V8 heap, one event loop). An
+unbounded fan-out of parallel `Agent` calls stacks every child's per-turn
+extension work onto the parent's loop, which can stall the parent long enough
+for the dashboard bridge watchdog to force-close the session. The cap bounds
+that worst case; set `maxConcurrent: 0` to opt out.
+
+#### Child resource loading
+
+Each child session gets its **own** lean resource loader: extensions are loaded
+(so the child keeps the full tool surface, minus `Agent`), but **skills, prompt
+templates and themes are not** — a headless child never reads them, and
+skipping them cuts memory noticeably on wide fan-outs. Skills remain reachable
+by path if the parent passes them in the prompt.
 
 Four usage modes:
 

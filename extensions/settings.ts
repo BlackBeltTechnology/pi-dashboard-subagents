@@ -26,7 +26,7 @@
  * want the LLM to make per-task decisions can flip the expose flag on.
  */
 
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
@@ -59,6 +59,12 @@ export interface DashboardAgentSettings {
   exposeInheritanceInTool: boolean;
   /** Compression knobs applied when inheriting (global-only, not per-call). */
   inheritance: InheritanceCompressionSettings;
+  /**
+   * Maximum number of subagent sessions running at once in this process.
+   * Excess spawns wait FIFO in `queued` status. `0` = unlimited.
+   * Default: 4.
+   */
+  maxConcurrent: number;
 }
 
 export const DEFAULT_SETTINGS: DashboardAgentSettings = Object.freeze({
@@ -69,6 +75,7 @@ export const DEFAULT_SETTINGS: DashboardAgentSettings = Object.freeze({
     toolOutputWindow: 2,
     maxChars: 24_000,
   }) as InheritanceCompressionSettings,
+  maxConcurrent: 4,
 }) as DashboardAgentSettings;
 
 // ─── Storage location ────────────────────────────────────────────────────
@@ -83,10 +90,23 @@ export function getSettingsPath(): string {
 // ─── Cache ───────────────────────────────────────────────────────────────
 
 let cached: DashboardAgentSettings | undefined;
+/** mtime of the config file at the time `cached` was populated. */
+let cachedMtimeMs: number | undefined;
 
 /** Force-reload from disk on next read. Tests + reload-after-write use this. */
 export function invalidateSettingsCache(): void {
   cached = undefined;
+  cachedMtimeMs = undefined;
+}
+
+/** Current mtime of the config file, or undefined when absent/unreadable. */
+function configMtimeMs(): number | undefined {
+  try {
+    const path = getSettingsPath();
+    return existsSync(path) ? statSync(path).mtimeMs : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 // ─── Read ────────────────────────────────────────────────────────────────
@@ -99,6 +119,7 @@ export function invalidateSettingsCache(): void {
 export function loadSettings(): DashboardAgentSettings {
   if (cached) return cached;
   const path = getSettingsPath();
+  cachedMtimeMs = configMtimeMs();
   if (!existsSync(path)) {
     cached = mergeWithDefaults({});
     return cached;
@@ -126,7 +147,16 @@ function mergeWithDefaults(partial: Partial<DashboardAgentSettings>): DashboardA
       toolOutputWindow: partial.inheritance?.toolOutputWindow ?? DEFAULT_SETTINGS.inheritance.toolOutputWindow,
       maxChars: partial.inheritance?.maxChars ?? DEFAULT_SETTINGS.inheritance.maxChars,
     },
+    maxConcurrent: coerceMaxConcurrent(partial.maxConcurrent),
   };
+}
+
+/** Non-number, non-finite or negative values fall back to the default. `0` is valid (unlimited). */
+function coerceMaxConcurrent(value: unknown): number {
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
+    return DEFAULT_SETTINGS.maxConcurrent;
+  }
+  return Math.floor(value);
 }
 
 // ─── Write ───────────────────────────────────────────────────────────────
@@ -145,6 +175,10 @@ export function saveSettings(patch: Partial<DashboardAgentSettings>): DashboardA
       toolOutputWindow: patch.inheritance?.toolOutputWindow ?? current.inheritance.toolOutputWindow,
       maxChars: patch.inheritance?.maxChars ?? current.inheritance.maxChars,
     },
+    maxConcurrent:
+      patch.maxConcurrent === undefined
+        ? current.maxConcurrent
+        : coerceMaxConcurrent(patch.maxConcurrent),
   };
   writeSettingsToDisk(next);
   cached = next;
@@ -202,4 +236,16 @@ export function resolveIsolated(perCall: boolean | undefined): boolean {
  */
 export function getInheritanceCompression(): InheritanceCompressionSettings {
   return loadSettings().inheritance;
+}
+
+/**
+ * Maximum number of subagents allowed to run at once (`0` = unlimited).
+ * Read per spawn, so edits to the config file apply without `/reload`
+ * (subject to the settings cache being invalidated).
+ */
+export function getMaxConcurrent(): number {
+  // Re-read when the config file changed on disk so operators can retune the
+  // cap without `/reload` (spec: "setting is read per call").
+  if (configMtimeMs() !== cachedMtimeMs) invalidateSettingsCache();
+  return loadSettings().maxConcurrent;
 }

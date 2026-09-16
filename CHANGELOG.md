@@ -6,6 +6,28 @@ All notable changes to this package are documented here. Format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- **Parent session no longer stalls on a wide `Agent` fan-out.** Two runtime
+  costs were unbounded: every child session built a full
+  `DefaultResourceLoader` (all extensions *and* skills/prompt templates/themes)
+  inside the parent's event loop, and the tool's `onUpdate` callback fired on
+  **every** child session event (text deltas included), each time building a
+  full details snapshot. Children now get a lean per-spawn loader
+  (`noSkills`/`noPromptTemplates`/`noThemes`; tool surface unchanged, ~350 MB
+  less RSS at 7-way fan-out), and `onUpdate` is coalesced through the same
+  250 ms window as the dashboard progress leg (≤ 4/s per child). Terminal
+  states (`completed`, `error`, `aborted`) always flush synchronously.
+
+### Added
+
+- **`maxConcurrent` setting** (default `4`, `0` = unlimited) in
+  `~/.pi/agent/extensions/pi-dashboard-subagents/config.json`. A process-wide
+  FIFO semaphore bounds how many subagents run at once; excess spawns show a
+  `queued` card until a slot frees, and a parent abort while queued resolves as
+  `aborted` without ever spawning a session. The value is re-read per spawn, so
+  retuning it needs no `/reload`.
+
 ## [0.2.4] - 2026-08-10
 
 ### Fixed

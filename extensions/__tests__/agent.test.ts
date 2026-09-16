@@ -27,7 +27,17 @@ import {
   resolveAgentMdPath,
   selectEffectiveModelRef,
 } from "../agent.js";
-import activate from "../agent.js";
+import activate, { runAgentTool } from "../agent.js";
+import { invalidateSettingsCache } from "../settings.js";
+import { buildDetails } from "../events.js";
+import { createAgentSession } from "@earendil-works/pi-coding-agent";
+
+// `buildDetails` is spied (not replaced) so the spawn tests can assert that a
+// coalesced burst does NOT compute a details snapshot per event.
+vi.mock("../events.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../events.js")>();
+  return { ...actual, buildDetails: vi.fn(actual.buildDetails) };
+});
 
 // Re-route getAgentDir() to a tmp dir per-test.
 let tmpAgentDir: string;
@@ -81,6 +91,26 @@ function tinyParseFrontmatter<T>(content: string): { frontmatter: T; body: strin
   return { frontmatter: out as T, body };
 }
 
+// Mock resource loader: records construction options per instance so the
+// spawn tests can assert per-spawn isolation + lean options (change:
+// reduce-fanout-parent-stall).
+const MockResourceLoader = vi.hoisted(() => {
+  class MockResourceLoader {
+    static instances: MockResourceLoader[] = [];
+    static failReload = false;
+    opts: Record<string, unknown>;
+    reload: ReturnType<typeof vi.fn>;
+    constructor(opts: Record<string, unknown>) {
+      this.opts = opts;
+      this.reload = vi.fn(async () => {
+        if (MockResourceLoader.failReload) throw new Error("reload boom");
+      });
+      MockResourceLoader.instances.push(this);
+    }
+  }
+  return MockResourceLoader;
+});
+
 vi.mock("@earendil-works/pi-coding-agent", () => ({
   getAgentDir: () => tmpAgentDir,
   // The agent.ts default-export path imports several other symbols (defineTool,
@@ -88,6 +118,13 @@ vi.mock("@earendil-works/pi-coding-agent", () => ({
   // don't exercise the execute() body, so we only need to stub what we touch.
   defineTool: <T,>(t: T) => t,
   createAgentSession: vi.fn(),
+  DefaultResourceLoader: MockResourceLoader,
+  DefaultPackageManager: class {
+    list() {
+      return [];
+    }
+  },
+  SettingsManager: { create: () => ({}) },
   SessionManager: { inMemory: vi.fn() },
   parseFrontmatter: tinyParseFrontmatter,
 }));
@@ -95,6 +132,9 @@ vi.mock("@earendil-works/pi-coding-agent", () => ({
 beforeEach(() => {
   tmpAgentDir = mkdtempSync(join(tmpdir(), "pi-dashboard-subagents-agentdir-"));
   tmpCwd = mkdtempSync(join(tmpdir(), "pi-dashboard-subagents-cwd-"));
+  MockResourceLoader.instances = [];
+  MockResourceLoader.failReload = false;
+  invalidateSettingsCache();
 });
 
 afterEach(() => {
@@ -281,10 +321,12 @@ describe("resolveAgentMdPath", () => {
 // ── createProgressEmitter (throttle) ────────────────────────────────────
 
 describe("createProgressEmitter throttling", () => {
+  // The emitter now takes a sink (design Decision 2): one throttled fan-out
+  // feeding both `emitSubagentProgress` and the tool's `onUpdate`.
   function fakePi() {
     const calls: any[] = [];
     return {
-      pi: { events: { emit: (channel: string, data: any) => calls.push({ channel, data }) } } as any,
+      sink: (details: any) => calls.push({ channel: "subagents:started", data: { details } }),
       calls,
     };
   }
@@ -312,14 +354,14 @@ describe("createProgressEmitter throttling", () => {
   });
 
   it("first schedule fires synchronously, subsequent calls coalesce within the window", () => {
-    const { pi, calls } = fakePi();
-    const em = createProgressEmitter(pi, "a1", 250);
+    const { sink, calls } = fakePi();
+    const em = createProgressEmitter(sink, 250);
 
-    em.schedule(snapshot("first"));
+    em.schedule(() => snapshot("first"));
     expect(calls.length).toBe(1);
 
-    em.schedule(snapshot("second"));
-    em.schedule(snapshot("third"));
+    em.schedule(() => snapshot("second"));
+    em.schedule(() => snapshot("third"));
     expect(calls.length).toBe(1); // throttled
 
     vi.advanceTimersByTime(250);
@@ -328,12 +370,12 @@ describe("createProgressEmitter throttling", () => {
   });
 
   it("≤4 emissions per second under continuous schedule", () => {
-    const { pi, calls } = fakePi();
-    const em = createProgressEmitter(pi, "a1", 250);
+    const { sink, calls } = fakePi();
+    const em = createProgressEmitter(sink, 250);
 
     // Schedule 100 times spread over 1 second
     for (let i = 0; i < 100; i++) {
-      em.schedule(snapshot(`label-${i}`));
+      em.schedule(() => snapshot(`label-${i}`));
       vi.advanceTimersByTime(10);
     }
     // 1000ms / 250ms window = ~4 emissions max
@@ -341,11 +383,11 @@ describe("createProgressEmitter throttling", () => {
   });
 
   it("flush() always sends the latest state regardless of throttle", () => {
-    const { pi, calls } = fakePi();
-    const em = createProgressEmitter(pi, "a1", 250);
+    const { sink, calls } = fakePi();
+    const em = createProgressEmitter(sink, 250);
 
-    em.schedule(snapshot("first"));
-    em.schedule(snapshot("second"));
+    em.schedule(() => snapshot("first"));
+    em.schedule(() => snapshot("second"));
     expect(calls.length).toBe(1);
 
     em.flush();
@@ -354,10 +396,10 @@ describe("createProgressEmitter throttling", () => {
   });
 
   it("flush() is a no-op when no pending update exists", () => {
-    const { pi, calls } = fakePi();
-    const em = createProgressEmitter(pi, "a1", 250);
+    const { sink, calls } = fakePi();
+    const em = createProgressEmitter(sink, 250);
 
-    em.schedule(snapshot("only"));
+    em.schedule(() => snapshot("only"));
     expect(calls.length).toBe(1);
 
     em.flush(); // nothing pending
@@ -365,11 +407,11 @@ describe("createProgressEmitter throttling", () => {
   });
 
   it("dispose() clears the pending timer (no late emission)", () => {
-    const { pi, calls } = fakePi();
-    const em = createProgressEmitter(pi, "a1", 250);
+    const { sink, calls } = fakePi();
+    const em = createProgressEmitter(sink, 250);
 
-    em.schedule(snapshot("first"));
-    em.schedule(snapshot("queued"));
+    em.schedule(() => snapshot("first"));
+    em.schedule(() => snapshot("queued"));
     expect(calls.length).toBe(1);
     em.dispose();
     vi.advanceTimersByTime(1000);
@@ -611,5 +653,284 @@ describe("activation handle isolation", () => {
 
     const piAccessor = /^\s*(?:export\s+)?function\s+getPi\s*\(/m;
     expect(source).not.toMatch(piAccessor);
+  });
+});
+
+// ── Spawn path: lean per-child loader, throttled onUpdate, concurrency cap ──
+// (change: reduce-fanout-parent-stall)
+
+describe("runAgentTool spawn path", () => {
+  const Loader = MockResourceLoader;
+
+  function fakePi() {
+    return { events: { emit: vi.fn() } } as any;
+  }
+
+  function fakeCtx() {
+    return { cwd: tmpCwd } as any;
+  }
+
+  function makeFakeSession() {
+    let listener: ((e: any) => void) | undefined;
+    let finish: (() => void) | undefined;
+    let fail: ((e: Error) => void) | undefined;
+    const session: any = {
+      model: { id: "mock-model" },
+      getActiveToolNames: () => ["Read", "Agent"],
+      setActiveToolsByName: vi.fn(),
+      subscribe: (fn: any) => {
+        listener = fn;
+        return () => {
+          listener = undefined;
+        };
+      },
+      prompt: vi.fn(
+        (text: string) =>
+          new Promise<void>((res, rej) => {
+            session.lastPrompt = text;
+            finish = () => res();
+            fail = rej;
+          }),
+      ),
+      dispose: vi.fn(),
+      abort: vi.fn(),
+    };
+    return {
+      session,
+      emit: (e: any) => listener?.(e),
+      finish: () => finish?.(),
+      fail: (e: Error) => fail?.(e),
+    };
+  }
+
+  function installSessions() {
+    const created: Array<ReturnType<typeof makeFakeSession> & { opts?: any }> = [];
+    (createAgentSession as any).mockReset();
+    (createAgentSession as any).mockImplementation(async (opts: any) => {
+      const h = makeFakeSession() as ReturnType<typeof makeFakeSession> & { opts?: any };
+      h.opts = opts;
+      created.push(h);
+      return { session: h.session };
+    });
+    return created;
+  }
+
+  function writeConfig(patch: Record<string, unknown>): void {
+    const dir = join(tmpAgentDir, "extensions", "pi-dashboard-subagents");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, "config.json"), JSON.stringify(patch), "utf-8");
+    invalidateSettingsCache();
+  }
+
+  /** Let pending microtasks + a macrotask settle. */
+  async function settle(): Promise<void> {
+    for (let i = 0; i < 3; i++) await new Promise((r) => setTimeout(r, 0));
+  }
+
+  const args = (prompt: string) => ({ subagent_type: "t", description: "d", prompt });
+
+  // ── 1.1 lean per-spawn loader ──
+
+  it("gives each spawn its own lean resource loader, reloaded once", async () => {
+    writeConfig({ maxConcurrent: 0 });
+    const created = installSessions();
+    const pi = fakePi();
+
+    const a = runAgentTool(tmpCwd, args("p0"), undefined, undefined, fakeCtx(), pi);
+    const b = runAgentTool(tmpCwd, args("p1"), undefined, undefined, fakeCtx(), pi);
+    await settle();
+
+    expect(Loader.instances.length).toBe(2);
+    expect(Loader.instances[0]).not.toBe(Loader.instances[1]);
+    for (const l of Loader.instances) {
+      expect(l.opts).toMatchObject({
+        cwd: tmpCwd,
+        agentDir: tmpAgentDir,
+        noSkills: true,
+        noPromptTemplates: true,
+        noThemes: true,
+      });
+      expect(l.reload).toHaveBeenCalledTimes(1);
+    }
+    // Each createAgentSession receives its own loader object.
+    expect(created[0].opts.resourceLoader).toBe(Loader.instances[0]);
+    expect(created[1].opts.resourceLoader).toBe(Loader.instances[1]);
+    expect(created[0].opts.resourceLoader).not.toBe(created[1].opts.resourceLoader);
+
+    created.forEach((c) => c.finish());
+    await Promise.all([a, b]);
+  });
+
+  it("surfaces a failing reload as an error result and retains no loader", async () => {
+    writeConfig({ maxConcurrent: 0 });
+    installSessions();
+    Loader.failReload = true;
+
+    const res: any = await runAgentTool(tmpCwd, args("p"), undefined, undefined, fakeCtx(), fakePi());
+    expect(res.isError).toBe(true);
+    expect(createAgentSession).not.toHaveBeenCalled();
+
+    // A second call builds a brand-new loader (nothing cached from the failure).
+    Loader.failReload = false;
+    const created = installSessions();
+    const run = runAgentTool(tmpCwd, args("p2"), undefined, undefined, fakeCtx(), fakePi());
+    await settle();
+    expect(Loader.instances.length).toBe(2);
+    created.forEach((c) => c.finish());
+    await run;
+  });
+
+  // ── 2.1 throttled onUpdate ──
+
+  it("coalesces onUpdate for a burst of session events", async () => {
+    writeConfig({ maxConcurrent: 0 });
+    const created = installSessions();
+    const onUpdate = vi.fn();
+    const run = runAgentTool(tmpCwd, args("p"), undefined, onUpdate, fakeCtx(), fakePi());
+    await settle();
+
+    const buildCallsBefore = (buildDetails as any).mock.calls.length;
+    for (let i = 0; i < 100; i++) created[0].emit({ type: "text_delta", delta: "x" });
+    expect(onUpdate.mock.calls.length).toBeLessThanOrEqual(2);
+    // snapshotDetails (→ buildDetails) is NOT evaluated per coalesced event.
+    expect((buildDetails as any).mock.calls.length - buildCallsBefore).toBeLessThanOrEqual(3);
+
+    created[0].finish();
+    await run;
+  });
+
+  it("delivers a terminal onUpdate carrying the final status", async () => {
+    writeConfig({ maxConcurrent: 0 });
+    const created = installSessions();
+
+    const onUpdate = vi.fn();
+    const run = runAgentTool(tmpCwd, args("p"), undefined, onUpdate, fakeCtx(), fakePi());
+    await settle();
+    created[0].emit({ type: "text_delta", delta: "x" });
+    created[0].finish();
+    await run;
+    expect(onUpdate.mock.calls.at(-1)![0].details.status).toBe("completed");
+
+    const created2 = installSessions();
+    const onUpdate2 = vi.fn();
+    const run2 = runAgentTool(tmpCwd, args("p"), undefined, onUpdate2, fakeCtx(), fakePi());
+    await settle();
+    created2[0].fail(new Error("kaboom"));
+    await run2;
+    expect(onUpdate2.mock.calls.at(-1)![0].details.status).toBe("error");
+
+    const created3 = installSessions();
+    const onUpdate3 = vi.fn();
+    const ac = new AbortController();
+    const run3 = runAgentTool(tmpCwd, args("p"), ac.signal, onUpdate3, fakeCtx(), fakePi());
+    await settle();
+    ac.abort();
+    created3[0].finish();
+    await run3;
+    expect(onUpdate3.mock.calls.at(-1)![0].details.status).toBe("aborted");
+  });
+
+  // ── 3.2 concurrency cap ──
+
+  it("caps concurrent spawns and starts waiters FIFO", async () => {
+    writeConfig({ maxConcurrent: 2 });
+    const created = installSessions();
+    const pi = fakePi();
+    const runs = [0, 1, 2, 3, 4].map((i) =>
+      runAgentTool(tmpCwd, args(`p${i}`), undefined, undefined, fakeCtx(), pi),
+    );
+    await settle();
+
+    expect(created.length).toBe(2);
+    // Waiting calls still announced their card, with status "queued".
+    const queued = pi.events.emit.mock.calls.filter(
+      (c: any[]) => c[0] === "subagents:created" && c[1].details.status === "queued",
+    );
+    expect(queued.length).toBe(5);
+
+    created[0].finish();
+    await settle();
+    expect(created.length).toBe(3);
+    expect(created[2].session.lastPrompt).toContain("p2"); // FIFO
+
+    created[1].finish();
+    await settle();
+    expect(created.length).toBe(4);
+    expect(created[3].session.lastPrompt).toContain("p3");
+
+    created.slice(2).forEach((c) => c.finish());
+    await settle();
+    created.slice(4).forEach((c) => c.finish());
+    await Promise.all(runs);
+    expect(created.length).toBe(5);
+  });
+
+  it("spawns everything when maxConcurrent is 0", async () => {
+    writeConfig({ maxConcurrent: 0 });
+    const created = installSessions();
+    const runs = [0, 1, 2, 3, 4, 5, 6].map((i) =>
+      runAgentTool(tmpCwd, args(`p${i}`), undefined, undefined, fakeCtx(), fakePi()),
+    );
+    await settle();
+    expect(created.length).toBe(7);
+    created.forEach((c) => c.finish());
+    await Promise.all(runs);
+  });
+
+  it("aborting while queued resolves aborted without spawning or consuming a slot", async () => {
+    writeConfig({ maxConcurrent: 1 });
+    const created = installSessions();
+    const first = runAgentTool(tmpCwd, args("p0"), undefined, undefined, fakeCtx(), fakePi());
+    await settle();
+    expect(created.length).toBe(1);
+
+    const ac = new AbortController();
+    const queuedRun = runAgentTool(tmpCwd, args("p1"), ac.signal, undefined, fakeCtx(), fakePi());
+    await settle();
+    expect(created.length).toBe(1);
+
+    ac.abort();
+    const res: any = await queuedRun;
+    expect(res.details.status).toBe("aborted");
+    expect(created.length).toBe(1);
+
+    // Slot was never consumed: the next call starts as soon as the first ends.
+    created[0].finish();
+    await first;
+    const third = runAgentTool(tmpCwd, args("p2"), undefined, undefined, fakeCtx(), fakePi());
+    await settle();
+    expect(created.length).toBe(2);
+    created[1].finish();
+    await third;
+  });
+
+  it("releases the slot on completion, error and abort", async () => {
+    writeConfig({ maxConcurrent: 1 });
+    const created = installSessions();
+
+    const r1 = runAgentTool(tmpCwd, args("p0"), undefined, undefined, fakeCtx(), fakePi());
+    await settle();
+    created[0].finish();
+    await r1;
+
+    const r2 = runAgentTool(tmpCwd, args("p1"), undefined, undefined, fakeCtx(), fakePi());
+    await settle();
+    expect(created.length).toBe(2);
+    created[1].fail(new Error("x"));
+    await r2;
+
+    const ac = new AbortController();
+    const r3 = runAgentTool(tmpCwd, args("p2"), ac.signal, undefined, fakeCtx(), fakePi());
+    await settle();
+    expect(created.length).toBe(3);
+    ac.abort();
+    created[2].finish();
+    await r3;
+
+    const r4 = runAgentTool(tmpCwd, args("p3"), undefined, undefined, fakeCtx(), fakePi());
+    await settle();
+    expect(created.length).toBe(4);
+    created[3].finish();
+    await r4;
   });
 });

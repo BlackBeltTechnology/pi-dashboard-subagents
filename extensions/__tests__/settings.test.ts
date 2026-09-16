@@ -17,6 +17,7 @@ import { join } from "node:path";
 import {
   DEFAULT_SETTINGS,
   getSettingsPath,
+  getMaxConcurrent,
   invalidateSettingsCache,
   loadSettings,
   resolveIsolated,
@@ -92,6 +93,42 @@ describe("loadSettings", () => {
     expect(s.inheritContext).toBe(DEFAULT_SETTINGS.inheritContext);
     expect(warnSpy).toHaveBeenCalled();
     warnSpy.mockRestore();
+  });
+});
+
+// ── maxConcurrent (change: reduce-fanout-parent-stall) ──────────────────
+
+describe("maxConcurrent", () => {
+  it("defaults to 4 when absent", () => {
+    expect(DEFAULT_SETTINGS.maxConcurrent).toBe(4);
+    expect(loadSettings().maxConcurrent).toBe(4);
+  });
+
+  it("honours an explicit value, including 0 (unlimited)", () => {
+    saveSettings({ maxConcurrent: 0 });
+    invalidateSettingsCache();
+    expect(loadSettings().maxConcurrent).toBe(0);
+
+    saveSettings({ maxConcurrent: 7 });
+    invalidateSettingsCache();
+    expect(loadSettings().maxConcurrent).toBe(7);
+  });
+
+  it("coerces non-number, negative and non-finite values to the default", () => {
+    for (const bad of ["2", null, -1, Number.NaN, {}]) {
+      saveSettings({});
+      writeFileSync(getSettingsPath(), JSON.stringify({ maxConcurrent: bad }));
+      invalidateSettingsCache();
+      expect(loadSettings().maxConcurrent).toBe(DEFAULT_SETTINGS.maxConcurrent);
+    }
+  });
+
+  it("getMaxConcurrent picks up a hand-edit without an explicit invalidate", async () => {
+    saveSettings({ maxConcurrent: 5 });
+    expect(getMaxConcurrent()).toBe(5);
+    await new Promise((r) => setTimeout(r, 10)); // distinct mtime
+    writeFileSync(getSettingsPath(), JSON.stringify({ maxConcurrent: 1 }));
+    expect(getMaxConcurrent()).toBe(1);
   });
 });
 
