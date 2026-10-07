@@ -6,6 +6,8 @@ All notable changes to this package are documented here. Format follows
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-07
+
 ### Added
 
 - **Live reasoning tail.** `details.liveTail = { kind: "thinking" | "text", text }`
