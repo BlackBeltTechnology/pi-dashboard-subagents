@@ -6,6 +6,22 @@ All notable changes to this package are documented here. Format follows
 
 ## [Unreleased]
 
+### Added
+
+- **Live reasoning tail.** `details.liveTail = { kind: "thinking" | "text", text }`
+  carries the last ≤ 280 chars of the block currently streaming, fed by
+  `thinking_delta` / `text_delta`. Present on every snapshot (terminal too);
+  `{ kind: "none", text: "" }` when nothing streams. Rides the existing
+  250 ms tick throttle. Older dashboards ignore it.
+- **Thinking level on details.** `details.thinkingLevel` reports the child
+  session's effective level (`session.thinkingLevel`, falling back to the
+  requested level) so the dashboard can show it next to the model.
+
+### Fixed
+
+- **Activity no longer flickers between steps.** `tool_execution_end` keeps
+  the last activity instead of clearing it.
+
 ## [0.2.6] - 2026-10-07
 
 ### Fixed

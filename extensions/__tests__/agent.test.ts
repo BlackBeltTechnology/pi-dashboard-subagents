@@ -831,6 +831,31 @@ describe("runAgentTool spawn path", () => {
     expect((await spawnOpts("p/m", {}, pi)).thinkingLevel).toBe("high");
   });
 
+  // See change: stream-subagent-reasoning-and-stable-card (task 5.1).
+  it("reports the session's effective thinkingLevel on details", async () => {
+    writeConfig({ maxConcurrent: 0 });
+    const created = installSessions();
+    const onUpdate = vi.fn();
+    const run = runAgentTool(tmpCwd, { ...args("p"), model: "p/m:high" }, undefined, onUpdate, { cwd: tmpCwd } as any, resolvingPi());
+    await settle();
+    created[0].session.thinkingLevel = "medium"; // SDK clamped
+    created[0].emit({ type: "turn_start" });
+    created[0].finish();
+    await run;
+    expect(onUpdate.mock.calls.at(-1)![0].details.thinkingLevel).toBe("medium");
+  });
+
+  it("falls back to the requested thinkingLevel when the session exposes none", async () => {
+    writeConfig({ maxConcurrent: 0 });
+    const created = installSessions();
+    const onUpdate = vi.fn();
+    const run = runAgentTool(tmpCwd, { ...args("p"), model: "p/m:low" }, undefined, onUpdate, { cwd: tmpCwd } as any, resolvingPi());
+    await settle();
+    created[0].finish();
+    await run;
+    expect(onUpdate.mock.calls.at(-1)![0].details.thinkingLevel).toBe("low");
+  });
+
   it("omits thinkingLevel when neither suffix nor parent level exists", async () => {
     expect(await spawnOpts("p/m")).not.toHaveProperty("thinkingLevel");
   });
@@ -978,6 +1003,157 @@ describe("runAgentTool spawn path", () => {
     expect(created.length).toBe(2);
     created[1].finish();
     await third;
+  });
+
+  // ── liveTail + sticky activity (stream-subagent-reasoning-and-stable-card) ──
+
+  const CLEARED = { kind: "none", text: "" };
+  const mu = (type: string, delta?: string) => ({
+    type: "message_update",
+    assistantMessageEvent: delta === undefined ? { type } : { type, delta },
+  });
+  /** Force the next schedule to emit synchronously. */
+  function advance(ms = 300): void {
+    vi.setSystemTime(Date.now() + ms);
+  }
+
+  describe("liveTail", () => {
+    beforeEach(() => {
+      vi.useFakeTimers({ toFake: ["Date"] });
+    });
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
+    it.each([0, 1, 279, 280, 281, 1000])("bounds a %i-char thinking tail to the last 280 chars", async (n) => {
+      writeConfig({ maxConcurrent: 0 });
+      const created = installSessions();
+      const onUpdate = vi.fn();
+      const run = runAgentTool(tmpCwd, args("p"), undefined, onUpdate, fakeCtx(), fakePi());
+      await settle();
+      created[0].emit(mu("thinking_start"));
+      const full = Array.from({ length: n }, (_, i) => String.fromCharCode(97 + (i % 26))).join("");
+      for (const ch of full) created[0].emit(mu("thinking_delta", ch));
+      advance();
+      created[0].emit(mu("thinking_delta", ""));
+      const tail = onUpdate.mock.calls.at(-1)![0].details.liveTail;
+      expect(tail.kind).toBe("thinking");
+      expect(tail.text).toBe(full.slice(-280));
+      expect(tail.text.length).toBe(Math.min(n, 280));
+      created[0].finish();
+      await run;
+    });
+
+    it("switches text → none → thinking, never mixed", async () => {
+      writeConfig({ maxConcurrent: 0 });
+      const created = installSessions();
+      const onUpdate = vi.fn();
+      const run = runAgentTool(tmpCwd, args("p"), undefined, onUpdate, fakeCtx(), fakePi());
+      await settle();
+      const last = () => onUpdate.mock.calls.at(-1)![0].details.liveTail;
+      advance();
+      created[0].emit(mu("text_start"));
+      advance();
+      created[0].emit(mu("text_delta", "hello"));
+      expect(last()).toEqual({ kind: "text", text: "hello" });
+      advance();
+      created[0].emit({ ...mu("text_end"), assistantMessageEvent: { type: "text_end", content: "hello" } });
+      expect(last()).toEqual(CLEARED);
+      advance();
+      created[0].emit(mu("thinking_start"));
+      advance();
+      created[0].emit(mu("thinking_delta", "hmm"));
+      expect(last()).toEqual({ kind: "thinking", text: "hmm" });
+      created[0].finish();
+      await run;
+    });
+
+    it("carries liveTail on every snapshot kind", async () => {
+      writeConfig({ maxConcurrent: 1 });
+      const created = installSessions();
+      const pi = fakePi();
+      const onUpdate = vi.fn();
+      const run = runAgentTool(tmpCwd, args("p"), undefined, onUpdate, fakeCtx(), pi);
+      // queued + early-error (abort while queued)
+      const ac = new AbortController();
+      const onQ = vi.fn();
+      const queuedRun = runAgentTool(tmpCwd, args("q"), ac.signal, onQ, fakeCtx(), pi);
+      await settle();
+      ac.abort();
+      await queuedRun;
+      expect(onQ.mock.calls.at(-1)![0].details.liveTail).toEqual(CLEARED);
+      // running idle
+      advance();
+      created[0].emit({ type: "turn_start" });
+      expect(onUpdate.mock.calls.at(-1)![0].details.liveTail).toEqual(CLEARED);
+      // running mid-block
+      advance();
+      created[0].emit(mu("thinking_start"));
+      advance();
+      created[0].emit(mu("thinking_delta", "x"));
+      expect(onUpdate.mock.calls.at(-1)![0].details.liveTail).toEqual({ kind: "thinking", text: "x" });
+      created[0].finish();
+      await run;
+      expect(onUpdate.mock.calls.at(-1)![0].details.liveTail).toEqual(CLEARED);
+      for (const [ch, payload] of pi.events.emit.mock.calls) {
+        expect(payload.details, ch).toHaveProperty("liveTail");
+      }
+
+      // failed
+      const created2 = installSessions();
+      const on2 = vi.fn();
+      const r2 = runAgentTool(tmpCwd, args("p"), undefined, on2, fakeCtx(), fakePi());
+      await settle();
+      created2[0].emit(mu("text_start"));
+      created2[0].fail(new Error("boom"));
+      await r2;
+      expect(on2.mock.calls.at(-1)![0].details.liveTail).toEqual(CLEARED);
+
+      // aborted while running
+      const created3 = installSessions();
+      const on3 = vi.fn();
+      const ac3 = new AbortController();
+      const r3 = runAgentTool(tmpCwd, args("p"), ac3.signal, on3, fakeCtx(), fakePi());
+      await settle();
+      created3[0].emit(mu("text_start"));
+      ac3.abort();
+      created3[0].finish();
+      await r3;
+      expect(on3.mock.calls.at(-1)![0].details.status).toBe("aborted");
+      expect(on3.mock.calls.at(-1)![0].details.liveTail).toEqual(CLEARED);
+    });
+
+    it("keeps activity after tool_execution_end", async () => {
+      writeConfig({ maxConcurrent: 0 });
+      const created = installSessions();
+      const onUpdate = vi.fn();
+      const run = runAgentTool(tmpCwd, args("p"), undefined, onUpdate, fakeCtx(), fakePi());
+      await settle();
+      advance();
+      created[0].emit({ type: "tool_execution_start", toolCallId: "t1", toolName: "Read", args: {} });
+      advance();
+      created[0].emit({ type: "tool_execution_end", toolCallId: "t1", toolName: "Read", result: {}, isError: false });
+      expect(onUpdate.mock.calls.at(-1)![0].details.activity).toBe("running Read");
+      created[0].finish();
+      await run;
+    });
+  });
+
+  it("throttles a 100-delta thinking burst to ≤ ceil(burst/250ms)+1 ticks", async () => {
+    writeConfig({ maxConcurrent: 0 });
+    const created = installSessions();
+    const onUpdate = vi.fn();
+    const run = runAgentTool(tmpCwd, args("p"), undefined, onUpdate, fakeCtx(), fakePi());
+    await settle();
+    const before = onUpdate.mock.calls.length;
+    const t0 = Date.now();
+    created[0].emit(mu("thinking_start"));
+    for (let i = 0; i < 100; i++) created[0].emit(mu("thinking_delta", "y"));
+    const burstMs = Date.now() - t0;
+    expect(burstMs).toBeLessThan(250);
+    expect(onUpdate.mock.calls.length - before).toBeLessThanOrEqual(Math.ceil(burstMs / 250) + 1);
+    created[0].finish();
+    await run;
   });
 
   it("releases the slot on completion, error and abort", async () => {

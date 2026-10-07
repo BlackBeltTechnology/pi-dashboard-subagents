@@ -34,6 +34,12 @@ export type SubagentTimelineEntry =
 export type AgentStatus =
   | "queued" | "running" | "completed" | "aborted" | "stopped" | "error";
 
+export type LiveTail =
+  | { kind: "thinking" | "text"; text: string }
+  | { kind: "none"; text: "" };
+
+export const CLEARED_LIVE_TAIL: LiveTail = Object.freeze({ kind: "none", text: "" }) as LiveTail;
+
 export interface AgentDetails {
   /** Stable id — drives popout URL `/session/<sid>/subagent/<agentId>` */
   agentId: string;
@@ -43,6 +49,12 @@ export interface AgentDetails {
   status: AgentStatus;
   /** Live current-activity line — e.g. "reading src/foo.ts" */
   activity?: string;
+  /**
+   * Bounded tail (≤ 280 chars) of the block currently streaming. Present on
+   * every snapshot; `{ kind: "none", text: "" }` when nothing streams.
+   * See change: stream-subagent-reasoning-and-stable-card.
+   */
+  liveTail?: LiveTail;
   /** Full per-step timeline. Tier-1 in the dashboard. */
   entries?: SubagentTimelineEntry[];
   /** Cumulative count of completed tool calls. */
@@ -56,6 +68,11 @@ export interface AgentDetails {
   durationMs: number;
   /** Resolved model id used by this subagent. */
   modelName?: string;
+  /**
+   * Effective thinking level of the child session (e.g. "high", "off").
+   * Undefined until the session exists. See change: stream-subagent-reasoning-and-stable-card.
+   */
+  thinkingLevel?: string;
   /** Notable config flags surfaced on the card. */
   tags?: string[];
   /**
@@ -467,6 +484,7 @@ export function buildDetails(snapshot: {
   subagentType: string;
   status: AgentStatus;
   activity?: string;
+  liveTail?: LiveTail;
   entries: SubagentTimelineEntry[];
   toolUses: number;
   tokensTotal: number;
@@ -475,6 +493,7 @@ export function buildDetails(snapshot: {
   maxTurns?: number;
   startedAt: number;
   modelName?: string;
+  thinkingLevel?: string;
   tags?: string[];
   agentMdPath?: string;
   /**
@@ -496,6 +515,7 @@ export function buildDetails(snapshot: {
     subagentType: snapshot.subagentType,
     status: snapshot.status,
     activity: snapshot.activity,
+    liveTail: snapshot.liveTail ?? CLEARED_LIVE_TAIL,
     entries: snapshot.entries,
     toolUses: snapshot.toolUses,
     tokens: formatTokens(snapshot.tokensTotal),
@@ -504,6 +524,7 @@ export function buildDetails(snapshot: {
     maxTurns: snapshot.maxTurns,
     durationMs: Date.now() - snapshot.startedAt,
     modelName: snapshot.modelName,
+    thinkingLevel: snapshot.thinkingLevel,
     tags: snapshot.tags,
     agentMdPath: snapshot.agentMdPath,
     agentMdSource: snapshot.agentMdSource,

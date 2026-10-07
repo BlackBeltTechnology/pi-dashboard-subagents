@@ -41,6 +41,8 @@ import {
 import {
   type AgentDetails,
   type AgentStatus,
+  type LiveTail,
+  CLEARED_LIVE_TAIL,
   type SubagentTimelineEntry,
   type TokenUsage,
   buildDetails,
@@ -585,15 +587,43 @@ function activityFromEvent(event: AgentSessionEvent): string | null | undefined 
   if (event.type === "tool_execution_start") {
     return `running ${event.toolName}`;
   }
-  if (event.type === "tool_execution_end") {
-    return null; // clear activity
-  }
+  // `tool_execution_end` keeps the last activity (no flicker between steps).
   if (event.type === "message_update") {
     const e = event.assistantMessageEvent;
     if (e.type === "thinking_start") return "thinking";
     if (e.type === "text_start") return "writing";
   }
   return undefined; // no change
+}
+
+/** Max chars of the streaming block carried in `details.liveTail`. */
+export const LIVE_TAIL_MAX = 280;
+
+/**
+ * Fold one session event into the bounded live tail of the block currently
+ * streaming. Block end / message end clear it to the sentinel.
+ */
+export function nextLiveTail(prev: LiveTail, event: AgentSessionEvent): LiveTail {
+  if (event.type === "message_end") return CLEARED_LIVE_TAIL;
+  if (event.type !== "message_update") return prev;
+  const e = event.assistantMessageEvent as { type: string; delta?: string };
+  switch (e.type) {
+    case "thinking_start":
+      return { kind: "thinking", text: "" };
+    case "text_start":
+      return { kind: "text", text: "" };
+    case "thinking_delta":
+    case "text_delta": {
+      const kind = e.type === "thinking_delta" ? "thinking" : "text";
+      const base = prev.kind === kind ? prev.text : "";
+      return { kind, text: (base + (e.delta ?? "")).slice(-LIVE_TAIL_MAX) };
+    }
+    case "thinking_end":
+    case "text_end":
+      return CLEARED_LIVE_TAIL;
+    default:
+      return prev;
+  }
 }
 
 // ─── Model reference resolution ───────────────────────────────────────────
@@ -1063,7 +1093,9 @@ export async function runAgentTool(
   let toolUses = 0;
   let turnCount = 0;
   let activity: string | undefined;
+  let liveTail: LiveTail = CLEARED_LIVE_TAIL;
   let modelName: string | undefined;
+  let thinkingLevel: string | undefined;
 
   const tracker = createToolCallTracker();
   const usage = createUsageAccumulator();
@@ -1089,6 +1121,7 @@ export async function runAgentTool(
       subagentType: args.subagent_type,
       status,
       activity,
+      liveTail: status === "running" ? liveTail : CLEARED_LIVE_TAIL,
       entries: entries.slice(),
       toolUses,
       tokensTotal: usage.totals().total,
@@ -1096,6 +1129,7 @@ export async function runAgentTool(
       turnCount,
       startedAt,
       modelName,
+      thinkingLevel: (session as { thinkingLevel?: string } | undefined)?.thinkingLevel ?? thinkingLevel,
       agentMdPath,
       agentMdSource,
       agentMdPkg,
@@ -1265,6 +1299,8 @@ export async function runAgentTool(
     });
     session = createResult.session;
     modelName = session.model?.id;
+    // Requested level; snapshots prefer the session's live (possibly clamped) one.
+    thinkingLevel = effectiveThinking;
 
     // ── Tool allowlist ──
     // Always strip the `Agent` tool to prevent recursive nesting. When
@@ -1288,6 +1324,7 @@ export async function runAgentTool(
       const pairing = tracker.onEvent(event); // null on non-tool, { input } on end
       const newActivity = activityFromEvent(event);
       if (newActivity !== undefined) activity = newActivity ?? undefined;
+      liveTail = nextLiveTail(liveTail, event);
 
       if (event.type === "tool_execution_end") {
         const entry = mapSessionEventToEntry(event);
