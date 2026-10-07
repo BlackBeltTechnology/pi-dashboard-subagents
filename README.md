@@ -490,13 +490,16 @@ This section locks the producer-side contract consumed by the dashboard inspecto
 
 ### Emission channels
 
-Every run emits on four `pi.events.emit(channel, data)` channels. The dashboard
-bridge's emit intercept renames them to its protocol event types:
+Every run emits on five `pi.events.emit(channel, data)` channels. The dashboard
+bridge's emit intercept renames the four lifecycle channels to its protocol
+event types; any listener on `pi.events` (a TUI widget, a logger, the
+dashboard) can consume all five:
 
 | Producer channel        | Dashboard protocol event | When                                          |
 | ----------------------- | ------------------------ | --------------------------------------------- |
 | `subagents:created`     | `subagent_created`       | Tool invocation begins (before any session work) |
-| `subagents:started`     | `subagent_started`       | Initial "running" emission, AND all progress ticks (re-uses channel; dashboard reducer merges) |
+| `subagents:started`     | `subagent_started`       | Initial "running" emission, AND all progress ticks (re-uses channel; progress ticks omit `entries`, carry `entryCount`) |
+| `subagents:entry`       | — (not forwarded by core) | Once per timeline step, the moment it is appended (never throttled) |
 | `subagents:completed`   | `subagent_completed`     | `await session.prompt(...)` resolves successfully |
 | `subagents:failed`      | `subagent_failed`        | Any throw, abort, or session error path       |
 
@@ -515,7 +518,18 @@ subagents:created   → { id, type, description, details }
 subagents:started   → { id, type?, description?, details }    // type/description on first emission only
 subagents:completed → { id, result, durationMs, tokens, toolUses, details }
 subagents:failed    → { id, error, durationMs, toolUses?, details }
+subagents:entry     → { v: 1, agentId, toolCallId, index, entry }  // SubagentEntryEvent
 ```
+
+**Timeline steps go out once each.** Rebuild a live timeline by appending
+`subagents:entry` payloads by `index` (0-based, contiguous, never rewritten;
+`toolCallId` is the parent `Agent` tool call id, `""` when unknown). Progress
+ticks on `subagents:started` deliberately OMIT the `entries` key and carry
+`details.entryCount` instead, so per-tick cost stays constant however long the
+run is. `subagents:created`, the initial `subagents:started`,
+`subagents:completed`, `subagents:failed`, the tool's `onUpdate` and the final
+tool result all keep the full `details.entries[]` (the parent session's tool
+result is the durable full timeline).
 
 ### `AgentDetails` field reference
 
@@ -529,7 +543,8 @@ The `details` payload (defined in `extensions/events.ts`) carries everything the
 | `subagentType` | `string`                        | The `.md` agent type identifier (e.g. `"Explore"`)                       |
 | `status`       | `AgentStatus`                   | One of `queued \| running \| completed \| aborted \| stopped \| error`     |
 | `activity?`    | `string`                        | Live current-activity line ("running bash", "thinking", …)               |
-| `entries?`     | `SubagentTimelineEntry[]`       | Full timeline (cumulative; dashboard REPLACES on each emission)          |
+| `entries?`     | `SubagentTimelineEntry[]`       | Full timeline. Absent on progress ticks (use `subagents:entry`)          |
+| `entryCount?`  | `number`                        | `entries.length` at snapshot time; on every emission                     |
 | `toolUses`    | `number`                        | Cumulative count of completed tool calls                                 |
 | `tokens`       | `string`                        | Display-formatted total (`"12.3k"`)                                      |
 | `tokensUsage?` | `{ input, output, total }`      | Raw integer counts (populated on `completed`/`failed`)                    |

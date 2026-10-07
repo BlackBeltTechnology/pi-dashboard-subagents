@@ -48,8 +48,17 @@ The dashboard bridge's emit intercept maps `subagents:*` channels to `subagent_*
 
 - **GIVEN** a subagent run is in progress
 - **WHEN** `entries[]`, `activity`, `toolUses`, or `turnCount` changes
-- **THEN** `pi.events.emit("subagents:started", payload)` SHALL be called with the latest cumulative `details`
-- **AND** the dashboard reducer SHALL replace `SessionState.subagents[agentId].entries` with the new array (replace, not append)
+- **THEN** `pi.events.emit("subagents:started", payload)` SHALL be called with the latest `details`
+- **AND** the progress `details` SHALL OMIT the `entries` key and SHALL carry `entryCount === entries.length`
+- **AND** listeners SHALL rebuild the live timeline from `subagents:entry` events (see change: stream-subagent-entries-per-step)
+
+#### Scenario: Each timeline step is emitted once on subagents:entry
+
+- **WHEN** a step is appended to the timeline (tool end, text/thinking/error end, or `message_end` backfill)
+- **THEN** `pi.events.emit("subagents:entry", { v: 1, agentId, toolCallId, index, entry })` SHALL be called exactly once, synchronously, unthrottled
+- **AND** `index` SHALL be the step's 0-based position, contiguous across the run
+- **AND** `toolCallId` SHALL be the parent `Agent` tool call id, or `""` when unknown
+- **AND** `created`, the initial `started`, `completed`, `failed`, `onUpdate` and the final tool result SHALL still carry the full `details.entries`
 
 #### Scenario: Progress emissions are throttled to avoid event-bus flooding
 

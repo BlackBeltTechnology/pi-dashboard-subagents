@@ -15,8 +15,10 @@
  *   subagents:failed    → subagent_failed
  *
  * The dashboard reducer routes by `data.id` into SessionState.subagents
- * and reads `data.details` for the card. `data.details.entries[]` is the
- * Tier-1 timeline (tool calls, reasoning, assistant text, errors).
+ * and reads `data.details` for the card. Timeline steps (tool calls,
+ * reasoning, assistant text, errors) go out once each on `subagents:entry`;
+ * progress frames carry only `entryCount`. created / completed / failed and
+ * the tool result still carry the full `details.entries[]`.
  */
 
 import type { ExtensionAPI, ExtensionContext, SessionEntry } from "@earendil-works/pi-coding-agent";
@@ -55,8 +57,15 @@ export interface AgentDetails {
    * See change: stream-subagent-reasoning-and-stable-card.
    */
   liveTail?: LiveTail;
-  /** Full per-step timeline. Tier-1 in the dashboard. */
+  /**
+   * Full per-step timeline. OMITTED (key absent) on progress frames — steps
+   * arrive once each on `subagents:entry`. Present on created, the initial
+   * started frame, completed, failed, `onUpdate` and the final tool result.
+   * See change: stream-subagent-entries-per-step.
+   */
   entries?: SubagentTimelineEntry[];
+  /** `entries.length` at snapshot time. Present on every snapshot. */
+  entryCount?: number;
   /** Cumulative count of completed tool calls. */
   toolUses: number;
   /** Display-only formatted token total ("12.3k"). */
@@ -107,6 +116,21 @@ export interface TokenUsage {
   input: number;
   output: number;
   total: number;
+}
+
+/**
+ * Payload of `subagents:entry` — emitted exactly once per timeline step, in
+ * order, the moment the step is appended. `index` is the step's stable
+ * 0-based position (steps are never mutated or removed).
+ * See change: stream-subagent-entries-per-step.
+ */
+export interface SubagentEntryEvent {
+  v: 1;
+  agentId: string;
+  /** Parent `Agent` tool call id; `""` when unknown. */
+  toolCallId: string;
+  index: number;
+  entry: SubagentTimelineEntry;
 }
 
 // ─── Mapping AgentSessionEvent → SubagentTimelineEntry ───────────────────
@@ -222,10 +246,9 @@ export function emitSubagentStarted(
 }
 
 /**
- * Cumulative progress update — fire on every entry append, activity change,
- * token tick, or status transition while the subagent is running. Reuses
- * "subagents:started" since the dashboard reducer merges incoming `details`
- * with the existing SubagentState (entries[] are replaced wholesale each tick).
+ * Throttled progress update while the subagent runs. Reuses
+ * "subagents:started". The `entries` key is OMITTED (steps go out once each
+ * via {@link emitSubagentEntry}); `entryCount` tells listeners how many exist.
  */
 export function emitSubagentProgress(
   pi: ExtensionAPI,
@@ -234,10 +257,17 @@ export function emitSubagentProgress(
     details: AgentDetails;
   },
 ): void {
+  const { entries: _omit, ...details } = args.details;
   emit(pi, "subagents:started", {
     id: args.agentId,
-    details: args.details,
+    details,
   });
+}
+
+/** One timeline step, emitted once on `subagents:entry`. Never throttled. */
+export function emitSubagentEntry(pi: ExtensionAPI, event: Omit<SubagentEntryEvent, "v">): void {
+  const payload: SubagentEntryEvent = { v: 1, ...event };
+  emit(pi, "subagents:entry", payload as unknown as Record<string, unknown>);
 }
 
 export function emitSubagentCompleted(
@@ -517,6 +547,7 @@ export function buildDetails(snapshot: {
     activity: snapshot.activity,
     liveTail: snapshot.liveTail ?? CLEARED_LIVE_TAIL,
     entries: snapshot.entries,
+    entryCount: snapshot.entries.length,
     toolUses: snapshot.toolUses,
     tokens: formatTokens(snapshot.tokensTotal),
     tokensUsage: snapshot.tokensUsage,

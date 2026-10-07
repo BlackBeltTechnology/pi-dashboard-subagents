@@ -1185,4 +1185,183 @@ describe("runAgentTool spawn path", () => {
     created[3].finish();
     await r4;
   });
+
+  // ── Per-step entry stream (change: stream-subagent-entries-per-step) ──
+
+  describe("per-step entry stream", () => {
+    /** Fake pi whose bus records every emission per channel. */
+    function recordingPi() {
+      const emitted: Array<{ channel: string; data: any }> = [];
+      const pi: any = { events: { emit: (channel: string, data: any) => emitted.push({ channel, data }) } };
+      const on = (channel: string) => emitted.filter((e) => e.channel === channel).map((e) => e.data);
+      return { pi, emitted, on };
+    }
+    const textEnd = (content: string) => ({
+      type: "message_update",
+      assistantMessageEvent: { type: "text_end", content },
+    });
+    const thinkingEnd = (content: string) => ({
+      type: "message_update",
+      assistantMessageEvent: { type: "thinking_end", content },
+    });
+    const toolStep = (h: { emit: (e: any) => void }, id: string) => {
+      h.emit({ type: "tool_execution_start", toolCallId: id, toolName: "Read", args: { path: id } });
+      h.emit({ type: "tool_execution_end", toolCallId: id, toolName: "Read", result: { ok: id }, isError: false });
+    };
+
+    beforeEach(() => {
+      vi.useFakeTimers({ toFake: ["Date"] });
+    });
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
+    it("announces each step once, in order, matching the final timeline", async () => {
+      writeConfig({ maxConcurrent: 0 });
+      const created = installSessions();
+      const { pi, on } = recordingPi();
+      const run = runAgentTool(tmpCwd, args("p"), undefined, undefined, fakeCtx(), pi, "call-42");
+      await settle();
+      const h = created[0];
+      toolStep(h, "t1");
+      h.emit(thinkingEnd("hmm"));
+      h.emit(textEnd("hello"));
+      // Streaming already delivered both blocks → no backfill duplicates.
+      h.emit({
+        type: "message_end",
+        message: { role: "assistant", content: [{ type: "thinking", thinking: "hmm" }, { type: "text", text: "hello" }] },
+      });
+      toolStep(h, "t2");
+      // Provider without streaming end events → backfilled from message_end.
+      h.emit({
+        type: "message_end",
+        message: { role: "assistant", content: [{ type: "thinking", thinking: "bf-think" }, { type: "text", text: "bf-text" }] },
+      });
+      h.finish();
+      const res: any = await run;
+
+      const steps = on("subagents:entry");
+      expect(steps.map((s) => s.index)).toEqual([0, 1, 2, 3, 4, 5]);
+      expect(steps.map((s) => s.entry.kind)).toEqual(["tool", "thinking", "text", "tool", "thinking", "text"]);
+      expect(res.details.entries).toHaveLength(steps.length);
+      for (const s of steps) {
+        expect(s.agentId).toBe(res.details.agentId);
+        expect(s.toolCallId).toBe("call-42");
+        expect(s.entry).toEqual(res.details.entries[s.index]);
+      }
+      expect(steps[0].entry).toMatchObject({ kind: "tool", input: { path: "t1" } });
+    });
+
+    it("defaults toolCallId to an empty string when unknown", async () => {
+      writeConfig({ maxConcurrent: 0 });
+      const created = installSessions();
+      const { pi, on } = recordingPi();
+      const run = runAgentTool(tmpCwd, args("p"), undefined, undefined, fakeCtx(), pi);
+      await settle();
+      created[0].emit(textEnd("x"));
+      created[0].finish();
+      await run;
+      expect(on("subagents:entry")[0].toolCallId).toBe("");
+    });
+
+    it("the Agent tool passes its tool call id through", async () => {
+      writeConfig({ maxConcurrent: 0 });
+      const created = installSessions();
+      const { pi, on } = recordingPi();
+      const tools: any[] = [];
+      pi.registerTool = (t: any) => tools.push(t);
+      pi.on = () => {};
+      activate(pi);
+      const run = tools[0].execute("call-xyz", args("p"), undefined, undefined, fakeCtx());
+      await settle();
+      created[0].emit(textEnd("x"));
+      created[0].finish();
+      await run;
+      expect(on("subagents:entry")[0].toolCallId).toBe("call-xyz");
+    });
+
+    it("progress updates omit the step list and carry entryCount; everything else keeps it", async () => {
+      writeConfig({ maxConcurrent: 0 });
+      const created = installSessions();
+      const { pi, on } = recordingPi();
+      const onUpdate = vi.fn();
+      const run = runAgentTool(tmpCwd, args("p"), undefined, onUpdate, fakeCtx(), pi);
+      await settle();
+      advance();
+      toolStep(created[0], "t1");
+      advance();
+      created[0].emit(textEnd("a"));
+      advance();
+      created[0].emit(textEnd("b"));
+      created[0].finish();
+      const res: any = await run;
+
+      const started = on("subagents:started");
+      // First frame is the initial announcement (full); the rest are progress.
+      expect(started[0].details.entries).toEqual([]);
+      expect(started[0].details.entryCount).toBe(0);
+      const progress = started.slice(1);
+      expect(progress.length).toBeGreaterThanOrEqual(3);
+      for (const f of progress) {
+        expect("entries" in f.details).toBe(false);
+        expect(typeof f.details.entryCount).toBe("number");
+      }
+      expect(progress.at(-1).details.entryCount).toBe(3);
+
+      expect(on("subagents:created")[0].details.entries).toEqual([]);
+      const completed = on("subagents:completed")[0];
+      expect(completed.details.entries).toHaveLength(3);
+      expect(completed.details.entryCount).toBe(3);
+      expect(res.details.entries).toHaveLength(3);
+      expect(res.details.entryCount).toBe(3);
+      for (const [u] of onUpdate.mock.calls) {
+        expect(Array.isArray(u.details.entries)).toBe(true);
+        expect(u.details.entryCount).toBe(u.details.entries.length);
+      }
+    });
+
+    it("failure and abort keep the full step list and entryCount", async () => {
+      writeConfig({ maxConcurrent: 0 });
+      const created = installSessions();
+      const { pi, on } = recordingPi();
+      const r1: Promise<any> = runAgentTool(tmpCwd, args("p"), undefined, undefined, fakeCtx(), pi);
+      await settle();
+      created[0].emit(textEnd("a"));
+      created[0].fail(new Error("boom"));
+      const res1 = await r1;
+      expect(res1.details.entries).toHaveLength(1);
+      expect(res1.details.entryCount).toBe(1);
+
+      const ac = new AbortController();
+      const r2: Promise<any> = runAgentTool(tmpCwd, args("p"), ac.signal, undefined, fakeCtx(), pi);
+      await settle();
+      created[1].emit(textEnd("b"));
+      created[1].emit(textEnd("c"));
+      ac.abort();
+      created[1].finish();
+      const res2 = await r2;
+      expect(res2.details.entries).toHaveLength(2);
+      expect(res2.details.entryCount).toBe(2);
+
+      const failed = on("subagents:failed");
+      expect(failed.map((f) => f.details.entries.length)).toEqual([1, 2]);
+      expect(failed.map((f) => f.details.entryCount)).toEqual([1, 2]);
+    });
+
+    it("announces every step of a 100-step burst while progress stays throttled", async () => {
+      writeConfig({ maxConcurrent: 0 });
+      const created = installSessions();
+      const { pi, on } = recordingPi();
+      const run = runAgentTool(tmpCwd, args("p"), undefined, undefined, fakeCtx(), pi);
+      await settle();
+      const before = on("subagents:started").length;
+      for (let i = 0; i < 100; i++) created[0].emit(textEnd(`s${i}`));
+      expect(on("subagents:entry")).toHaveLength(100);
+      expect(on("subagents:entry").map((s) => s.index)).toEqual([...Array(100).keys()]);
+      // Date is frozen → one leading progress emit, the rest coalesced.
+      expect(on("subagents:started").length - before).toBeLessThanOrEqual(1);
+      created[0].finish();
+      await run;
+    });
+  });
 });

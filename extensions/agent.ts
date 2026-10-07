@@ -50,6 +50,7 @@ import {
   createToolCallTracker,
   emitSubagentCompleted,
   emitSubagentCreated,
+  emitSubagentEntry,
   emitSubagentFailed,
   emitSubagentProgress,
   emitSubagentStarted,
@@ -1015,13 +1016,15 @@ function makeAgentTool(pi: ExtensionAPI, exposeIsolated: boolean) {
     parameters: buildAgentParametersSchema(exposeIsolated),
 
     async execute(
-      _toolCallId: string,
+      toolCallId: string,
       params: AgentToolArgs,
       signal: AbortSignal | undefined,
       onUpdate: AgentToolUpdateCallback<AgentDetails> | undefined,
       ctx: ExtensionContext,
     ): Promise<AgentToolResult<AgentDetails>> {
-      return runAgentTool(ctx.cwd, params, signal, onUpdate, ctx, pi) as Promise<AgentToolResult<AgentDetails>>;
+      return runAgentTool(ctx.cwd, params, signal, onUpdate, ctx, pi, toolCallId) as Promise<
+        AgentToolResult<AgentDetails>
+      >;
     },
   });
 }
@@ -1063,6 +1066,8 @@ export async function runAgentTool(
   onUpdate: AgentToolUpdateCallback<AgentDetails> | undefined,
   ctx: ExtensionContext,
   pi: ExtensionAPI,
+  /** Parent `Agent` tool call id, echoed on every `subagents:entry`. */
+  toolCallId = "",
 ): Promise<AgentToolResultWithError<AgentDetails>> {
   const agentId = randomUUID();
   const startedAt = Date.now();
@@ -1096,6 +1101,16 @@ export async function runAgentTool(
   let liveTail: LiveTail = CLEARED_LIVE_TAIL;
   let modelName: string | undefined;
   let thinkingLevel: string | undefined;
+
+  /**
+   * The ONLY way a step joins the timeline: push, then announce it once on
+   * `subagents:entry` (synchronous, never throttled). Steps are never mutated
+   * or removed afterwards, so `index` is stable.
+   */
+  function appendEntry(entry: SubagentTimelineEntry): void {
+    entries.push(entry);
+    emitSubagentEntry(pi, { agentId, toolCallId, index: entries.length - 1, entry });
+  }
 
   const tracker = createToolCallTracker();
   const usage = createUsageAccumulator();
@@ -1330,12 +1345,12 @@ export async function runAgentTool(
         const entry = mapSessionEventToEntry(event);
         if (entry && entry.kind === "tool") {
           entry.input = pairing?.input;
-          entries.push(entry);
+          appendEntry(entry);
           toolUses += 1;
         }
       } else if (event.type === "message_update") {
         const entry = mapSessionEventToEntry(event);
-        if (entry) entries.push(entry);
+        if (entry) appendEntry(entry);
       } else if (event.type === "message_end") {
         const msg = event.message as { role: string; content?: unknown };
         if (msg.role === "assistant") {
@@ -1370,14 +1385,14 @@ export async function runAgentTool(
               const now = Date.now();
               for (const block of textBlocks.slice(trailingNonToolCount)) {
                 if (block.type === "text" && typeof block.text === "string" && block.text) {
-                  entries.push({ kind: "text", text: block.text, ts: now });
+                  appendEntry({ kind: "text", text: block.text, ts: now });
                 } else if (
                   block.type === "thinking" &&
                   typeof block.thinking === "string" &&
                   block.thinking &&
                   !block.redacted
                 ) {
-                  entries.push({ kind: "thinking", text: block.thinking, ts: now });
+                  appendEntry({ kind: "thinking", text: block.thinking, ts: now });
                 }
               }
             }

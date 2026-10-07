@@ -16,6 +16,22 @@ All notable changes to this package are documented here. Format follows
 - **Thinking level on details.** `details.thinkingLevel` reports the child
   session's effective level (`session.thinkingLevel`, falling back to the
   requested level) so the dashboard can show it next to the model.
+- **Per-step entry stream.** Each timeline step is emitted ONCE on the new
+  `subagents:entry` channel, the moment it is appended:
+  `{ v: 1, agentId, toolCallId, index, entry }` (`SubagentEntryEvent`).
+  `index` is the stable 0-based position; `toolCallId` is the parent `Agent`
+  tool call id (`""` when unknown). Never throttled.
+- **`details.entryCount`** = `entries.length` on every snapshot.
+
+### Changed
+
+- **BREAKING (wire): progress ticks no longer carry the timeline.** Progress
+  frames on `subagents:started` omit the `entries` key (absent, not `[]`);
+  listeners rebuild the live timeline from `subagents:entry`. Before, every
+  tick resent the whole growing list, so a long run cost O(steps²) in
+  transport and storage. `subagents:created`, the initial `subagents:started`,
+  `subagents:completed`, `subagents:failed`, the tool's `onUpdate` and the
+  final tool result still carry the full `entries[]`.
 
 ### Fixed
 
