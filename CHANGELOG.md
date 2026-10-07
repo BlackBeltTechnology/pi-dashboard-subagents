@@ -6,6 +6,35 @@ All notable changes to this package are documented here. Format follows
 
 ## [Unreleased]
 
+## [0.2.6] - 2026-10-07
+
+### Fixed
+
+- **Subagents honor the requested thinking level.** A `:off` suffix on a
+  model ref or role is now passed to the subagent instead of being dropped
+  (it previously fell back to `defaultThinkingLevel`, usually `medium`).
+- **Subagents inherit the parent's live thinking level.** When the model ref
+  has no suffix, the child uses the parent session's current level (e.g. an
+  unsaved `/thinking low`) instead of the settings default. Precedence:
+  suffix > parent live level > pi per-model setting > `defaultThinkingLevel`.
+  pi 1.x's `max` level is accepted as a suffix (`provider/model:max`).
+  Note: the parent level now wins over a per-model thinking setting, and
+  subagent cost/latency follows the parent's level.
+- **Custom-provider auth works in subagents again on pi >=0.80.8.** The child
+  session now inherits the parent's live `modelRuntime`; the removed
+  `modelRegistry`/`authStorage` options were silently ignored, so children
+  built a disk-only runtime and failed with "No API key found".
+
+### Changed
+
+- **pi 1.x support.** Peer range for `@earendil-works/pi-ai`,
+  `pi-coding-agent`, `pi-tui` is now `>=0.80.8 <2`; developed and tested
+  against pi 1.0.4. **BREAKING:** pi <0.80.8 is no longer supported (stay on
+  0.2.5).
+- **Docs.** README documents thinking-level precedence, custom-provider
+  runtime inheritance and the supported pi range; removed the frontmatter
+  `thinking:` example, which was never implemented (use a `:level` suffix).
+
 ## [0.2.5] - 2026-09-16
 
 ### Fixed

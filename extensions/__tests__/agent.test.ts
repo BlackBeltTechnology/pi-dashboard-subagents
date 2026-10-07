@@ -780,6 +780,82 @@ describe("runAgentTool spawn path", () => {
     await run;
   });
 
+  // ── thinking level + model runtime (fix-subagent-thinking-and-pi1-compat) ──
+
+  /** pi whose model:resolve handler parses a ":<level>" suffix; "@cheap" -> off. */
+  function resolvingPi() {
+    return {
+      events: {
+        emit: vi.fn((name: string, probe: any) => {
+          if (name !== "model:resolve") return;
+          const ref = probe.ref === "@cheap" ? "p/m:off" : probe.ref;
+          const [id, thk] = ref.split(":");
+          probe.model = { provider: "p", id };
+          if (thk) probe.thinkingLevel = thk;
+        }),
+      },
+    } as any;
+  }
+
+  async function spawnOpts(model: string | undefined, ctxExtra: Record<string, unknown> = {}, pi = resolvingPi()) {
+    writeConfig({ maxConcurrent: 0 });
+    const created = installSessions();
+    const run = runAgentTool(
+      tmpCwd, { ...args("p"), ...(model ? { model } : {}) }, undefined, undefined,
+      { cwd: tmpCwd, ...ctxExtra } as any, pi,
+    );
+    await settle();
+    created[0].finish();
+    await run;
+    return created[0].opts;
+  }
+
+  it.each([
+    ["p/m:off", "off"],
+    ["@cheap", "off"],
+    ["p/m:high", "high"],
+    ["p/m:max", "max"],
+  ])("passes the %s suffix as thinkingLevel %s", async (ref, level) => {
+    expect((await spawnOpts(ref, { thinkingLevel: "low" })).thinkingLevel).toBe(level);
+  });
+
+  it("inherits the parent's live thinking level when the ref has no suffix", async () => {
+    expect((await spawnOpts("p/m", { thinkingLevel: "low" })).thinkingLevel).toBe("low");
+    expect((await spawnOpts(undefined, { thinkingLevel: "minimal" })).thinkingLevel).toBe("minimal");
+    expect((await spawnOpts("p/m", { thinkingLevel: "max" })).thinkingLevel).toBe("max");
+  });
+
+  it("falls back to pi.getThinkingLevel() when ctx has no level", async () => {
+    const pi = resolvingPi();
+    pi.getThinkingLevel = () => "high";
+    expect((await spawnOpts("p/m", {}, pi)).thinkingLevel).toBe("high");
+  });
+
+  it("omits thinkingLevel when neither suffix nor parent level exists", async () => {
+    expect(await spawnOpts("p/m")).not.toHaveProperty("thinkingLevel");
+  });
+
+  it("passes the parent registry's live modelRuntime, not modelRegistry/authStorage", async () => {
+    const runtime = { tag: "runtime" };
+    const opts = await spawnOpts(undefined, { modelRegistry: { runtime, authStorage: {} } });
+    expect(opts.modelRuntime).toBe(runtime);
+    expect(opts).not.toHaveProperty("modelRegistry");
+    expect(opts).not.toHaveProperty("authStorage");
+  });
+
+  it("omits modelRuntime and warns once when the parent runtime is unavailable", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const opts = await spawnOpts(undefined, { modelRegistry: {} });
+      expect(opts).not.toHaveProperty("modelRuntime");
+      await spawnOpts(undefined, { modelRegistry: {} });
+      const runtimeWarnings = warn.mock.calls.filter((c) => String(c[0]).includes("modelRuntime"));
+      expect(runtimeWarnings).toHaveLength(1);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
   // ── 2.1 throttled onUpdate ──
 
   it("coalesces onUpdate for a burst of session events", async () => {

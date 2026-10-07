@@ -144,6 +144,9 @@ pi-agent-dashboard inspector.
 
 ## Install
 
+Requires pi **>=0.80.8 <2** (`@earendil-works/pi-coding-agent`, `pi-ai`,
+`pi-tui`); developed and tested on pi 1.x. On pi <0.80.8 stay on 0.2.5.
+
 ```bash
 npm install -g @blackbelt-technology/pi-dashboard-subagents
 ```
@@ -198,7 +201,7 @@ behaviour, so an `.md` with no frontmatter still works.
 ---
 description: Fast read-only codebase & docs exploration
 model: anthropic/claude-haiku-4-5      # OR "@role" — see below
-thinking: high                          # (alt: "model: id:high" suffix)
+                                        # thinking level: use a ":high" suffix on model
 tools: [read, grep, find, ls, bash]    # allowlist (built-in + extension tools)
 inherit_context: false                  # per-agent override of the global setting
 prompt: |                              # OPTIONAL — body fallback below
@@ -213,7 +216,7 @@ prompt-template / skill files.
 | Field             | Effect                                                                                              |
 | ----------------- | --------------------------------------------------------------------------------------------------- |
 | `description`     | Overrides `displayName` on the dashboard card.                                                      |
-| `model`           | `"@role"`, `"provider/model-id"`, `"provider/model-id:thinking"`, or bare `"model-id"`. See [Model resolution](#model-resolution-model). |
+| `model`           | `"@role"`, `"provider/model-id"`, `"provider/model-id:thinking"`, or bare `"model-id"`. See [Model resolution](#model-resolution-model) and [Thinking level](#thinking-level). |
 | `tools`           | Allowlist intersected with the parent's active tool set (minus `Agent`). Unknown names dropped silently. |
 | `inherit_context` | `true` → inherit parent context. `false` → isolated. Per-agent; overrides the global `inheritContext`.|
 | `prompt`          | Prepended as `<agent-prompt>...</agent-prompt>` before the task. Body of the `.md` is used if the field is absent. |
@@ -354,6 +357,31 @@ resolves literal forms locally via `pi.modelRegistry`:
 This means: **subagents using literal or bare-id models always work**, with
 or without the dashboard. Only `@role` requires a handler.
 
+#### Thinking level
+
+A subagent's thinking level is chosen in this order, first match wins:
+
+1. **Explicit suffix** on the effective model ref (tool-call `model`,
+   frontmatter `model:`, or the ref an `@role` resolves to), e.g.
+   `anthropic/claude-haiku-4-5:off`. `:off` is honored, not dropped.
+2. **Parent's live level**: the parent session's current `/thinking`
+   value, even when it was not saved to settings.
+3. **pi defaults**: per-model thinking setting, then
+   `defaultThinkingLevel`, then `medium`.
+
+pi clamps the result to what the child's model supports. Note that the
+parent's level outranks a per-model thinking setting; use a suffix to pin a
+subagent's level regardless of the parent.
+
+#### Custom providers
+
+Subagents inherit the parent session's live model runtime, so providers
+registered at runtime (e.g. custom providers from `providers.json`, with
+their auth) resolve in children exactly as in the parent. pi exposes no
+public accessor for this runtime; if a future pi renames the internal
+field, the extension logs one warning and children fall back to a
+disk-only runtime (custom providers may then fail with "No API key found").
+
 #### Failure surface
 
 When resolution fails (handler error, fallback miss, no handler for `@role`),
@@ -399,7 +427,7 @@ interface ModelResolveProbe {
   ref: string;                                          // input
   resolved?: string;                                    // "provider/model-id"
   model?: Model<any>;
-  thinkingLevel?: "minimal" | "low" | "medium" | "high" | "xhigh" | "off";
+  thinkingLevel?: "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "off";
   auth?: { ok?: boolean; error?: string; [k: string]: unknown };
   error?: string;
   available?: {

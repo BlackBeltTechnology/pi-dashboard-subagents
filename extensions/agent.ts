@@ -32,6 +32,7 @@ import {
   type ExtensionAPI,
   type ExtensionContext,
   getAgentDir,
+  type ModelRuntime,
   parseFrontmatter,
   SessionManager,
   SettingsManager,
@@ -624,13 +625,14 @@ function activityFromEvent(event: AgentSessionEvent): string | null | undefined 
 
 import type { Model } from "@earendil-works/pi-ai";
 
-type ThinkingLevelString = "minimal" | "low" | "medium" | "high" | "xhigh" | "off";
+type ThinkingLevelString = "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "off";
 const VALID_THINKING_LEVELS: readonly ThinkingLevelString[] = [
   "minimal",
   "low",
   "medium",
   "high",
   "xhigh",
+  "max",
   "off",
 ];
 
@@ -1002,6 +1004,28 @@ function makeAgentTool(pi: ExtensionAPI, exposeIsolated: boolean) {
 
 // ─── The main spawn loop ────────────────────────────────────────────────
 
+/** Warned-once latch for {@link getParentModelRuntime}. */
+let warnedMissingRuntime = false;
+
+/**
+ * Read the parent session's live `ModelRuntime` from `ctx.modelRegistry`.
+ * pi declares `ModelRegistry.runtime` private and exposes no public accessor,
+ * so this reads it defensively. When it is missing (renamed upstream), logs one
+ * stderr warning and returns undefined; pi then builds its own disk runtime.
+ */
+export function getParentModelRuntime(ctx: ExtensionContext): ModelRuntime | undefined {
+  const runtime = (ctx.modelRegistry as unknown as { runtime?: ModelRuntime } | undefined)?.runtime;
+  if (runtime) return runtime;
+  if (ctx.modelRegistry && !warnedMissingRuntime) {
+    warnedMissingRuntime = true;
+    console.warn(
+      "[pi-dashboard-subagents] parent modelRuntime unavailable on ctx.modelRegistry; " +
+        "subagents fall back to a disk-only model runtime (custom providers may lack auth).",
+    );
+  }
+  return undefined;
+}
+
 export async function runAgentTool(
   cwd: string,
   args: AgentToolArgs,
@@ -1215,6 +1239,11 @@ export async function runAgentTool(
     // ── Construct in-memory subagent session ──
     const sessionManager = SessionManager.inMemory(cwd);
     const resourceLoader = await createChildLoader(cwd);
+    const parentRuntime = getParentModelRuntime(ctx);
+    const effectiveThinking: ThinkingLevelString | undefined =
+      resolvedThinkingLevel ??
+      (ctx.thinkingLevel as ThinkingLevelString | undefined) ??
+      (pi.getThinkingLevel?.() as ThinkingLevelString | undefined);
     const createResult = await createAgentSession({
       cwd,
       sessionManager,
@@ -1222,17 +1251,17 @@ export async function runAgentTool(
       // templates/themes (design Decision 1). Without this the SDK builds a
       // full DefaultResourceLoader per child, in the parent's event loop.
       resourceLoader,
-      // Inherit the parent session's live registry so the subagent sees every
-      // provider registered on it — including custom providers from
-      // providers.json (models AND providerRequestConfigs auth). Without this,
-      // createAgentSession builds a fresh disk registry that lacks custom
-      // providers → "No API key found for <provider>".
-      ...(ctx.modelRegistry ? { modelRegistry: ctx.modelRegistry } : {}),
-      ...(ctx.modelRegistry?.authStorage ? { authStorage: ctx.modelRegistry.authStorage } : {}),
+      // Inherit the parent's live model runtime so the subagent sees every
+      // provider registered on it, including custom providers from
+      // providers.json (models AND auth). Without it, createAgentSession
+      // builds a fresh disk-only runtime and fails with "No API key found
+      // for <provider>". (pi >=0.80.8 removed the modelRegistry/authStorage
+      // options; only `modelRuntime` is honored.)
+      ...(parentRuntime ? { modelRuntime: parentRuntime } : {}),
       ...(resolvedModel ? { model: resolvedModel } : {}),
-      ...(resolvedThinkingLevel && resolvedThinkingLevel !== "off"
-        ? { thinkingLevel: resolvedThinkingLevel }
-        : {}),
+      // Precedence: explicit ref suffix > parent's live level > pi defaults.
+      // `off` is passed through so it isn't replaced by settings defaults.
+      ...(effectiveThinking ? { thinkingLevel: effectiveThinking } : {}),
     });
     session = createResult.session;
     modelName = session.model?.id;

@@ -1,6 +1,6 @@
 {
   "name": "@blackbelt-technology/pi-dashboard-subagents",
-  "version": "0.2.5",
+  "version": "0.2.6",
   "description": "A lightweight subagent spawning and managing system for pi.",
   "repository": {
     "type": "git",
@@ -41,15 +41,15 @@
     "test:watch": "vitest"
   },
   "peerDependencies": {
-    "@earendil-works/pi-ai": "^0.75.5",
-    "@earendil-works/pi-coding-agent": "^0.75.5",
-    "@earendil-works/pi-tui": "^0.75.5",
+    "@earendil-works/pi-ai": ">=0.80.8 <2",
+    "@earendil-works/pi-coding-agent": ">=0.80.8 <2",
+    "@earendil-works/pi-tui": ">=0.80.8 <2",
     "@sinclair/typebox": "^0.34.49"
   },
   "devDependencies": {
-    "@earendil-works/pi-ai": "^0.75.5",
-    "@earendil-works/pi-coding-agent": "^0.75.5",
-    "@earendil-works/pi-tui": "^0.75.5",
+    "@earendil-works/pi-ai": "^1.0.4",
+    "@earendil-works/pi-coding-agent": "^1.0.4",
+    "@earendil-works/pi-tui": "^1.0.4",
     "@eslint/js": "^10.0.1",
     "@sinclair/typebox": "^0.34.49",
     "@types/node": "^25.8.0",

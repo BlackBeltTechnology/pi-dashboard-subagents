@@ -191,6 +191,17 @@ describe("resolveModelFromRef — FALLBACK path (silent emit, in-process registr
     expect(findArgs).toEqual(["anthropic", "claude-opus-4"]);
   });
 
+  it("silent emit + provider/model:max → fallback parses pi 1.x \"max\" suffix", () => {
+    const fakeModel: AnyModel = { id: "claude-opus-4", provider: "anthropic" };
+    const pi = mkPi({
+      modelRegistry: { find: (p, m) => (p === "anthropic" && m === "claude-opus-4" ? fakeModel : undefined) },
+    });
+    const out = resolveModelFromRef(pi, "anthropic/claude-opus-4:max", "/tmp/x.md");
+    expect(out.error).toBeUndefined();
+    expect(out.model).toBe(fakeModel);
+    expect(out.thinkingLevel).toBe("max");
+  });
+
   it("silent emit + bare id → fallback uses registry.getAll, first match wins", () => {
     const m1: AnyModel = { id: "claude-haiku-4-5", provider: "anthropic" };
     const m2: AnyModel = { id: "claude-haiku-4-5", provider: "bedrock" };

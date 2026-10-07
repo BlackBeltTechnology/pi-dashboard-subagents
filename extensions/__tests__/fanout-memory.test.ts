@@ -64,42 +64,38 @@ describe.skipIf(typeof global.gc !== "function")("real faux-provider fan-out", (
   });
 
   it("streams many filtered sessions without retaining per-spawn memory", async () => {
-    const codingAgentEntry = import.meta.resolve("@earendil-works/pi-coding-agent");
-    const nestedPiAiUrl = new URL(
-      "../node_modules/@earendil-works/pi-ai/dist/index.js",
-      codingAgentEntry,
-    ).href;
-    let runtimePiAi: typeof import("@earendil-works/pi-ai");
-    try {
-      runtimePiAi = await import(nestedPiAiUrl) as typeof import("@earendil-works/pi-ai");
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ERR_MODULE_NOT_FOUND") throw error;
-      runtimePiAi = await import("@earendil-works/pi-ai");
-    }
-    const [{ runAgentTool }, { invalidateSettingsCache }, { AuthStorage, ModelRegistry }] =
+    const [piAi, { runAgentTool }, { invalidateSettingsCache }, { ModelRegistry, ModelRuntime }] =
       await Promise.all([
+        import("@earendil-works/pi-ai"),
         import("../agent.js"),
         import("../settings.js"),
         import("@earendil-works/pi-coding-agent"),
       ]);
     invalidateSettingsCache();
 
-    const registration = runtimePiAi.registerFauxProvider({
+    // pi 1.x: a faux Provider registered on an isolated ModelRuntime (auth +
+    // models under the temp agentDir), wrapped by a ModelRegistry the way pi
+    // wires ctx.modelRegistry. Subagents inherit this runtime.
+    const registration = piAi.fauxProvider({
       provider: "fanout-faux",
       models: [{ id: "fanout-model", reasoning: false }],
     });
     const model = registration.getModel();
-    const authStorage = AuthStorage.inMemory();
-    authStorage.setRuntimeApiKey(model.provider, "faux-test-key");
-    const modelRegistry = ModelRegistry.inMemory(authStorage);
+    const modelRuntime = await ModelRuntime.create({
+      authPath: join(agentDir, "auth.json"),
+      modelsPath: join(agentDir, "models.json"),
+    });
+    modelRuntime.registerNativeProvider(registration.provider);
+    await modelRuntime.setRuntimeApiKey(model.provider, "faux-test-key");
+    const modelRegistry = new ModelRegistry(modelRuntime);
     const observedTools = new Map<string, string[]>();
     const eventCounts = new Map<string, number>();
 
     const response: FauxResponseFactory = (context) => {
       const prompt = userText(context);
       const id = prompt.match(/<(?:task)>\s*([^<]+)\s*<\/(?:task)>/)?.[1]?.trim() ?? prompt.trim();
-      observedTools.set(id, (context.tools ?? []).map((tool) => tool.name).sort());
-      return runtimePiAi.fauxAssistantMessage(`completed:${id}`);
+      observedTools.set(id, piAi.getCurrentTools(context.messages).map((tool) => tool.name).sort());
+      return piAi.fauxAssistantMessage(`completed:${id}`);
     };
 
     const pi = {
@@ -209,7 +205,7 @@ describe.skipIf(typeof global.gc !== "function")("real faux-provider fan-out", (
       expect(secondBatchGrowth).toBeLessThan(MAX_RETAINED_HEAP_GROWTH);
       expect(totalGrowth).toBeLessThan(MAX_RETAINED_HEAP_GROWTH * 2);
     } finally {
-      registration.unregister();
+      modelRuntime.unregisterProvider(model.provider);
     }
   }, 60_000);
 });

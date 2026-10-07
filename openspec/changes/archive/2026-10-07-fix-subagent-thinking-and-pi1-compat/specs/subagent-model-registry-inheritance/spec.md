@@ -1,9 +1,4 @@
-# subagent-model-registry-inheritance Specification
-
-## Purpose
-TBD - created by archiving change inherit-parent-model-registry. Update Purpose after archive.
-
-## Requirements
+## MODIFIED Requirements
 
 ### Requirement: Subagent inherits parent model registry
 
