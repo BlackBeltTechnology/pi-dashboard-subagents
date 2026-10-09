@@ -68,16 +68,17 @@ describe("real faux-provider entry stream", () => {
 
     // pi's real in-process bus, with a recorder + the @role resolver.
     const bus = sdk.createEventBus();
-    const log: Array<{ channel: string; data: any }> = [];
+    const log: Array<{ channel: string; data: any; at: number }> = [];
     for (const channel of [
       "subagents:created",
       "subagents:started",
       "subagents:entry",
+      "subagents:delta",
       "subagents:completed",
       "subagents:failed",
     ]) {
       bus.on(channel, (data) => {
-        log.push({ channel, data });
+        log.push({ channel, data, at: Date.now() });
       });
     }
     bus.on("model:resolve", (payload: any) => {
@@ -177,8 +178,33 @@ describe("real faux-provider entry stream", () => {
         else if (e.channel === "subagents:started") expect(e.data.details.entryCount).toBeLessThanOrEqual(announced);
       }
 
+      // Block deltas (change: emit-subagent-block-deltas): every streamed
+      // block is rebuilt exactly from `subagents:delta` alone, contiguous,
+      // closed by exactly one final piece that precedes its linked entry.
+      const deltas = of("subagents:delta");
+      const blockIds = [...new Set(deltas.map((d) => d.blockId))];
+      expect(blockIds).toEqual([0, 1, 2, 3]);
+      for (const id of blockIds) {
+        const pieces = deltas.filter((d) => d.blockId === id);
+        let have = 0;
+        for (const p of pieces) {
+          expect(p).toMatchObject({ v: 1, agentId: result.details.agentId, toolCallId: "call-faux-1" });
+          expect(p.offset).toBe(have);
+          have += p.text.length;
+        }
+        expect(pieces.filter((p) => p.final)).toHaveLength(1);
+        expect(pieces.at(-1).final).toBe(true);
+        const linked = steps.filter((s) => s.blockId === id);
+        expect(linked).toHaveLength(1);
+        expect(pieces.map((p) => p.text).join("")).toEqual(linked[0].entry.text);
+        const finalAt = log.findIndex((e) => e.channel === "subagents:delta" && e.data.blockId === id && e.data.final);
+        const entryAt = log.findIndex((e) => e.channel === "subagents:entry" && e.data.blockId === id);
+        expect(finalAt).toBeLessThan(entryAt);
+      }
+      expect(steps.filter((s) => s.entry.kind === "tool").every((s) => !("blockId" in s))).toBe(true);
+
       console.info(
-        `[entry-stream-faux] steps=${steps.length} progressFrames=${progress.length} ` +
+        `[entry-stream-faux] steps=${steps.length} deltas=${deltas.length} progressFrames=${progress.length} ` +
           `progressBytes=${progress.reduce((n, f) => n + JSON.stringify(f).length, 0)} ` +
           `entryBytes=${steps.reduce((n, s) => n + JSON.stringify(s).length, 0)}`,
       );
@@ -229,6 +255,37 @@ describe("real faux-provider entry stream", () => {
         `[entry-stream-faux long] steps=${n} ms=${Date.now() - t0} progressFrames=${progress.length} ` +
           `maxProgressBytes=${Math.max(...sizes)} completedBytes=${completedBytes}`,
       );
+    } finally {
+      modelRuntime.unregisterProvider(model.provider);
+    }
+  }, 30_000);
+
+  it("slow long block: delta pieces are throttled to \u2264 4/s and rebuild the block exactly", async () => {
+    const { piAi, registration, modelRuntime, model, tool, ctx, of, log } = await setup(150);
+    try {
+      const thought = Array.from({ length: 60 }, (_, i) => `thought-${i}`).join(" ");
+      registration.setResponses([piAi.fauxAssistantMessage([piAi.fauxThinking(thought), piAi.fauxText("ok")])]);
+      const result: any = await tool.execute(
+        "call-faux-slow",
+        { subagent_type: "faux-agent", description: "slow", prompt: "think", model: "@entry-faux" },
+        undefined,
+        undefined,
+        ctx,
+      );
+      expect(result.details.status).toBe("completed");
+      const pieces = of("subagents:delta").filter((d) => d.blockId === 0);
+      expect(pieces.map((p) => p.text).join("")).toBe(thought);
+      const times = log
+        .filter((e) => e.channel === "subagents:delta" && !e.data.final)
+        .map((e) => e.at);
+      expect(times.length).toBeGreaterThanOrEqual(4); // streamed mid-block, not only at close
+      for (let i = 0; i < times.length; i++) {
+        const inWindow = times.filter((t) => t >= times[i] && t < times[i] + 1000).length;
+        expect(inWindow).toBeLessThanOrEqual(4);
+      }
+      const maxTick = Math.max(...of("subagents:started").slice(1).map((f) => JSON.stringify(f).length));
+      expect(maxTick).toBeLessThan(1_500);
+      console.info(`[entry-stream-faux slow] deltaPieces=${times.length} maxTickBytes=${maxTick}`);
     } finally {
       modelRuntime.unregisterProvider(model.provider);
     }

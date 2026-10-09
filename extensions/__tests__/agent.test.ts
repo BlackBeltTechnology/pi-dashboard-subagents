@@ -21,6 +21,7 @@ import { join } from "node:path";
 
 import {
   buildAgentParametersSchema,
+  createBlockDeltaEmitter,
   createProgressEmitter,
   createUsageAccumulator,
   parseAgentMd,
@@ -416,6 +417,124 @@ describe("createProgressEmitter throttling", () => {
     em.dispose();
     vi.advanceTimersByTime(1000);
     expect(calls.length).toBe(1); // queued was discarded
+  });
+});
+
+// ── createBlockDeltaEmitter (append-only block pieces) ──────────────────
+// See change: emit-subagent-block-deltas.
+
+describe("createBlockDeltaEmitter", () => {
+  type Piece = { blockId: number; kind: string; offset: number; text: string; final: boolean };
+  function recorder() {
+    const pieces: Piece[] = [];
+    return { sink: (p: Piece) => pieces.push(p), pieces };
+  }
+  const joined = (pieces: Piece[], id: number) =>
+    pieces.filter((p) => p.blockId === id).map((p) => p.text).join("");
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("(a) pieces are contiguous and reconstruct the block exactly", () => {
+    const { sink, pieces } = recorder();
+    const em = createBlockDeltaEmitter(sink, 250);
+    em.open("thinking");
+    em.push("thinking", "Let ");
+    vi.advanceTimersByTime(250);
+    em.push("thinking", "me ");
+    vi.advanceTimersByTime(250);
+    em.push("thinking", "check");
+    em.close();
+    expect(joined(pieces, 0)).toBe("Let me check");
+    let have = 0;
+    for (const p of pieces) {
+      expect(p.offset).toBe(have);
+      have += p.text.length;
+    }
+    expect(pieces[0].offset).toBe(0);
+    expect(pieces.filter((p) => p.final)).toHaveLength(1);
+    expect(pieces[pieces.length - 1].final).toBe(true);
+  });
+
+  it("(b) 200 deltas in 1 s with no boundary give \u2264 4 non-final pieces", () => {
+    const { sink, pieces } = recorder();
+    const em = createBlockDeltaEmitter(sink, 250);
+    em.open("text");
+    for (let i = 0; i < 200; i++) {
+      em.push("text", "x");
+      vi.advanceTimersByTime(5);
+    }
+    expect(pieces.filter((p) => !p.final).length).toBeLessThanOrEqual(4);
+    em.close();
+    expect(joined(pieces, 0)).toBe("x".repeat(200));
+  });
+
+  it("(c) a 1,500-char burst in one window is one lossless piece", () => {
+    const { sink, pieces } = recorder();
+    const em = createBlockDeltaEmitter(sink, 250);
+    em.open("thinking");
+    for (let i = 0; i < 1500; i++) em.push("thinking", "y");
+    vi.advanceTimersByTime(250);
+    const nonFinal = pieces.filter((p) => !p.final);
+    expect(nonFinal).toHaveLength(1);
+    expect(nonFinal[0].text).toBe("y".repeat(1500));
+    expect(nonFinal[0].offset).toBe(0);
+  });
+
+  it("(d) open() closes the previous block with one final piece; ids increment", () => {
+    const { sink, pieces } = recorder();
+    const em = createBlockDeltaEmitter(sink, 250);
+    expect(em.open("thinking")).toBe(0);
+    em.push("thinking", "a");
+    expect(em.open("text")).toBe(1);
+    em.push("text", "b");
+    expect(em.open("thinking")).toBe(2);
+    em.close();
+    for (const id of [0, 1, 2]) {
+      expect(pieces.filter((p) => p.blockId === id && p.final)).toHaveLength(1);
+    }
+    expect(pieces.filter((p) => p.blockId === 1)[0]).toMatchObject({ kind: "text", offset: 0 });
+    expect(joined(pieces, 0)).toBe("a");
+    expect(joined(pieces, 1)).toBe("b");
+  });
+
+  it("(e) close() with nothing pending emits an empty final piece and returns the id", () => {
+    const { sink, pieces } = recorder();
+    const em = createBlockDeltaEmitter(sink, 250);
+    em.open("text");
+    em.push("text", "abc");
+    vi.advanceTimersByTime(250);
+    expect(em.close()).toBe(0);
+    expect(pieces[pieces.length - 1]).toEqual({ blockId: 0, kind: "text", offset: 3, text: "", final: true });
+    expect(em.close()).toBeUndefined(); // nothing open: no-op
+    expect(pieces.filter((p) => p.final)).toHaveLength(1);
+  });
+
+  it("(f) dispose() closes the open block and nothing is emitted afterwards", () => {
+    const { sink, pieces } = recorder();
+    const em = createBlockDeltaEmitter(sink, 250);
+    em.open("thinking");
+    em.push("thinking", "pending");
+    em.dispose();
+    expect(pieces).toEqual([{ blockId: 0, kind: "thinking", offset: 0, text: "pending", final: true }]);
+    vi.advanceTimersByTime(1000);
+    expect(pieces).toHaveLength(1);
+  });
+
+  it("(g) a delta with no open block, or of another kind, opens a block implicitly", () => {
+    const { sink, pieces } = recorder();
+    const em = createBlockDeltaEmitter(sink, 250);
+    em.push("thinking", "t");
+    em.push("text", "u");
+    em.close();
+    expect(joined(pieces, 0)).toBe("t");
+    expect(joined(pieces, 1)).toBe("u");
+    expect(pieces.find((p) => p.blockId === 0 && p.final)).toBeTruthy();
+    expect(pieces.find((p) => p.blockId === 1)?.kind).toBe("text");
   });
 });
 
@@ -1096,6 +1215,8 @@ describe("runAgentTool spawn path", () => {
       await run;
       expect(onUpdate.mock.calls.at(-1)![0].details.liveTail).toEqual(CLEARED);
       for (const [ch, payload] of pi.events.emit.mock.calls) {
+        // `subagents:delta` pieces are not snapshots (no `details`).
+        if (ch === "subagents:delta") continue;
         expect(payload.details, ch).toHaveProperty("liveTail");
       }
 
@@ -1362,6 +1483,114 @@ describe("runAgentTool spawn path", () => {
       expect(on("subagents:started").length - before).toBeLessThanOrEqual(1);
       created[0].finish();
       await run;
+    });
+
+    // \u2500\u2500 Block delta stream (change: emit-subagent-block-deltas) \u2500\u2500
+
+    /** Bus order as compact tags: `d<blockId>[F]` for pieces, `e<kind>[#blockId]` for entries. */
+    const order = (emitted: Array<{ channel: string; data: any }>) =>
+      emitted
+        .filter((e) => e.channel === "subagents:delta" || e.channel === "subagents:entry")
+        .map((e) =>
+          e.channel === "subagents:delta"
+            ? `d${e.data.blockId}${e.data.final ? "F" : ""}`
+            : `e${e.data.entry.kind}${"blockId" in e.data ? `#${e.data.blockId}` : ""}`,
+        );
+    const blockText = (deltas: any[], id: number) =>
+      deltas.filter((d) => d.blockId === id).map((d) => d.text).join("");
+
+    it("streams block pieces, closes each with one final piece before its entry, links blockId", async () => {
+      writeConfig({ maxConcurrent: 0 });
+      const created = installSessions();
+      const { pi, emitted, on } = recordingPi();
+      const run = runAgentTool(tmpCwd, args("p"), undefined, undefined, fakeCtx(), pi, "call-7");
+      await settle();
+      const h = created[0];
+      h.emit(mu("thinking_start"));
+      h.emit(mu("thinking_delta", "Let "));
+      h.emit(mu("thinking_delta", "me check"));
+      h.emit(thinkingEnd("Let me check"));
+      h.emit(mu("text_start"));
+      h.emit(mu("text_delta", "Done."));
+      h.emit(textEnd("Done."));
+      h.emit({
+        type: "message_end",
+        message: { role: "assistant", content: [{ type: "thinking", thinking: "Let me check" }, { type: "text", text: "Done." }] },
+      });
+      toolStep(h, "t1");
+      h.finish();
+      await run;
+
+      expect(order(emitted)).toEqual(["d0F", "ethinking#0", "d1F", "etext#1", "etool"]);
+      const deltas = on("subagents:delta");
+      expect(deltas[0]).toMatchObject({ v: 1, toolCallId: "call-7", blockId: 0, kind: "thinking", offset: 0 });
+      expect(deltas[1]).toMatchObject({ blockId: 1, kind: "text", offset: 0 });
+      const steps = on("subagents:entry");
+      expect(steps[0].entry.text).toBe(blockText(deltas, 0));
+      expect(steps[1].entry.text).toBe(blockText(deltas, 1));
+      expect("blockId" in steps[2]).toBe(false);
+    });
+
+    it("closes a block with no end event before the backfilled entry, which carries no blockId", async () => {
+      writeConfig({ maxConcurrent: 0 });
+      const created = installSessions();
+      const { pi, emitted, on } = recordingPi();
+      const run = runAgentTool(tmpCwd, args("p"), undefined, undefined, fakeCtx(), pi);
+      await settle();
+      const h = created[0];
+      h.emit(mu("text_delta", "bf-"));
+      h.emit(mu("text_delta", "text"));
+      h.emit({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "bf-text" }] } });
+      h.finish();
+      await run;
+      expect(order(emitted)).toEqual(["d0F", "etext"]);
+      expect(blockText(on("subagents:delta"), 0)).toBe("bf-text");
+    });
+
+    it("abort and failure flush pending text as a final piece before subagents:failed", async () => {
+      writeConfig({ maxConcurrent: 0 });
+      const created = installSessions();
+      const { pi, emitted } = recordingPi();
+      const ac = new AbortController();
+      const r1 = runAgentTool(tmpCwd, args("p"), ac.signal, undefined, fakeCtx(), pi);
+      await settle();
+      created[0].emit(mu("thinking_start"));
+      created[0].emit(mu("thinking_delta", "half"));
+      ac.abort();
+      created[0].finish();
+      await r1;
+      const r2 = runAgentTool(tmpCwd, args("p"), undefined, undefined, fakeCtx(), pi);
+      await settle();
+      created[1].emit(mu("text_delta", "partial"));
+      created[1].fail(new Error("boom"));
+      await r2;
+
+      const tags = emitted
+        .filter((e) => e.channel === "subagents:delta" || e.channel === "subagents:failed")
+        .map((e) => (e.channel === "subagents:failed" ? "failed" : `${e.data.text}${e.data.final ? "F" : ""}`));
+      expect(tags).toEqual(["halfF", "failed", "partialF", "failed"]);
+    });
+
+    it("keeps progress ticks thin and liveTail bounded while deltas stream", async () => {
+      writeConfig({ maxConcurrent: 0 });
+      const created = installSessions();
+      const { pi, on } = recordingPi();
+      const run = runAgentTool(tmpCwd, args("p"), undefined, undefined, fakeCtx(), pi);
+      await settle();
+      created[0].emit(mu("thinking_start"));
+      for (let i = 0; i < 20; i++) {
+        advance();
+        created[0].emit(mu("thinking_delta", "z".repeat(50)));
+      }
+      const ticks = on("subagents:started").slice(1);
+      expect(ticks.length).toBeGreaterThan(0);
+      for (const t of ticks) {
+        expect("entries" in t.details).toBe(false);
+        expect(t.details.liveTail.text.length).toBeLessThanOrEqual(280);
+      }
+      created[0].finish();
+      await run;
+      expect(blockText(on("subagents:delta"), 0)).toBe("z".repeat(1000));
     });
   });
 });

@@ -6,6 +6,20 @@ All notable changes to this package are documented here. Format follows
 
 ## [Unreleased]
 
+### Added
+
+- **Block delta stream.** New `subagents:delta` channel streams the thinking /
+  text block in progress as exact, append-only pieces:
+  `{ v: 1, agentId, toolCallId, blockId, kind, offset, text, final }`
+  (`SubagentDeltaEvent`, `emitSubagentDelta`). `blockId` counts blocks per run
+  from 0; `offset` is block-relative (UTF-16 code units). Batched to ≤ 4
+  pieces/s/subagent, never coalesced away; flushed at block end, next block
+  start, message end and every terminal path. Each block gets exactly one
+  `final: true` piece, emitted before its `subagents:entry`.
+- **`blockId` on `subagents:entry`.** Steps that finish a streamed block carry
+  the block's id (optional, additive); tool, error and `message_end` backfill
+  steps omit it. Progress ticks and `details.liveTail` are unchanged.
+
 ## [0.3.0] - 2026-10-07
 
 ### Added

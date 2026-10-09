@@ -131,6 +131,33 @@ export interface SubagentEntryEvent {
   toolCallId: string;
   index: number;
   entry: SubagentTimelineEntry;
+  /**
+   * Id of the streamed block this step finishes (matches `subagents:delta`
+   * `blockId`). Present only on text/thinking steps produced by a block end
+   * event; omitted on tool, error and `message_end` backfill steps.
+   * See change: emit-subagent-block-deltas.
+   */
+  blockId?: number;
+}
+
+/**
+ * Payload of `subagents:delta`: one append-only piece of a thinking/text
+ * block while it streams. Pieces of a block are contiguous (`offset` counts
+ * UTF-16 code units from block start); each block ends with exactly one
+ * `final: true` piece, emitted before the block's `subagents:entry`.
+ * See change: emit-subagent-block-deltas.
+ */
+export interface SubagentDeltaEvent {
+  v: 1;
+  agentId: string;
+  /** Parent `Agent` tool call id; `""` when unknown. */
+  toolCallId: string;
+  /** Per-run block counter, starting at 0. */
+  blockId: number;
+  kind: "thinking" | "text";
+  offset: number;
+  text: string;
+  final: boolean;
 }
 
 // ─── Mapping AgentSessionEvent → SubagentTimelineEntry ───────────────────
@@ -268,6 +295,12 @@ export function emitSubagentProgress(
 export function emitSubagentEntry(pi: ExtensionAPI, event: Omit<SubagentEntryEvent, "v">): void {
   const payload: SubagentEntryEvent = { v: 1, ...event };
   emit(pi, "subagents:entry", payload as unknown as Record<string, unknown>);
+}
+
+/** One append-only block piece on `subagents:delta`. Batched by the caller. */
+export function emitSubagentDelta(pi: ExtensionAPI, event: Omit<SubagentDeltaEvent, "v">): void {
+  const payload: SubagentDeltaEvent = { v: 1, ...event };
+  emit(pi, "subagents:delta", payload as unknown as Record<string, unknown>);
 }
 
 export function emitSubagentCompleted(

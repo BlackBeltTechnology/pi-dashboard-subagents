@@ -50,6 +50,7 @@ import {
   createToolCallTracker,
   emitSubagentCompleted,
   emitSubagentCreated,
+  emitSubagentDelta,
   emitSubagentEntry,
   emitSubagentFailed,
   emitSubagentProgress,
@@ -627,6 +628,94 @@ export function nextLiveTail(prev: LiveTail, event: AgentSessionEvent): LiveTail
   }
 }
 
+/** One `subagents:delta` piece minus the envelope (`v`/`agentId`/`toolCallId`). */
+export interface BlockDeltaPiece {
+  blockId: number;
+  kind: "thinking" | "text";
+  offset: number;
+  text: string;
+  final: boolean;
+}
+
+/**
+ * Append-only accumulator for the streaming block's content (change:
+ * emit-subagent-block-deltas). Unlike {@link createProgressEmitter} (latest
+ * wins), pending text is APPENDED and never replaced, so a coalesced window
+ * loses no characters. At most one non-final piece per `windowMs` (trailing
+ * edge); `open`/`close`/`dispose` flush synchronously with `final: true`.
+ *
+ * - `open(kind)` closes any open block, then starts block `next++`.
+ * - `push(kind, delta)` appends; opens implicitly when no block is open or the
+ *   kind differs (providers that skip `_start`).
+ * - `close()` emits the final piece and returns the closed id (undefined when
+ *   nothing was open).
+ * - `dispose()` closes any open block; nothing is emitted afterwards.
+ */
+export function createBlockDeltaEmitter(
+  sink: (piece: BlockDeltaPiece) => void,
+  windowMs: number = PROGRESS_THROTTLE_MS,
+): {
+  open(kind: "thinking" | "text"): number;
+  push(kind: "thinking" | "text", delta: string): void;
+  close(): number | undefined;
+  dispose(): void;
+} {
+  let nextId = 0;
+  let open: { blockId: number; kind: "thinking" | "text"; offset: number; pending: string } | undefined;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let disposed = false;
+
+  function clearTimer(): void {
+    if (timer) {
+      clearTimeout(timer);
+      timer = undefined;
+    }
+  }
+
+  function emitPending(final: boolean): void {
+    if (!open) return;
+    const text = open.pending;
+    if (!final && text === "") return;
+    sink({ blockId: open.blockId, kind: open.kind, offset: open.offset, text, final });
+    open.offset += text.length;
+    open.pending = "";
+  }
+
+  function close(): number | undefined {
+    clearTimer();
+    if (!open) return undefined;
+    const id = open.blockId;
+    emitPending(true);
+    open = undefined;
+    return id;
+  }
+
+  function openBlock(kind: "thinking" | "text"): number {
+    close();
+    open = { blockId: nextId++, kind, offset: 0, pending: "" };
+    return open.blockId;
+  }
+
+  return {
+    open: openBlock,
+    push(kind, delta) {
+      if (disposed) return;
+      if (!open || open.kind !== kind) openBlock(kind);
+      open!.pending += delta;
+      if (timer) return;
+      timer = setTimeout(() => {
+        timer = undefined;
+        emitPending(false);
+      }, windowMs);
+    },
+    close,
+    dispose() {
+      close();
+      disposed = true;
+    },
+  };
+}
+
 // ─── Model reference resolution ───────────────────────────────────────────
 //
 // Maps a frontmatter `model:` string to a concrete `Model<any>` object
@@ -1107,10 +1196,23 @@ export async function runAgentTool(
    * `subagents:entry` (synchronous, never throttled). Steps are never mutated
    * or removed afterwards, so `index` is stable.
    */
-  function appendEntry(entry: SubagentTimelineEntry): void {
+  function appendEntry(entry: SubagentTimelineEntry, blockId?: number): void {
     entries.push(entry);
-    emitSubagentEntry(pi, { agentId, toolCallId, index: entries.length - 1, entry });
+    emitSubagentEntry(pi, {
+      agentId,
+      toolCallId,
+      index: entries.length - 1,
+      entry,
+      ...(blockId !== undefined ? { blockId } : {}),
+    });
   }
+
+  // Append-only pieces of the streaming block on `subagents:delta`. Closed
+  // BEFORE the block's entry is appended, so the final piece always precedes
+  // `subagents:entry`. See change: emit-subagent-block-deltas.
+  const blockDeltas = createBlockDeltaEmitter((piece) =>
+    emitSubagentDelta(pi, { agentId, toolCallId, ...piece }),
+  );
 
   const tracker = createToolCallTracker();
   const usage = createUsageAccumulator();
@@ -1341,6 +1443,18 @@ export async function runAgentTool(
       if (newActivity !== undefined) activity = newActivity ?? undefined;
       liveTail = nextLiveTail(liveTail, event);
 
+      let closedBlockId: number | undefined;
+      if (event.type === "message_update") {
+        const e = event.assistantMessageEvent as { type: string; delta?: string };
+        if (e.type === "thinking_start") blockDeltas.open("thinking");
+        else if (e.type === "text_start") blockDeltas.open("text");
+        else if (e.type === "thinking_delta") blockDeltas.push("thinking", e.delta ?? "");
+        else if (e.type === "text_delta") blockDeltas.push("text", e.delta ?? "");
+        else if (e.type === "thinking_end" || e.type === "text_end") closedBlockId = blockDeltas.close();
+      } else if (event.type === "message_end") {
+        blockDeltas.close(); // before any backfilled entry
+      }
+
       if (event.type === "tool_execution_end") {
         const entry = mapSessionEventToEntry(event);
         if (entry && entry.kind === "tool") {
@@ -1350,7 +1464,7 @@ export async function runAgentTool(
         }
       } else if (event.type === "message_update") {
         const entry = mapSessionEventToEntry(event);
-        if (entry) appendEntry(entry);
+        if (entry) appendEntry(entry, entry.kind === "error" ? undefined : closedBlockId);
       } else if (event.type === "message_end") {
         const msg = event.message as { role: string; content?: unknown };
         if (msg.role === "assistant") {
@@ -1427,6 +1541,7 @@ export async function runAgentTool(
 
     // ── Aborted via parent signal? ──
     if (signal?.aborted) {
+      blockDeltas.dispose();
       progress.flush();
       const abortedDetails = snapshotDetails("aborted", "aborted by parent");
       emitSubagentFailed(pi, {
@@ -1441,6 +1556,7 @@ export async function runAgentTool(
     }
 
     // ── Success ──
+    blockDeltas.dispose();
     progress.flush();
     const finalText = lastAssistantText(entries) ?? "(no output)";
     const completedDetails = snapshotDetails("completed");
@@ -1458,6 +1574,7 @@ export async function runAgentTool(
       details: completedDetails,
     };
   } catch (err) {
+    blockDeltas.dispose();
     progress.flush();
     const message = err instanceof Error ? err.message : String(err);
     const failedDetails = snapshotDetails("error", message);
@@ -1486,6 +1603,7 @@ export async function runAgentTool(
         /* ignore */
       }
     }
+    blockDeltas.dispose(); // idempotent; clears any trailing timer
     progress.dispose();
     try {
       session?.dispose();

@@ -490,20 +490,34 @@ This section locks the producer-side contract consumed by the dashboard inspecto
 
 ### Emission channels
 
-Every run emits on five `pi.events.emit(channel, data)` channels. The dashboard
+Every run emits on six `pi.events.emit(channel, data)` channels. The dashboard
 bridge's emit intercept renames the four lifecycle channels to its protocol
 event types; any listener on `pi.events` (a TUI widget, a logger, the
-dashboard) can consume all five:
+dashboard) can consume all six:
 
 | Producer channel        | Dashboard protocol event | When                                          |
 | ----------------------- | ------------------------ | --------------------------------------------- |
 | `subagents:created`     | `subagent_created`       | Tool invocation begins (before any session work) |
 | `subagents:started`     | `subagent_started`       | Initial "running" emission, AND all progress ticks (re-uses channel; progress ticks omit `entries`, carry `entryCount`) |
-| `subagents:entry`       | — (not forwarded by core) | Once per timeline step, the moment it is appended (never throttled) |
+| `subagents:entry`       | — (not forwarded by core) | Once per timeline step, the moment it is appended (never throttled). Steps finishing a streamed text/thinking block carry `blockId` |
+| `subagents:delta`       | —                        | Append-only pieces of the streaming text/thinking block (see below) |
 | `subagents:completed`   | `subagent_completed`     | `await session.prompt(...)` resolves successfully |
 | `subagents:failed`      | `subagent_failed`        | Any throw, abort, or session error path       |
 
 Progress emissions are throttled to **≤4 per second per subagent** (`PROGRESS_THROTTLE_MS = 250`). The final progress snapshot is always flushed before `completed`/`failed`.
+
+`subagents:delta` carries the block currently streaming as exact, append-only
+pieces: `{ v: 1, agentId, toolCallId, blockId, kind, offset, text, final }`
+(`SubagentDeltaEvent`). `blockId` counts blocks per run from 0; `offset` is the
+block-relative start of `text` in UTF-16 code units, so a block's pieces are
+contiguous and concatenate to exactly what was streamed. Pieces are batched to
+**≤4 per second per subagent**, never coalesced away, and flushed synchronously
+at block end, next block start, message end and on any terminal path. Every
+opened block gets exactly one `final: true` piece, emitted **before** its
+`subagents:entry`; that entry carries the same `blockId` and is the source of
+truth. Steps backfilled at `message_end` (providers without `_end` events),
+tools and errors carry no `blockId`. `details.liveTail` (≤ 280-char preview on
+ticks) is unchanged.
 
 Emissions are no-ops when `pi.events` is undefined — the run continues; the parent just doesn't get the rich UI.
 

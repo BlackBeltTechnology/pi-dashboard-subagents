@@ -20,6 +20,8 @@ import {
   DEFAULT_INHERITANCE,
   emitSubagentCompleted,
   emitSubagentCreated,
+  emitSubagentDelta,
+  emitSubagentEntry,
   emitSubagentFailed,
   emitSubagentProgress,
   emitSubagentStarted,
@@ -272,6 +274,54 @@ describe("emit* helpers", () => {
     });
     expect(calls[0].channel).toBe("subagents:failed");
     expect(calls[0].data.error).toBe("boom");
+  });
+
+  it("emitSubagentDelta fires subagents:delta with the v1 piece payload", () => {
+    const { pi, calls } = fakePi();
+    emitSubagentDelta(pi, {
+      agentId: "a1",
+      toolCallId: "tc1",
+      blockId: 2,
+      kind: "thinking",
+      offset: 4,
+      text: "me ",
+      final: false,
+    });
+    expect(calls).toHaveLength(1);
+    expect(calls[0].channel).toBe("subagents:delta");
+    expect(calls[0].data).toEqual({
+      v: 1,
+      agentId: "a1",
+      toolCallId: "tc1",
+      blockId: 2,
+      kind: "thinking",
+      offset: 4,
+      text: "me ",
+      final: false,
+    });
+  });
+
+  it("emitSubagentDelta is a silent no-op when pi.events is undefined", () => {
+    expect(() =>
+      emitSubagentDelta({} as any, {
+        agentId: "x",
+        toolCallId: "",
+        blockId: 0,
+        kind: "text",
+        offset: 0,
+        text: "",
+        final: true,
+      }),
+    ).not.toThrow();
+  });
+
+  it("emitSubagentEntry passes blockId through when given and omits the key otherwise", () => {
+    const { pi, calls } = fakePi();
+    const entry = { kind: "text" as const, text: "hi", ts: 1 };
+    emitSubagentEntry(pi, { agentId: "a1", toolCallId: "", index: 0, entry, blockId: 3 });
+    emitSubagentEntry(pi, { agentId: "a1", toolCallId: "", index: 1, entry });
+    expect(calls[0].data.blockId).toBe(3);
+    expect("blockId" in calls[1].data).toBe(false);
   });
 
   it("emit helpers are silent no-ops when pi.events is undefined", () => {
