@@ -6,6 +6,8 @@ All notable changes to this package are documented here. Format follows
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-10-14
+
 ### Fixed
 
 - **Subagents inherit the parent's live model.** An `Agent` call with no
