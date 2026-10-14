@@ -6,6 +6,14 @@ All notable changes to this package are documented here. Format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- **Subagents inherit the parent's live model.** An `Agent` call with no
+  `model` argument and no agent-`.md` `model:` now runs on the parent's
+  current model (`ctx.model`) instead of the settings `defaultModel`.
+  Precedence: tool-call `model` > frontmatter `model:` > parent live model >
+  SDK default.
+
 ## [0.4.0] - 2026-10-09
 
 ### Added

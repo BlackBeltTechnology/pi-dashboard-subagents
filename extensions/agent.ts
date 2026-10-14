@@ -328,7 +328,7 @@ export interface AgentMdConfig {
    *   • `"provider/model-id:level"`  literal with thinking suffix
    *   • `"model-id"`                 bare; "like" query — first registry
    *                                   entry whose `m.id === ref` wins.
-   * Absent / empty → inherit parent default.
+   * Absent / empty → inherit parent's live model (`ctx.model`).
    */
   model?: string;
   /** Allowlist of tool names. Absent → all parent tools minus `Agent`. */
@@ -1057,7 +1057,7 @@ export function buildAgentParametersSchema(exposeIsolated: boolean) {
     model: Type.Optional(
       Type.String({
         description:
-          'Optional model override. Accepts "@role" (e.g. "@fast"), "provider/model-id[:thinking]" (e.g. "anthropic/claude-haiku-4-5:high"), or bare "model-id". Overrides the agent .md `model:` field when both are present. Omit to use the .md value, or to inherit the parent default when no .md matches.',
+          'Optional model override. Accepts "@role" (e.g. "@fast"), "provider/model-id[:thinking]" (e.g. "anthropic/claude-haiku-4-5:high"), or bare "model-id". Overrides the agent .md `model:` field when both are present. Omit to use the .md value, or to inherit the parent session\'s current model when no .md model is set.',
       }),
     ),
   };
@@ -1409,7 +1409,9 @@ export async function runAgentTool(
       // for <provider>". (pi >=0.80.8 removed the modelRegistry/authStorage
       // options; only `modelRuntime` is honored.)
       ...(parentRuntime ? { modelRuntime: parentRuntime } : {}),
-      ...(resolvedModel ? { model: resolvedModel } : {}),
+      // No ref -> the parent's LIVE model (ctx.model). Without it the SDK
+      // falls back to settings `defaultModel`, not what the parent runs.
+      ...(resolvedModel ?? ctx.model ? { model: resolvedModel ?? ctx.model } : {}),
       // Precedence: explicit ref suffix > parent's live level > pi defaults.
       // `off` is passed through so it isn't replaced by settings defaults.
       ...(effectiveThinking ? { thinkingLevel: effectiveThinking } : {}),

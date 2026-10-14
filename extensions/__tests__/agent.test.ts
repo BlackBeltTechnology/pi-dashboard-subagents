@@ -987,6 +987,21 @@ describe("runAgentTool spawn path", () => {
     expect(opts).not.toHaveProperty("authStorage");
   });
 
+  // See change: inherit-parent-live-model.
+  it("inherits the parent's live model when no ref is given", async () => {
+    const parentModel = { provider: "anthropic", id: "parent-live" };
+    expect((await spawnOpts(undefined, { model: parentModel })).model).toBe(parentModel);
+  });
+
+  it("prefers an explicit model ref over the parent's live model", async () => {
+    const opts = await spawnOpts("p/m", { model: { provider: "anthropic", id: "parent-live" } });
+    expect(opts.model).toEqual({ provider: "p", id: "p/m" });
+  });
+
+  it("omits model when neither a ref nor a parent model exists", async () => {
+    expect(await spawnOpts(undefined)).not.toHaveProperty("model");
+  });
+
   it("omits modelRuntime and warns once when the parent runtime is unavailable", async () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     try {
