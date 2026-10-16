@@ -20,6 +20,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import {
+  boundToolResult,
   buildAgentParametersSchema,
   createBlockDeltaEmitter,
   createProgressEmitter,
@@ -27,6 +28,7 @@ import {
   parseAgentMd,
   resolveAgentMdPath,
   selectEffectiveModelRef,
+  stripChildSettlementHandlers,
 } from "../agent.js";
 import activate, { runAgentTool } from "../agent.js";
 import { invalidateSettingsCache } from "../settings.js";
@@ -99,12 +101,15 @@ const MockResourceLoader = vi.hoisted(() => {
   class MockResourceLoader {
     static instances: MockResourceLoader[] = [];
     static failReload = false;
+    /** Awaited inside reload() when set — lets a test hold reload open. */
+    static reloadGate: Promise<void> | undefined;
     opts: Record<string, unknown>;
     reload: ReturnType<typeof vi.fn>;
     constructor(opts: Record<string, unknown>) {
       this.opts = opts;
       this.reload = vi.fn(async () => {
         if (MockResourceLoader.failReload) throw new Error("reload boom");
+        if (MockResourceLoader.reloadGate) await MockResourceLoader.reloadGate;
       });
       MockResourceLoader.instances.push(this);
     }
@@ -135,6 +140,7 @@ beforeEach(() => {
   tmpCwd = mkdtempSync(join(tmpdir(), "pi-dashboard-subagents-cwd-"));
   MockResourceLoader.instances = [];
   MockResourceLoader.failReload = false;
+  MockResourceLoader.reloadGate = undefined;
   invalidateSettingsCache();
 });
 
@@ -540,6 +546,64 @@ describe("createBlockDeltaEmitter", () => {
 
 // ── createUsageAccumulator ──────────────────────────────────────────────
 
+describe("boundToolResult", () => {
+  const details = (entries: any[]) =>
+    ({ agentId: "a", status: "completed", toolUses: 1, tokens: "1k", durationMs: 5, entries, entryCount: entries.length }) as any;
+  const L = { resultMaxChars: 10, detailsMaxChars: 0, entryFieldMaxChars: 0 };
+
+  it("keeps head and tail of long text with a marker", () => {
+    const out = boundToolResult("0123456789abcdefghij", details([]), L);
+    expect(out.text).toBe("01234\n[… 10 chars truncated …]\nfghij");
+  });
+
+  it("leaves short text and disabled limits untouched", () => {
+    const d = details([{ kind: "text", text: "x".repeat(50), ts: 1 }]);
+    const out = boundToolResult("short", d, { resultMaxChars: 0, detailsMaxChars: 0, entryFieldMaxChars: 0 });
+    expect(out.text).toBe("short");
+    expect(out.details).toEqual(d);
+    expect("entriesOmitted" in out.details).toBe(false);
+  });
+
+  it("cuts long entry fields, including non-string tool input/output", () => {
+    const d = details([
+      { kind: "tool", toolName: "Read", input: { path: "p".repeat(100) }, output: "o".repeat(100), ts: 1 },
+      { kind: "text", text: "t".repeat(100), ts: 2 },
+    ]);
+    const out = boundToolResult("x", d, { resultMaxChars: 0, detailsMaxChars: 0, entryFieldMaxChars: 20 });
+    const [tool, text] = out.details.entries as any[];
+    expect(tool.output).toContain("chars truncated");
+    expect(typeof tool.input).toBe("string");
+    expect(tool.input).toContain("chars truncated");
+    expect(text.text.startsWith("t".repeat(10))).toBe(true);
+    expect(tool.toolName).toBe("Read");
+    // input is not mutated
+    expect((d.entries[0] as any).output).toHaveLength(100);
+  });
+
+  it("keeps head and tail entries with one marker when the timeline is too big", () => {
+    const entries = Array.from({ length: 50 }, (_, i) => ({ kind: "text", text: `entry-${i}-${"x".repeat(40)}`, ts: i }));
+    const out = boundToolResult("x", details(entries), { resultMaxChars: 0, detailsMaxChars: 1_000, entryFieldMaxChars: 0 });
+    const kept = out.details.entries as any[];
+    expect(JSON.stringify(kept).length).toBeLessThanOrEqual(1_000);
+    const markers = kept.filter((e) => e.kind === "error");
+    expect(markers).toHaveLength(1);
+    const m = kept.indexOf(markers[0]);
+    expect(kept[0].text).toMatch(/^entry-0-/);
+    expect(kept.at(-1).text).toMatch(/^entry-49-/);
+    expect(markers[0].text).toBe(`[${out.details.entriesOmitted} timeline entries omitted]`);
+    expect(m).toBeGreaterThan(0);
+    expect(kept.length - 1 + out.details.entriesOmitted!).toBe(50);
+    expect(out.details.entryCount).toBe(50);
+    expect(out.details.status).toBe("completed");
+    expect(out.details.tokens).toBe("1k");
+  });
+
+  it("passes details without entries through", () => {
+    const d = { agentId: "a", status: "error", toolUses: 0, tokens: "0", durationMs: 1 } as any;
+    expect(boundToolResult("x", d, L).details).toEqual(d);
+  });
+});
+
 describe("createUsageAccumulator", () => {
   it("accumulates input/output across message_end events", () => {
     const acc = createUsageAccumulator();
@@ -814,10 +878,27 @@ describe("runAgentTool spawn path", () => {
       dispose: vi.fn(),
       abort: vi.fn(),
     };
+    // Real pi always ends a run with an assistant `message_end`; the outcome
+    // is read from it (change: harden-subagent-lifecycle). `finish()` sends a
+    // default successful one unless the test already sent its own.
+    let sawAssistantEnd = false;
+    const emit = (e: any) => {
+      if (e?.type === "message_end" && e.message?.role === "assistant") sawAssistantEnd = true;
+      listener?.(e);
+    };
     return {
       session,
-      emit: (e: any) => listener?.(e),
-      finish: () => finish?.(),
+      emit,
+      finish: (final?: any) => {
+        if (final) emit({ type: "message_end", message: { role: "assistant", ...final } });
+        else if (!sawAssistantEnd) {
+          emit({
+            type: "message_end",
+            message: { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "done" }] },
+          });
+        }
+        finish?.();
+      },
       fail: (e: Error) => fail?.(e),
     };
   }
@@ -1230,8 +1311,8 @@ describe("runAgentTool spawn path", () => {
       await run;
       expect(onUpdate.mock.calls.at(-1)![0].details.liveTail).toEqual(CLEARED);
       for (const [ch, payload] of pi.events.emit.mock.calls) {
-        // `subagents:delta` pieces are not snapshots (no `details`).
-        if (ch === "subagents:delta") continue;
+        // `subagents:delta` pieces and `subagents:entry` steps are not snapshots (no `details`).
+        if (ch === "subagents:delta" || ch === "subagents:entry") continue;
         expect(payload.details, ch).toHaveProperty("liveTail");
       }
 
@@ -1320,6 +1401,198 @@ describe("runAgentTool spawn path", () => {
     expect(created.length).toBe(4);
     created[3].finish();
     await r4;
+  });
+
+  // ── harden-subagent-lifecycle ──
+
+  describe("final assistant message decides the outcome", () => {
+    const emitted = (pi: any, ch: string) =>
+      pi.events.emit.mock.calls.filter((c: any[]) => c[0] === ch).map((c: any[]) => c[1]);
+
+    async function runWith(drive: (h: ReturnType<typeof makeFakeSession>) => void) {
+      writeConfig({ maxConcurrent: 0 });
+      const created = installSessions();
+      const pi = fakePi();
+      const onUpdate = vi.fn();
+      const run = runAgentTool(tmpCwd, args("p"), undefined, onUpdate, fakeCtx(), pi);
+      await settle();
+      drive(created[0]);
+      const res: any = await run;
+      return { res, pi, onUpdate };
+    }
+
+    it("an errored final reply fails even when an earlier turn produced text", async () => {
+      const { res, pi, onUpdate } = await runWith((h) => {
+        h.emit({
+          type: "message_end",
+          message: { role: "assistant", stopReason: "toolUse", content: [{ type: "text", text: "first" }] },
+        });
+        h.finish({ stopReason: "error", errorMessage: "upstream 500", content: [] });
+      });
+      expect(res.isError).toBe(true);
+      expect(res.details.status).toBe("error");
+      expect(res.content[0].text).not.toBe("first");
+      expect(res.content[0].text).toContain("upstream 500");
+      expect(emitted(pi, "subagents:completed")).toHaveLength(0);
+      expect(emitted(pi, "subagents:failed")).toHaveLength(1);
+      expect(emitted(pi, "subagents:failed")[0].error).toBe("upstream 500");
+      expect(onUpdate.mock.calls.at(-1)![0].details.status).toBe("error");
+    });
+
+    it("an empty final reply fails", async () => {
+      const { res, pi } = await runWith((h) => {
+        h.emit({
+          type: "message_end",
+          message: { role: "assistant", stopReason: "toolUse", content: [{ type: "text", text: "earlier" }] },
+        });
+        h.finish({ stopReason: "stop", content: [] });
+      });
+      expect(res.isError).toBe(true);
+      expect(res.details.status).toBe("error");
+      expect(res.details.error).toBe("subagent produced no final output");
+      expect(emitted(pi, "subagents:completed")).toHaveLength(0);
+    });
+
+    it("a final reply with only thinking fails", async () => {
+      const { res } = await runWith((h) =>
+        h.finish({ stopReason: "stop", content: [{ type: "thinking", thinking: "x" }] }),
+      );
+      expect(res.details.status).toBe("error");
+      expect(res.details.error).toBe("subagent produced no final output");
+    });
+
+    it("a normal run returns only the final message's text", async () => {
+      const { res, pi } = await runWith((h) => {
+        h.emit({
+          type: "message_end",
+          message: { role: "assistant", stopReason: "toolUse", content: [{ type: "text", text: "first" }] },
+        });
+        h.finish({
+          stopReason: "stop",
+          content: [{ type: "text", text: "part A" }, { type: "text", text: "part B" }],
+        });
+      });
+      expect(res.isError).toBeUndefined();
+      expect(res.details.status).toBe("completed");
+      expect(res.content[0].text).toBe("part A\npart B");
+      expect(emitted(pi, "subagents:completed")[0].result).toBe("part A\npart B");
+    });
+
+    it("a retried error followed by a successful reply still completes", async () => {
+      const { res } = await runWith((h) => {
+        h.emit({
+          type: "message_end",
+          message: { role: "assistant", stopReason: "error", errorMessage: "overloaded", content: [] },
+        });
+        h.finish({ stopReason: "stop", content: [{ type: "text", text: "recovered" }] });
+      });
+      expect(res.details.status).toBe("completed");
+      expect(res.content[0].text).toBe("recovered");
+    });
+  });
+
+  describe("abort honored during child construction", () => {
+    it("abort while the loader reloads never creates a session", async () => {
+      writeConfig({ maxConcurrent: 0 });
+      installSessions();
+      const ac = new AbortController();
+      const pi = fakePi();
+      let releaseReload!: () => void;
+      Loader.reloadGate = new Promise<void>((r) => (releaseReload = r));
+      const run = runAgentTool(tmpCwd, args("p"), ac.signal, undefined, fakeCtx(), pi);
+      await settle();
+      expect(Loader.instances[0].reload).toHaveBeenCalledTimes(1); // reload is pending
+      ac.abort();
+      releaseReload();
+      const res: any = await run;
+      expect(res.details.status).toBe("aborted");
+      expect(createAgentSession).not.toHaveBeenCalled();
+      const failed = pi.events.emit.mock.calls.filter((c: any[]) => c[0] === "subagents:failed");
+      expect(failed).toHaveLength(1);
+      expect(failed[0][1].error).toBe("aborted by parent");
+    });
+
+    it("abort while the session is created never prompts and disposes it", async () => {
+      writeConfig({ maxConcurrent: 0 });
+      const ac = new AbortController();
+      const made: any[] = [];
+      (createAgentSession as any).mockReset();
+      (createAgentSession as any).mockImplementation(async () => {
+        const h = makeFakeSession();
+        made.push(h.session);
+        ac.abort(); // Stop pressed while the session is being built
+        return { session: h.session };
+      });
+      const pi = fakePi();
+      const res: any = await runAgentTool(tmpCwd, args("p"), ac.signal, undefined, fakeCtx(), pi);
+      expect(res.details.status).toBe("aborted");
+      expect(made).toHaveLength(1);
+      expect(made[0].prompt).not.toHaveBeenCalled();
+      expect(made[0].dispose).toHaveBeenCalled();
+      const failed = pi.events.emit.mock.calls.filter((c: any[]) => c[0] === "subagents:failed");
+      expect(failed).toHaveLength(1);
+    });
+  });
+
+  describe("settlement hooks stripped from children", () => {
+    it("the child loader is given an extensionsOverride", async () => {
+      writeConfig({ maxConcurrent: 0 });
+      const created = installSessions();
+      const run = runAgentTool(tmpCwd, args("p"), undefined, undefined, fakeCtx(), fakePi());
+      await settle();
+      expect(Loader.instances[0].opts.extensionsOverride).toBe(stripChildSettlementHandlers);
+      created[0].finish();
+      await run;
+    });
+
+    it("stripChildSettlementHandlers drops only settlement events", () => {
+      const h = () => undefined;
+      const handlers = new Map<string, unknown[]>(
+        ["turn_end", "agent_end", "agent_before_settle", "agent_settled", "message_end", "tool_call"].map(
+          (ev) => [ev, [h]],
+        ),
+      );
+      const tools = new Map([["my_tool", {}]]);
+      const base: any = { extensions: [{ handlers, tools }], errors: [], runtime: {} };
+      const out = stripChildSettlementHandlers(base);
+      expect([...out.extensions[0].handlers.keys()].sort()).toEqual(["message_end", "tool_call"]);
+      expect(out.extensions[0].tools.has("my_tool")).toBe(true);
+      expect(out.errors).toBe(base.errors);
+    });
+  });
+
+  describe("result bounds", () => {
+    it("bounds the returned result but keeps bus events full", async () => {
+      writeConfig({ maxConcurrent: 0, resultMaxChars: 100, detailsMaxChars: 2_000, entryFieldMaxChars: 50 });
+      const created = installSessions();
+      const pi = fakePi();
+      const onUpdate = vi.fn();
+      const run = runAgentTool(tmpCwd, args("p"), undefined, onUpdate, fakeCtx(), pi);
+      await settle();
+      for (let i = 0; i < 40; i++) {
+        created[0].emit({ type: "tool_execution_start", toolCallId: `t${i}`, toolName: "Read", args: { path: `f${i}` } });
+        created[0].emit({
+          type: "tool_execution_end", toolCallId: `t${i}`, toolName: "Read", result: "o".repeat(500), isError: false,
+        });
+      }
+      const big = "A".repeat(300) + "Z".repeat(300);
+      created[0].finish({ stopReason: "stop", content: [{ type: "text", text: big }] });
+      const res: any = await run;
+
+      expect(res.details.status).toBe("completed");
+      expect(res.content[0].text.startsWith("A".repeat(50))).toBe(true);
+      expect(res.content[0].text.endsWith("Z".repeat(50))).toBe(true);
+      expect(res.content[0].text).toContain("[… 500 chars truncated …]");
+      expect(JSON.stringify(res.details.entries).length).toBeLessThanOrEqual(2_000);
+      expect(res.details.entriesOmitted).toBeGreaterThan(0);
+      expect(res.details.entryCount).toBe(41);
+      expect(onUpdate.mock.calls.at(-1)![0].details.entriesOmitted).toBe(res.details.entriesOmitted);
+
+      const completed = pi.events.emit.mock.calls.find((c: any[]) => c[0] === "subagents:completed")[1];
+      expect(completed.result).toBe(big);
+      expect(completed.details.entries).toHaveLength(41);
+      expect(completed.details.entriesOmitted).toBeUndefined();
+    });
   });
 
   // ── Per-step entry stream (change: stream-subagent-entries-per-step) ──

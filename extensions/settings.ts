@@ -65,7 +65,21 @@ export interface DashboardAgentSettings {
    * Default: 4.
    */
   maxConcurrent: number;
+  /**
+   * Size limits on the tool result pi persists to the parent session
+   * (`0` = unlimited). Bus events are never bounded.
+   * See change: harden-subagent-lifecycle.
+   */
+  resultMaxChars: number;
+  detailsMaxChars: number;
+  entryFieldMaxChars: number;
 }
+
+/** The three result-size limits, as read by `getResultLimits()`. */
+export type ResultLimits = Pick<
+  DashboardAgentSettings,
+  "resultMaxChars" | "detailsMaxChars" | "entryFieldMaxChars"
+>;
 
 export const DEFAULT_SETTINGS: DashboardAgentSettings = Object.freeze({
   inheritContext: true,
@@ -76,6 +90,9 @@ export const DEFAULT_SETTINGS: DashboardAgentSettings = Object.freeze({
     maxChars: 24_000,
   }) as InheritanceCompressionSettings,
   maxConcurrent: 4,
+  resultMaxChars: 16_000,
+  detailsMaxChars: 20_000,
+  entryFieldMaxChars: 2_000,
 }) as DashboardAgentSettings;
 
 // ─── Storage location ────────────────────────────────────────────────────
@@ -148,15 +165,20 @@ function mergeWithDefaults(partial: Partial<DashboardAgentSettings>): DashboardA
       maxChars: partial.inheritance?.maxChars ?? DEFAULT_SETTINGS.inheritance.maxChars,
     },
     maxConcurrent: coerceMaxConcurrent(partial.maxConcurrent),
+    resultMaxChars: coerceLimit(partial.resultMaxChars, DEFAULT_SETTINGS.resultMaxChars),
+    detailsMaxChars: coerceLimit(partial.detailsMaxChars, DEFAULT_SETTINGS.detailsMaxChars),
+    entryFieldMaxChars: coerceLimit(partial.entryFieldMaxChars, DEFAULT_SETTINGS.entryFieldMaxChars),
   };
 }
 
-/** Non-number, non-finite or negative values fall back to the default. `0` is valid (unlimited). */
-function coerceMaxConcurrent(value: unknown): number {
-  if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
-    return DEFAULT_SETTINGS.maxConcurrent;
-  }
+/** Non-number, non-finite or negative values fall back to `fallback`. `0` is valid (unlimited). */
+function coerceLimit(value: unknown, fallback: number): number {
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 0) return fallback;
   return Math.floor(value);
+}
+
+function coerceMaxConcurrent(value: unknown): number {
+  return coerceLimit(value, DEFAULT_SETTINGS.maxConcurrent);
 }
 
 // ─── Write ───────────────────────────────────────────────────────────────
@@ -179,6 +201,12 @@ export function saveSettings(patch: Partial<DashboardAgentSettings>): DashboardA
       patch.maxConcurrent === undefined
         ? current.maxConcurrent
         : coerceMaxConcurrent(patch.maxConcurrent),
+    resultMaxChars: coerceLimit(patch.resultMaxChars ?? current.resultMaxChars, current.resultMaxChars),
+    detailsMaxChars: coerceLimit(patch.detailsMaxChars ?? current.detailsMaxChars, current.detailsMaxChars),
+    entryFieldMaxChars: coerceLimit(
+      patch.entryFieldMaxChars ?? current.entryFieldMaxChars,
+      current.entryFieldMaxChars,
+    ),
   };
   writeSettingsToDisk(next);
   cached = next;
@@ -246,6 +274,24 @@ export function getInheritanceCompression(): InheritanceCompressionSettings {
 export function getMaxConcurrent(): number {
   // Re-read when the config file changed on disk so operators can retune the
   // cap without `/reload` (spec: "setting is read per call").
-  if (configMtimeMs() !== cachedMtimeMs) invalidateSettingsCache();
+  refreshIfConfigChanged();
   return loadSettings().maxConcurrent;
+}
+
+/**
+ * Result-size limits for the persisted tool result (`0` = unlimited). Read
+ * per spawn like `getMaxConcurrent`. See change: harden-subagent-lifecycle.
+ */
+export function getResultLimits(): ResultLimits {
+  refreshIfConfigChanged();
+  const s = loadSettings();
+  return {
+    resultMaxChars: s.resultMaxChars,
+    detailsMaxChars: s.detailsMaxChars,
+    entryFieldMaxChars: s.entryFieldMaxChars,
+  };
+}
+
+function refreshIfConfigChanged(): void {
+  if (configMtimeMs() !== cachedMtimeMs) invalidateSettingsCache();
 }

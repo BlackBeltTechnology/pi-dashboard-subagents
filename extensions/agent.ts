@@ -32,6 +32,7 @@ import {
   type ExtensionAPI,
   type ExtensionContext,
   getAgentDir,
+  type LoadExtensionsResult,
   type ModelRuntime,
   parseFrontmatter,
   SessionManager,
@@ -61,6 +62,8 @@ import {
 import {
   getInheritanceCompression,
   getMaxConcurrent,
+  getResultLimits,
+  type ResultLimits,
   resolveIsolated,
   shouldExposeInheritanceInTool,
 } from "./settings.js";
@@ -488,9 +491,117 @@ async function createChildLoader(cwd: string): Promise<DefaultResourceLoader> {
     noSkills: true,
     noPromptTemplates: true,
     noThemes: true,
+    extensionsOverride: stripChildSettlementHandlers,
   });
   await loader.reload();
   return loader;
+}
+
+/**
+ * Settlement events whose extension handlers do NOT run in a child session.
+ * pi awaits them inside `prompt()`, so a parent-scoped hook (memory summary,
+ * telemetry flush) would delay the child or keep it running. `message_end`
+ * is kept: its handlers may rewrite/redact the message itself.
+ * See change: harden-subagent-lifecycle.
+ */
+const CHILD_STRIPPED_EVENTS = ["turn_end", "agent_end", "agent_before_settle", "agent_settled"] as const;
+
+/**
+ * `extensionsOverride` for child loaders: drops settlement-event handlers,
+ * keeps every other handler and every tool. Mutates in place — safe because
+ * each child has its own loader and thus its own `Extension` objects.
+ */
+export function stripChildSettlementHandlers(base: LoadExtensionsResult): LoadExtensionsResult {
+  for (const ext of base.extensions) {
+    for (const ev of CHILD_STRIPPED_EVENTS) ext.handlers.delete(ev);
+  }
+  return base;
+}
+
+// ─── Result bounds ────────────────────────────────────────────────────
+//
+// pi persists a custom tool's result (`content` + `details`) to the parent
+// session JSONL unmodified, so the producer bounds it. Bus events stay full.
+// See change: harden-subagent-lifecycle.
+
+/** Keep head + tail of `s` within `max` chars, marking the cut. `max <= 0` = unlimited. */
+function cutMiddle(s: string, max: number): string {
+  if (max <= 0 || s.length <= max) return s;
+  const head = Math.ceil(max / 2);
+  const tail = max - head;
+  return `${s.slice(0, head)}\n[… ${s.length - max} chars truncated …]\n${s.slice(s.length - tail)}`;
+}
+
+/** Cut an arbitrary value: strings directly, anything else via its JSON form. */
+function cutValue(v: unknown, max: number): unknown {
+  if (max <= 0 || v === undefined) return v;
+  if (typeof v === "string") return cutMiddle(v, max);
+  let json: string | undefined;
+  try {
+    json = JSON.stringify(v);
+  } catch {
+    return "[unserializable]";
+  }
+  return json !== undefined && json.length > max ? cutMiddle(json, max) : v;
+}
+
+function cutEntry(e: SubagentTimelineEntry, max: number): SubagentTimelineEntry {
+  if (max <= 0) return e;
+  if (e.kind === "tool") return { ...e, input: cutValue(e.input, max), output: cutValue(e.output, max) };
+  return { ...e, text: cutMiddle(e.text, max) };
+}
+
+/**
+ * Bound a tool result for persistence: result text head/tail-cut, each entry
+ * field cut, and an oversized timeline reduced to a head + tail of entries
+ * around one `[N timeline entries omitted]` marker (`entriesOmitted = N`;
+ * `entryCount` keeps the original count). Metadata is never touched. Pure.
+ */
+export function boundToolResult(
+  text: string,
+  details: AgentDetails,
+  limits: ResultLimits,
+): { text: string; details: AgentDetails } {
+  const outText = cutMiddle(text, limits.resultMaxChars);
+  if (!details.entries) return { text: outText, details };
+  let entries = details.entries.map((e) => cutEntry(e, limits.entryFieldMaxChars));
+  let entriesOmitted: number | undefined;
+  const max = limits.detailsMaxChars;
+  if (max > 0 && JSON.stringify(entries).length > max) {
+    const size = (e: SubagentTimelineEntry) => JSON.stringify(e).length + 1; // + comma
+    const markerTs = entries[0]?.ts ?? 0;
+    const markerFor = (n: number): SubagentTimelineEntry => ({
+      kind: "error",
+      text: `[${n} timeline entries omitted]`,
+      ts: markerTs,
+    });
+    let budget = max - 2 - size(markerFor(entries.length)); // brackets + worst-case marker
+    const head: SubagentTimelineEntry[] = [];
+    const tail: SubagentTimelineEntry[] = [];
+    let i = 0;
+    let j = entries.length - 1;
+    let takeHead = true;
+    while (i <= j) {
+      const next = takeHead ? entries[i] : entries[j];
+      const cost = size(next);
+      if (cost > budget) break;
+      budget -= cost;
+      if (takeHead) head.push(entries[i++]);
+      else tail.unshift(entries[j--]);
+      takeHead = !takeHead;
+    }
+    entriesOmitted = j - i + 1;
+    if (entriesOmitted > 0) {
+      const marker = { ...markerFor(entriesOmitted), ts: head.at(-1)?.ts ?? markerTs };
+      entries = [...head, marker, ...tail];
+    } else {
+      entriesOmitted = undefined;
+    }
+  }
+  return {
+    text: outText,
+    details: { ...details, entries, ...(entriesOmitted ? { entriesOmitted } : {}) },
+  };
 }
 
 // ─── Spawn concurrency gate ───────────────────────────────────────
@@ -1190,6 +1301,14 @@ export async function runAgentTool(
   let liveTail: LiveTail = CLEARED_LIVE_TAIL;
   let modelName: string | undefined;
   let thinkingLevel: string | undefined;
+  // Read once per spawn; bound only what pi persists (tool result + terminal onUpdate).
+  const limits = getResultLimits();
+  /**
+   * The final assistant message, overwritten on each assistant `message_end`.
+   * It alone decides the outcome (pi has already retried by the time
+   * `prompt()` resolves). See change: harden-subagent-lifecycle.
+   */
+  let lastAssistant: { stopReason?: string; errorMessage?: string; text: string } | undefined;
 
   /**
    * The ONLY way a step joins the timeline: push, then announce it once on
@@ -1266,8 +1385,30 @@ export async function runAgentTool(
   function pushTerminalUpdate(details: AgentDetails): void {
     onUpdate?.({
       content: [{ type: "text", text: details.error ?? activity ?? "(done)" }],
+      details: boundToolResult("", details, limits).details,
+    });
+  }
+
+  /**
+   * Terminal failure: emit `subagents:failed` (full details), flush the
+   * terminal `onUpdate`, and return a bounded error result.
+   */
+  function failWith(
+    status: "aborted" | "error",
+    message: string,
+    resultText: string,
+  ): AgentToolResultWithError<AgentDetails> {
+    const details = snapshotDetails(status, message);
+    emitSubagentFailed(pi, {
+      agentId,
+      error: message,
+      durationMs: Date.now() - startedAt,
+      toolUses,
       details,
     });
+    pushTerminalUpdate(details);
+    const bounded = boundToolResult(resultText, details, limits);
+    return errorResult(bounded.text, bounded.details);
   }
 
   // Emit created BEFORE we touch any other infrastructure so the dashboard
@@ -1289,29 +1430,17 @@ export async function runAgentTool(
   } catch (err) {
     // Only an abort-while-queued is expected here; anything else is reported
     // as a genuine failure rather than masquerading as a parent abort.
-    const aborted = err instanceof SpawnAbortedError;
-    const message = aborted
-      ? "aborted by parent"
-      : err instanceof Error
-        ? err.message
-        : String(err);
-    const details = snapshotDetails(aborted ? "aborted" : "error", message);
-    emitSubagentFailed(pi, {
-      agentId,
-      error: message,
-      durationMs: Date.now() - startedAt,
-      toolUses,
-      details,
-    });
-    pushTerminalUpdate(details);
     progress.dispose();
-    return errorResult(
-      aborted ? "Subagent aborted by parent." : `Subagent failed: ${message}`,
-      details,
-    );
+    if (err instanceof SpawnAbortedError) {
+      return failWith("aborted", "aborted by parent", "Subagent aborted by parent.");
+    }
+    const message = err instanceof Error ? err.message : String(err);
+    return failWith("error", message, `Subagent failed: ${message}`);
   }
 
   try {
+    // Stop may land between slot grant and here.
+    throwIfAborted(signal);
     // ── Effective model ref: tool-call `args.model` > .md frontmatter ──
     // Per spec agent-md-frontmatter precedence rule + spec subagent-emission
     // "Tool-call `args.model` SHALL take precedence over `agentConfig.model`".
@@ -1338,18 +1467,10 @@ export async function runAgentTool(
         // with-fallback`. Don't silently fall back to the parent default —
         // the caller (tool-call OR .md author) explicitly requested this
         // model.
-        const failedDetails = snapshotDetails("error", resolution.error);
-        emitSubagentFailed(pi, {
-          agentId,
-          error: resolution.error ?? "Model resolution failed",
-          durationMs: Date.now() - startedAt,
-          toolUses,
-          details: failedDetails,
-        });
-        pushTerminalUpdate(failedDetails);
-        return errorResult(
+        return failWith(
+          "error",
+          resolution.error ?? "Model resolution failed",
           resolution.error ?? `Could not resolve model reference "${effectiveModelRef}".`,
-          failedDetails,
         );
       }
       resolvedModel = resolution.model;
@@ -1390,6 +1511,9 @@ export async function runAgentTool(
     // ── Construct in-memory subagent session ──
     const sessionManager = SessionManager.inMemory(cwd);
     const resourceLoader = await createChildLoader(cwd);
+    // pi's session.abort() is a no-op before a run starts, so a Stop pressed
+    // during construction must be checked here, not relayed.
+    throwIfAborted(signal);
     const parentRuntime = getParentModelRuntime(ctx);
     const effectiveThinking: ThinkingLevelString | undefined =
       resolvedThinkingLevel ??
@@ -1416,7 +1540,8 @@ export async function runAgentTool(
       // `off` is passed through so it isn't replaced by settings defaults.
       ...(effectiveThinking ? { thinkingLevel: effectiveThinking } : {}),
     });
-    session = createResult.session;
+    session = createResult.session; // assigned first: `finally` disposes it
+    throwIfAborted(signal);
     modelName = session.model?.id;
     // Requested level; snapshots prefer the session's live (possibly clamped) one.
     thinkingLevel = effectiveThinking;
@@ -1471,14 +1596,19 @@ export async function runAgentTool(
         const msg = event.message as { role: string; content?: unknown };
         if (msg.role === "assistant") {
           turnCount += 1;
+          const am = msg as { stopReason?: string; errorMessage?: string };
+          lastAssistant = {
+            stopReason: am.stopReason,
+            errorMessage: am.errorMessage,
+            text: assistantText(msg.content),
+          };
           // Backfill text / thinking entries from message_end content blocks
           // when streaming `text_end` / `thinking_end` events were NOT
           // emitted. Some providers (e.g. DeepSeek non-streaming responses)
           // deliver the entire assistant message in `message_end` only,
           // never firing the streaming end events. Without this backfill
           // the timeline shows only tools + reasoning, never assistant
-          // text — and `lastAssistantText(entries)` returns undefined,
-          // making the final result `"(no output)"`.
+          // text entries.
           //
           // Mirror of the same pattern in pi-flows' execution.ts.
           if (Array.isArray(msg.content)) {
@@ -1545,22 +1675,15 @@ export async function runAgentTool(
     if (signal?.aborted) {
       blockDeltas.dispose();
       progress.flush();
-      const abortedDetails = snapshotDetails("aborted", "aborted by parent");
-      emitSubagentFailed(pi, {
-        agentId,
-        error: "aborted by parent",
-        durationMs: Date.now() - startedAt,
-        toolUses,
-        details: abortedDetails,
-      });
-      pushTerminalUpdate(abortedDetails);
-      return errorResult("Subagent aborted by parent.", abortedDetails);
+      return failWith("aborted", "aborted by parent", "Subagent aborted by parent.");
     }
 
-    // ── Success ──
+    // ── Outcome: the final assistant message decides ──
     blockDeltas.dispose();
     progress.flush();
-    const finalText = lastAssistantText(entries) ?? "(no output)";
+    const failure = finalReplyFailure(lastAssistant);
+    if (failure) return failWith("error", failure, `Subagent failed: ${failure}`);
+    const finalText = lastAssistant!.text;
     const completedDetails = snapshotDetails("completed");
     emitSubagentCompleted(pi, {
       agentId,
@@ -1571,24 +1694,19 @@ export async function runAgentTool(
       details: completedDetails,
     });
     pushTerminalUpdate(completedDetails);
+    const bounded = boundToolResult(finalText, completedDetails, limits);
     return {
-      content: [{ type: "text", text: finalText }],
-      details: completedDetails,
+      content: [{ type: "text", text: bounded.text }],
+      details: bounded.details,
     };
   } catch (err) {
     blockDeltas.dispose();
     progress.flush();
+    if (err instanceof SpawnAbortedError) {
+      return failWith("aborted", "aborted by parent", "Subagent aborted by parent.");
+    }
     const message = err instanceof Error ? err.message : String(err);
-    const failedDetails = snapshotDetails("error", message);
-    emitSubagentFailed(pi, {
-      agentId,
-      error: message,
-      durationMs: Date.now() - startedAt,
-      toolUses,
-      details: failedDetails,
-    });
-    pushTerminalUpdate(failedDetails);
-    return errorResult(`Subagent failed: ${message}`, failedDetails);
+    return failWith("error", message, `Subagent failed: ${message}`);
   } finally {
     releaseSlot?.();
     if (abortHandler && signal) {
@@ -1615,13 +1733,32 @@ export async function runAgentTool(
   }
 }
 
-/** Last assistant-text entry's text — used as the `result` string. */
-function lastAssistantText(entries: SubagentTimelineEntry[]): string | undefined {
-  for (let i = entries.length - 1; i >= 0; i--) {
-    const e = entries[i];
-    if (e.kind === "text" && e.text) return e.text;
-  }
+/** Joined text blocks of an assistant message's content (string content passes through). */
+function assistantText(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  return content
+    .filter((b: { type?: string; text?: unknown }) => b?.type === "text" && typeof b.text === "string")
+    .map((b: { text: string }) => b.text)
+    .join("\n");
+}
+
+/**
+ * Why the final assistant message makes the run fail, or `undefined` when it
+ * succeeds. Earlier turns never count. See change: harden-subagent-lifecycle.
+ */
+function finalReplyFailure(
+  last: { stopReason?: string; errorMessage?: string; text: string } | undefined,
+): string | undefined {
+  if (last?.stopReason === "error") return last.errorMessage || "subagent's final reply errored";
+  if (last?.stopReason === "aborted") return last.errorMessage || "subagent run was aborted";
+  if (!last || last.text.trim() === "") return "subagent produced no final output";
   return undefined;
+}
+
+/** Throw `SpawnAbortedError` once the parent signal has aborted. */
+function throwIfAborted(signal: AbortSignal | undefined): void {
+  if (signal?.aborted) throw new SpawnAbortedError("aborted by parent");
 }
 
 /**

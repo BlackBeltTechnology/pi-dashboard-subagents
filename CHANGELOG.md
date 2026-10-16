@@ -6,6 +6,32 @@ All notable changes to this package are documented here. Format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- **An errored or empty final reply fails the call.** The outcome now comes
+  from the subagent's final assistant message. A final reply with
+  `stopReason: "error"` (after pi's retries) or `"aborted"`, or with no text,
+  returns `isError: true` and emits `subagents:failed`. Before, the run ended
+  `completed` with an earlier turn's text or `"(no output)"` as its result.
+  **Behavior change:** callers relying on that false success now get a failure.
+- **Stop during setup stops the run.** Parent abort is checked after the spawn
+  slot is granted, after the child loader reloads, and after the session is
+  created. Before, a Stop pressed during construction was missed and the
+  subagent ran to completion (spending tokens and running tools) before its
+  result was discarded.
+- **Parent settlement hooks no longer run in children.** Child loaders drop
+  every extension's `turn_end`, `agent_end`, `agent_before_settle` and
+  `agent_settled` handlers (`extensionsOverride`), so parent-scoped hooks can
+  no longer delay or extend a subagent. Tools and other hooks are unchanged.
+
+### Added
+
+- **Size-bounded tool result.** The tool result pi saves to the parent session
+  (and the terminal `onUpdate`) is capped: settings `resultMaxChars` (16000),
+  `detailsMaxChars` (20000), `entryFieldMaxChars` (2000); `0` = unlimited.
+  Head and tail are kept around a marker; `details.entriesOmitted` is additive.
+  `subagents:*` bus events still carry the full payloads.
+
 ## [0.4.1] - 2026-10-14
 
 ### Fixed

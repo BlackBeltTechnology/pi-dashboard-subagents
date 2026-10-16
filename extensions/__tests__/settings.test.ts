@@ -10,7 +10,7 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -18,6 +18,7 @@ import {
   DEFAULT_SETTINGS,
   getSettingsPath,
   getMaxConcurrent,
+  getResultLimits,
   invalidateSettingsCache,
   loadSettings,
   resolveIsolated,
@@ -223,5 +224,35 @@ describe("resolveIsolated truth table", () => {
   it("expose=on, inherit=false, perCall=false → false (per-call wins)", () => {
     saveSettings({ exposeInheritanceInTool: true, inheritContext: false });
     expect(resolveIsolated(false)).toBe(false);
+  });
+});
+
+// ── result limits (change: harden-subagent-lifecycle) ─────────────────────
+
+describe("result limits", () => {
+  it("defaults to 16000 / 20000 / 2000", () => {
+    expect(getResultLimits()).toEqual({ resultMaxChars: 16_000, detailsMaxChars: 20_000, entryFieldMaxChars: 2_000 });
+  });
+
+  it("reads configured values, 0 meaning unlimited", () => {
+    saveSettings({ resultMaxChars: 0, detailsMaxChars: 5_000, entryFieldMaxChars: 100 });
+    invalidateSettingsCache();
+    expect(getResultLimits()).toEqual({ resultMaxChars: 0, detailsMaxChars: 5_000, entryFieldMaxChars: 100 });
+  });
+
+  it.each([-1, "x", Number.NaN, null])("falls back to defaults for invalid %s", (bad) => {
+    saveSettings({});
+    writeFileSync(getSettingsPath(), JSON.stringify({ resultMaxChars: bad }));
+    invalidateSettingsCache();
+    expect(getResultLimits().resultMaxChars).toBe(16_000);
+  });
+
+  it("is re-read when the config file changes", () => {
+    expect(getResultLimits().resultMaxChars).toBe(16_000);
+    saveSettings({});
+    writeFileSync(getSettingsPath(), JSON.stringify({ resultMaxChars: 42 }));
+    const t = new Date(Date.now() + 5_000);
+    utimesSync(getSettingsPath(), t, t);
+    expect(getResultLimits().resultMaxChars).toBe(42);
   });
 });

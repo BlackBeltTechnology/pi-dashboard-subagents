@@ -17,8 +17,8 @@
  * The dashboard reducer routes by `data.id` into SessionState.subagents
  * and reads `data.details` for the card. Timeline steps (tool calls,
  * reasoning, assistant text, errors) go out once each on `subagents:entry`;
- * progress frames carry only `entryCount`. created / completed / failed and
- * the tool result still carry the full `details.entries[]`.
+ * progress frames carry only `entryCount`. created / completed / failed carry
+ * the full `details.entries[]`; the tool result carries it size-bounded.
  */
 
 import type { ExtensionAPI, ExtensionContext, SessionEntry } from "@earendil-works/pi-coding-agent";
@@ -66,6 +66,13 @@ export interface AgentDetails {
   entries?: SubagentTimelineEntry[];
   /** `entries.length` at snapshot time. Present on every snapshot. */
   entryCount?: number;
+  /**
+   * Set only on a size-bounded tool result / terminal `onUpdate`: how many
+   * timeline entries were replaced by the `[N timeline entries omitted]`
+   * marker. `entryCount` keeps the original count. Never set on bus events.
+   * See change: harden-subagent-lifecycle.
+   */
+  entriesOmitted?: number;
   /** Cumulative count of completed tool calls. */
   toolUses: number;
   /** Display-only formatted token total ("12.3k"). */

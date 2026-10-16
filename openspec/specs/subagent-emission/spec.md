@@ -2,7 +2,9 @@
 
 ## Purpose
 TBD - created by archiving change scaffold-foreground-subagent-extension. Update Purpose after archive.
+
 ## Requirements
+
 ### Requirement: The extension SHALL register an `Agent` tool that spawns foreground subagents in-memory
 
 The extension's `activate` entry point SHALL call `pi.registerTool` exactly once with a `ToolDefinition` named `"Agent"`. The tool's `execute` callback SHALL spawn a subagent via `createAgentSession` with `sessionManager: SessionManager.inMemory(cwd)`. The extension SHALL NOT spawn a separate `pi` CLI process for the subagent.
@@ -58,7 +60,8 @@ The dashboard bridge's emit intercept maps `subagents:*` channels to `subagent_*
 - **THEN** `pi.events.emit("subagents:entry", { v: 1, agentId, toolCallId, index, entry })` SHALL be called exactly once, synchronously, unthrottled
 - **AND** `index` SHALL be the step's 0-based position, contiguous across the run
 - **AND** `toolCallId` SHALL be the parent `Agent` tool call id, or `""` when unknown
-- **AND** `created`, the initial `started`, `completed`, `failed`, `onUpdate` and the final tool result SHALL still carry the full `details.entries`
+- **AND** `created`, the initial `started`, `completed` and `failed` SHALL still carry the full `details.entries`
+- **AND** the terminal `onUpdate` and the final tool result SHALL carry `details.entries` bounded per capability `subagent-result-bounds`
 
 #### Scenario: Progress emissions are throttled to avoid event-bus flooding
 
@@ -82,18 +85,35 @@ The dashboard bridge's emit intercept maps `subagents:*` channels to `subagent_*
 
 #### Scenario: subagents:completed fires on successful prompt resolution
 
-- **WHEN** `await session.prompt(effectivePrompt)` resolves successfully
+- **WHEN** `await session.prompt(effectivePrompt)` resolves, the parent signal has not aborted, and the final assistant message has a `stopReason` other than `"error"` or `"aborted"` and non-empty text
 - **THEN** `pi.events.emit("subagents:completed", payload)` SHALL be called exactly once
 - **AND** the payload SHALL include `{ id, result, durationMs, tokens, toolUses, details }`
 - **AND** `details.status === "completed"`
 - **AND** `details.tokensUsage` SHALL contain `{ input, output, total }`
+- **AND** `result` SHALL be the text of the final assistant message only, never text from an earlier turn
 
 #### Scenario: subagents:failed fires on prompt rejection or session error
 
-- **WHEN** `await session.prompt(effectivePrompt)` rejects, OR the subscription receives an error event
+- **WHEN** `await session.prompt(effectivePrompt)` rejects, OR the final assistant message has `stopReason` `"error"` or `"aborted"`, OR the final assistant message has no non-empty text
 - **THEN** `pi.events.emit("subagents:failed", payload)` SHALL be called exactly once
 - **AND** the payload SHALL include `{ id, error, durationMs, toolUses, details }`
 - **AND** `details.entries` SHALL contain whatever entries had accumulated before the failure (not be cleared)
+- **AND** the tool result SHALL have `isError: true` and `details.status === "error"`
+- **AND** for an errored final reply, `error` SHALL be that message's `errorMessage` when present
+
+#### Scenario: an earlier turn's text does not mask a failed final reply
+
+- **GIVEN** turn 1 emits text `"first"` and a tool call, and turn 2 ends with `stopReason: "error"`, `errorMessage: "upstream 500"`
+- **WHEN** the run ends
+- **THEN** `details.status` SHALL be `"error"`
+- **AND** the tool result text SHALL NOT be `"first"`
+- **AND** `subagents:completed` SHALL NOT fire
+
+#### Scenario: a recovered retry still succeeds
+
+- **GIVEN** pi auto-retries a transient error and the retried final reply has `stopReason: "stop"` and text `"done"`
+- **WHEN** the run ends
+- **THEN** `details.status` SHALL be `"completed"` and the result SHALL be `"done"`
 
 #### Scenario: Emissions are no-ops when pi.events is unavailable
 
@@ -358,4 +378,3 @@ The effective ref selection SHALL be expressible as: `const effectiveModelRef = 
 - **THEN** `resolveModelFromRef` SHALL NOT be called
 - **AND** `createAgentSession` SHALL be invoked with no `model` argument
 - **AND** the subagent SHALL run with pi's default model (parent inheritance, unchanged from today)
-

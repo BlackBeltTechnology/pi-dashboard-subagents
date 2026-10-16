@@ -46,6 +46,9 @@ Two persistent settings live at:
   "inheritContext": true,
   "exposeInheritanceInTool": false,
   "maxConcurrent": 4,
+  "resultMaxChars": 16000,
+  "detailsMaxChars": 20000,
+  "entryFieldMaxChars": 2000,
   "inheritance": {
     "recentTurns": 6,
     "toolOutputWindow": 2,
@@ -62,6 +65,9 @@ Two persistent settings live at:
 | `inheritance.toolOutputWindow` | Recent turns where tool outputs stay verbatim (default 2).                                   |
 | `inheritance.maxChars`     | Hard cap on the compressed context (default 24000 chars ≈ 6K tokens).                            |
 | `maxConcurrent`            | Maximum subagents running at once in this process (default 4). Extra spawns wait FIFO and their dashboard card shows `queued` until a slot frees. `0` = unlimited (the pre-0.2.5 behaviour). Re-read from disk per spawn — no `/reload` needed. |
+| `resultMaxChars`           | Cap on the result text in the tool result pi saves to the parent session (default 16000). Head and tail are kept around a `[… N chars truncated …]` marker. `0` = unlimited. Re-read per spawn. |
+| `detailsMaxChars`          | Cap on the serialized `details.entries` in that saved tool result (default 20000). Head and tail entries are kept around one `[N timeline entries omitted]` entry; `details.entriesOmitted` = N. `0` = unlimited. |
+| `entryFieldMaxChars`       | Cap on each timeline entry's text / tool input / tool output in that saved tool result (default 2000). `0` = unlimited. |
 
 #### Why a concurrency cap
 
@@ -78,6 +84,21 @@ Each child session gets its **own** lean resource loader: extensions are loaded
 templates and themes are not** — a headless child never reads them, and
 skipping them cuts memory noticeably on wide fan-outs. Skills remain reachable
 by path if the parent passes them in the prompt.
+
+Extension handlers for the **settlement events** `turn_end`, `agent_end`,
+`agent_before_settle` and `agent_settled` are removed from the child (via pi's
+`extensionsOverride`). pi awaits those hooks inside every run, so a
+parent-scoped hook (a memory summary, a telemetry flush) would otherwise delay
+or extend each subagent. Tool, provider and `message_end` hooks still run.
+
+#### Outcome and Stop
+
+- The **final assistant message** decides the outcome. If it errored
+  (`stopReason: "error"` after pi's own retries) or was aborted, or it has no
+  text, the call fails (`subagents:failed`, `isError: true`). Text from an
+  earlier turn is never returned as the result.
+- **Stop** is honored at every stage: while queued, while the child loader is
+  built, and while the session is created. An early Stop sends no model request.
 
 Four usage modes:
 
@@ -501,8 +522,8 @@ dashboard) can consume all six:
 | `subagents:started`     | `subagent_started`       | Initial "running" emission, AND all progress ticks (re-uses channel; progress ticks omit `entries`, carry `entryCount`) |
 | `subagents:entry`       | — (not forwarded by core) | Once per timeline step, the moment it is appended (never throttled). Steps finishing a streamed text/thinking block carry `blockId` |
 | `subagents:delta`       | —                        | Append-only pieces of the streaming text/thinking block (see below) |
-| `subagents:completed`   | `subagent_completed`     | `await session.prompt(...)` resolves successfully |
-| `subagents:failed`      | `subagent_failed`        | Any throw, abort, or session error path       |
+| `subagents:completed`   | `subagent_completed`     | `await session.prompt(...)` resolves and the final assistant reply succeeded with text |
+| `subagents:failed`      | `subagent_failed`        | Any throw, abort, errored/empty final reply, or session error path |
 
 Progress emissions are throttled to **≤4 per second per subagent** (`PROGRESS_THROTTLE_MS = 250`). The final progress snapshot is always flushed before `completed`/`failed`.
 
@@ -541,9 +562,10 @@ subagents:entry     → { v: 1, agentId, toolCallId, index, entry }  // Subagent
 ticks on `subagents:started` deliberately OMIT the `entries` key and carry
 `details.entryCount` instead, so per-tick cost stays constant however long the
 run is. `subagents:created`, the initial `subagents:started`,
-`subagents:completed`, `subagents:failed`, the tool's `onUpdate` and the final
-tool result all keep the full `details.entries[]` (the parent session's tool
-result is the durable full timeline).
+`subagents:completed` and `subagents:failed` keep the full `details.entries[]`.
+The terminal `onUpdate` and the final tool result (what pi saves to the parent
+session) carry it **size-bounded** per `resultMaxChars` / `detailsMaxChars` /
+`entryFieldMaxChars`; `details.entriesOmitted` says how many steps were dropped.
 
 ### `AgentDetails` field reference
 
@@ -558,7 +580,8 @@ The `details` payload (defined in `extensions/events.ts`) carries everything the
 | `status`       | `AgentStatus`                   | One of `queued \| running \| completed \| aborted \| stopped \| error`     |
 | `activity?`    | `string`                        | Live current-activity line ("running bash", "thinking", …)               |
 | `entries?`     | `SubagentTimelineEntry[]`       | Full timeline. Absent on progress ticks (use `subagents:entry`)          |
-| `entryCount?`  | `number`                        | `entries.length` at snapshot time; on every emission                     |
+| `entryCount?`  | `number`                        | `entries.length` at snapshot time; on every emission (the original count on a bounded tool result) |
+| `entriesOmitted?` | `number`                     | Bounded tool result / terminal `onUpdate` only: steps replaced by the omission marker |
 | `toolUses`    | `number`                        | Cumulative count of completed tool calls                                 |
 | `tokens`       | `string`                        | Display-formatted total (`"12.3k"`)                                      |
 | `tokensUsage?` | `{ input, output, total }`      | Raw integer counts (populated on `completed`/`failed`)                    |
@@ -586,7 +609,7 @@ Only `_end`-flavored session events become entries — each entry is final / ide
 ### Persistence model
 
 - **Subagent's conversation** — in-memory only, dies with the parent turn (uses `SessionManager.inMemory(cwd)`).
-- **Subagent's final result + timeline** — embedded in the `AgentToolResult<AgentDetails>` returned to the parent. Pi persists it inside the parent's `ToolResultMessage.details` in the parent session's JSONL. Survives `/resume`.
+- **Subagent's final result + timeline** — embedded in the `AgentToolResult<AgentDetails>` returned to the parent, size-bounded (see `resultMaxChars` / `detailsMaxChars`). Pi persists it inside the parent's `ToolResultMessage.details` in the parent session's JSONL. Survives `/resume`; a replayed timeline keeps head and tail steps around an omission marker.
 - **Live progress** — streamed only; not buffered server-side. A dashboard refresh while a subagent is still running loses the live card until the parent's tool result lands in JSONL (then state-replay re-hydrates from `details`). See the dashboard's `add-subagent-inspector` change for the consumer-side replay seam.
 
 ## License

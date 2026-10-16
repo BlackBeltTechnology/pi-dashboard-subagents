@@ -317,6 +317,12 @@ describe("real faux-provider entry stream", () => {
       expect(terminal[0].details.entries).toEqual(result.details.entries);
       expect(result.details.entryCount).toBe(result.details.entries.length);
       expect(steps.slice(0, 2).map((s) => s.entry.kind)).toEqual(["text", "tool"]);
+      // The errored final reply decides the outcome (change: harden-subagent-lifecycle).
+      expect(result.details.status).toBe("error");
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).not.toBe("first");
+      expect(of("subagents:failed")).toHaveLength(1);
+      expect(of("subagents:completed")).toHaveLength(0);
       console.info(
         `[entry-stream-faux error] status=${result.details.status} kinds=${steps.map((s) => s.entry.kind).join(",")}`,
       );
