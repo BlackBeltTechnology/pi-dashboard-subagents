@@ -200,7 +200,10 @@ jobs:
           npm publish --provenance --access public $TAG_ARG
           echo "::endgroup::"
 
-  # ── github-release: create a draft release with notes ────────────────────
+  # ── github-release: publish the release with notes ───────────────────────
+  # Published, not draft, so GitHub's "Latest" tracks npm. `make_latest:
+  # legacy` lets GitHub pick Latest by highest semver, so a backfilled old tag
+  # never becomes Latest; prereleases never do.
   github-release:
     needs: [prepare, publish]
     runs-on: ubuntu-latest
@@ -243,5 +246,6 @@ jobs:
           tag_name: ${{ needs.prepare.outputs.tag }}
           body_path: ${{ steps.notes.outputs.fallback == 'true' && '' || 'release-notes.md' }}
           generate_release_notes: ${{ steps.notes.outputs.fallback == 'true' }}
-          draft: true
+          draft: false
+          make_latest: legacy
           prerelease: ${{ needs.prepare.outputs.is_prerelease == 'true' }}

@@ -6,6 +6,14 @@ All notable changes to this package are documented here. Format follows
 
 ## [Unreleased]
 
+### Changed
+
+- **Release workflow publishes GitHub releases** instead of leaving drafts
+  (`draft: false`, `make_latest: legacy`), so GitHub's "Latest" tracks npm.
+- **CHANGELOG backfilled and re-attributed.** Added 0.2.0 to 0.2.2 sections;
+  entries that shipped in 0.2.1 / 0.2.2 but were filed under 0.2.3 moved to
+  their real versions.
+
 ## [0.5.0] - 2026-10-16
 
 ### Fixed
@@ -200,6 +208,8 @@ All notable changes to this package are documented here. Format follows
   `AgentDetails` so the dashboard card can render "reviewer (package:
   @acme/pi-reviewers)".
 
+## [0.2.2] - 2026-06-05
+
 ### Changed
 
 - **Release workflow hardening** (`.github/workflows/release.yml`). The
@@ -208,6 +218,8 @@ All notable changes to this package are documented here. Format follows
   matches the resolved tag and fails loud on drift. `prepare` is the single
   source of truth for versioning. Prevents silently publishing a tarball
   whose version was never bumped.
+
+## [0.2.1] - 2026-06-05
 
 ### Changed — **BREAKING**
 
@@ -252,8 +264,39 @@ All notable changes to this package are documented here. Format follows
   agent `.md` path and an actionable next step.
 - **`ModelResolveProbe` interface** exported from `extensions/agent.ts` for
   handler authors.
-- **`CHANGELOG.md`** (this file) — was missing previously.
+
+- **`CHANGELOG.md`** (this file).
 
 ### Removed
 
+- **Bundled `agents/Explore.md`.** Moved out of this package; the dashboard
+  now ships its Explore agent as a project-level agent.
 - `role:resolve-model` event name — see Changed above.
+
+## [0.2.0] - 2026-05-28
+
+### Added
+
+- **`Agent` tool** spawning foreground subagents in memory
+  (`SessionManager.inMemory(cwd)`): no session file, no child process. The
+  `Agent` tool is removed from the child, so subagents cannot nest.
+- **Live timeline on the event bus.** `subagents:created` / `started` /
+  `completed` / `failed` carry `AgentDetails` with a `tool` / `text` /
+  `thinking` / `error` timeline for the dashboard inspector. Progress is
+  throttled to about 4 emissions per second and flushed before terminal
+  events. The tool result embeds the full timeline, so `/resume` re-hydrates
+  the inspector without re-running.
+- **Context inheritance** by verbatim compaction of the parent branch (no
+  extra LLM call). Settings in
+  `~/.pi/agent/extensions/pi-dashboard-subagents/config.json`
+  (`inheritContext`, `exposeInheritanceInTool`, `inheritance.*`).
+- **Agent `.md` frontmatter** (`model`, `tools`, `prompt`, `inherit_context`,
+  `description`; body as prompt) with project → user → bundled resolution,
+  and a bundled read-only `Explore` agent on the `@fast` role.
+- Published as `@blackbelt-technology/pi-dashboard-subagents`.
+
+### Fixed
+
+- **Assistant text backfilled from `message_end`** for providers that never
+  emit streaming `text_end` / `thinking_end` events, which previously produced
+  `"(no output)"`.
