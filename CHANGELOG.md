@@ -6,6 +6,8 @@ All notable changes to this package are documented here. Format follows
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-10-16
+
 ### Fixed
 
 - **An errored or empty final reply fails the call.** The outcome now comes
