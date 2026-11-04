@@ -126,15 +126,18 @@ inheritContext=false, exposeInheritanceInTool=true
   → isolated by default. LLM can set `isolated: false` per call to opt in.
 ```
 
-Missing file or fields fall back to baked-in defaults. Settings are cached
-after first read; edit the file and restart pi, or call `invalidateSettingsCache()`
-programmatically to pick up changes.
+Missing file or fields fall back to baked-in defaults. Settings are cached,
+and every spawn re-checks the file's mtime, so edits apply on the **next
+spawn** without a restart. The one exception is `exposeInheritanceInTool`: it
+shapes the tool schema, which is fixed at activation, so it needs `/reload`.
+Waiting calls also re-read `maxConcurrent` about every second.
+`invalidateSettingsCache()` forces a re-read programmatically.
 
 ### Compression is operator-controlled only
 
 `recentTurns`, `toolOutputWindow`, and `maxChars` are never exposed to the
 LLM under any setting. They're operator concerns — fine-tune them globally
-by editing the config file, then restart pi.
+by editing the config file; the next spawn uses the new values.
 
 ## Upstream prompt caching — future work
 
@@ -214,14 +217,21 @@ Agent(
 )
 ```
 
+`subagent_type` can be any label. When it matches an agent `.md` (see
+[Agent `.md` files](#agent-md-files)) that file supplies the model, tools and
+prompt; otherwise the subagent runs with the parent's defaults. This package
+ships no agents itself; `Explore` above resolves only when some tier provides
+an `Explore.md` (pi-agent-dashboard ships one as a project-level agent).
+
 The subagent runs in-memory under the parent pi process. Live progress is
 streamed back to the caller via the standard `AgentDetails` payload plus the
 `entries[]` timeline field. The subagent never appears as a separate session.
 
 ## Agent `.md` files
 
-v0.2.0 added YAML frontmatter parsing for agent `.md` definition files plus a
-3-tier resolver and a bundled default Explore agent.
+Agent `.md` files define reusable subagent types: YAML frontmatter for
+model, tools and inheritance, plus a prompt. They are found by a four-tier
+resolver (project, user, bundled, package).
 
 ### Frontmatter schema
 
@@ -263,7 +273,7 @@ looks up `Explore.md` in four tiers, most-specific first:
 ```
 1. <cwd>/.pi/agents/Explore.md          → source: "project"   (per-project override)
 2. ~/.pi/agent/agents/Explore.md        → source: "user"      (per-user override)
-3. <EXTENSION_ROOT>/agents/Explore.md   → source: "bundled"   (ships with this package)
+3. <EXTENSION_ROOT>/agents/Explore.md   → source: "bundled"   (this package's own agents/; none shipped today)
 4. <installedPath>/agents/Explore.md    → source: "package"   (any other installed pi package)
 ```
 
@@ -314,40 +324,27 @@ Resolution rules for the package tier:
   `/reload` or a working-directory change. A newly installed package becomes
   spawnable after `/reload` (no full restart needed).
 
-### Bundled `Explore` agent
+### Bundled agents
 
-The package ships `agents/Explore.md` — a fast, read-only codebase / docs
-explorer informed by Claude Code's Explore agent and the production guidance
-in Ranjan Kumar's *Subagents: How to Run Parallelism Inside a Single Agent
-Session* (April 2026):
+The bundled tier (3) is kept so this package *can* ship agents, but **none are
+shipped**. The `Explore` agent that 0.2.0 bundled moved out in 0.2.1: the
+dashboard now ships it as a project-level agent. To get one without the
+dashboard, write your own, e.g. `~/.pi/agent/agents/Explore.md`:
 
-- **Model**: `"@fast"` — role alias resolved at spawn time by the dashboard's
-  roles plugin. Operators pick the underlying model behind `@fast` via
-  Settings → Roles. This makes model choice operator-controlled at runtime
-  rather than baked into the shipped file.
-- **Tools**: `[read, grep, find, ls, bash]` — no write/edit/Agent.
-- **Inherit context**: `false` — fresh window, parent's context not imported.
-- **Output contract**: structured `## Answer / ## Evidence / ## Notes` with
-  hard limits (≤2000 tokens, no raw file dumps).
-
-The bundled Explore **requires** a `model:resolve` handler to be loaded (so
-`@fast` can be looked up in `~/.pi/agent/providers.json`). The handler ships
-with **pi-agent-dashboard** and (optionally) **pi-flows**. Without one of
-them, `@role` references HARD-FAIL the spawn; literal model ids still resolve
-via the in-process registry fallback. See [Model resolution](#model-resolution-model)
-below.
-
-To customise (e.g. to run without the dashboard, or to pin a specific model):
-
-```bash
-mkdir -p ~/.pi/agent/agents
-cp "$(node -e 'console.log(require.resolve("@blackbelt-technology/pi-dashboard-subagents/agents/Explore.md"))')" \
-   ~/.pi/agent/agents/Explore.md
-# Edit ~/.pi/agent/agents/Explore.md — e.g. change `model:` to a literal
-# "provider/model-id" so it works without the roles-plugin bridge.
+```markdown
+---
+description: Fast read-only codebase & docs exploration
+model: anthropic/claude-haiku-4-5   # or "@fast" when a model:resolve handler is loaded
+tools: [read, grep, find, ls, bash]
+inherit_context: false
+---
+You are an Explore subagent. Be fast and read-only. Answer with
+## Answer / ## Evidence / ## Notes, no raw file dumps.
 ```
 
-The user-global override automatically wins over the bundled file (tier 2 > 3).
+`@role` refs such as `@fast` need a `model:resolve` handler (pi-agent-dashboard
+or pi-flows); literal ids work without one. See
+[Model resolution](#model-resolution-model).
 
 ### Model resolution (`model:`)
 
@@ -504,12 +501,15 @@ duplication, no second resolver — it's the identical machinery.
 ```
   args.model      (tool-call argument)
    > agentConfig.model    (`.md` frontmatter)
-    > pi default (settings.json)
+    > parent's live model (ctx.model — what the parent runs right now)
+     > SDK default (settings `defaultModel`)
 ```
 
 When `args.model` is non-empty it WINS and the `.md`'s `model:` is ignored.
 When `args.model` is omitted (or empty/whitespace) the `.md` value applies.
-When both are absent, the parent's default model is inherited.
+When both are absent, the subagent runs on the **parent's current model**
+(including a model switched mid-session), not the settings default; the SDK
+default applies only when the parent has no live model.
 
 Failure modes are identical to the frontmatter path. Error messages cite
 the source of the unresolvable ref — either the `.md` file path or the
