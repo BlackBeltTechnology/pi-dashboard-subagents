@@ -6,8 +6,31 @@ All notable changes to this package are documented here. Format follows
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-11-04
+
+### Added
+
+- **Per-subagent stop: `subagents:stop { agentId }`.** Stops one queued or
+  running subagent of the receiving session without aborting the parent turn
+  or its siblings. Queued: removed without using a slot or creating a child.
+  Running: only that child is aborted and its slot goes to the next waiter.
+  Ends `status: "stopped"` with `stopReason`, emitted on `subagents:completed`,
+  with a non-error tool result (partial output kept). First reason wins
+  against a parent abort. Every request is logged. Snapshots carry
+  `stoppable: true`. Each subagent now has its own abort linked to the parent.
+- **Queue info on `AgentDetails`:** `queuePosition`, `activeSlots`,
+  `maxConcurrent` while queued; `slotGrantedAt` once running. Queue changes
+  re-push one queued frame per waiter per task.
+- **Live `maxConcurrent`:** waiting calls re-check the limit about every
+  second, so raising it starts them without a new spawn or `/reload`.
+
 ### Changed
 
+- **Fair granting:** a new call takes a free slot immediately only when nobody
+  is waiting, so it can no longer jump ahead of earlier waiters.
+- **`maxConcurrent` is clamped to 0–64.** Larger hand-edited values run as 64.
+- `subagents:completed` can now carry `details.status: "stopped"`; consumers
+  that only knew `completed` show it as a finished subagent.
 - **Release workflow publishes GitHub releases** instead of leaving drafts
   (`draft: false`, `make_latest: legacy`), so GitHub's "Latest" tracks npm.
 - **CHANGELOG backfilled and re-attributed.** Added 0.2.0 to 0.2.2 sections;
