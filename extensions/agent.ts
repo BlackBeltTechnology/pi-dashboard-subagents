@@ -610,27 +610,90 @@ export function boundToolResult(
 // (design Decision 3). Nested subagents are impossible (`Agent` is stripped
 // from children), so one gate per process is the right scope.
 
-/** Thrown by `acquireSpawnSlot` when the parent aborts while queued. */
+/** Thrown when a spawn's own signal aborts (parent abort or `subagents:stop`). */
 class SpawnAbortedError extends Error {}
 
+/** How often waiting calls re-read `maxConcurrent` (live limit change). */
+const QUEUE_RECHECK_MS = 1_000;
+
+/** Queue state a waiting call reports on its snapshots. */
+export interface QueueInfo {
+  queuePosition: number;
+  activeSlots: number;
+  maxConcurrent: number;
+}
+
+interface SpawnWaiter {
+  start(): void;
+  /** Fresh queue info for this waiter; called from the batched flush. */
+  onPosition?: (info: QueueInfo) => void;
+}
+
 let activeSpawns = 0;
-const spawnWaiters: Array<{ start: () => void; onAbort?: () => void }> = [];
+const spawnWaiters: SpawnWaiter[] = [];
+let recheckTimer: ReturnType<typeof setInterval> | undefined;
+let positionsDirty = false;
+/** Limit seen by the last dispatch; a change re-pushes queue info. */
+let lastDispatchLimit: number | undefined;
+
+/** Current queue info for a waiter at 0-based `index`. */
+function queueInfoAt(index: number, limit = getMaxConcurrent()): QueueInfo {
+  return { queuePosition: index + 1, activeSlots: activeSpawns, maxConcurrent: limit };
+}
+
+/**
+ * Coalesce every queue change in the current task into ONE frame per
+ * remaining waiter (flushed on a microtask).
+ */
+function schedulePositionPush(): void {
+  if (positionsDirty) return;
+  positionsDirty = true;
+  queueMicrotask(() => {
+    positionsDirty = false;
+    if (spawnWaiters.length === 0) return;
+    const limit = getMaxConcurrent();
+    spawnWaiters.forEach((w, i) => w.onPosition?.(queueInfoAt(i, limit)));
+  });
+}
+
+/** Keep the live re-check running exactly while something waits. */
+function syncRecheckTimer(): void {
+  if (spawnWaiters.length > 0 && !recheckTimer) {
+    recheckTimer = setInterval(dispatchSpawnWaiters, QUEUE_RECHECK_MS);
+    (recheckTimer as { unref?: () => void }).unref?.();
+  } else if (spawnWaiters.length === 0 && recheckTimer) {
+    clearInterval(recheckTimer);
+    recheckTimer = undefined;
+  }
+}
 
 function dispatchSpawnWaiters(): void {
   const limit = getMaxConcurrent();
+  let changed = lastDispatchLimit !== undefined && limit !== lastDispatchLimit;
+  lastDispatchLimit = limit;
   while (spawnWaiters.length > 0 && (limit === 0 || activeSpawns < limit)) {
     const next = spawnWaiters.shift()!;
     activeSpawns += 1;
+    changed = true;
     next.start();
   }
+  if (changed) schedulePositionPush();
+  syncRecheckTimer();
 }
 
 /**
  * Wait for a spawn slot. Resolves with the release function. Rejects with
  * `SpawnAbortedError` when `signal` aborts before the slot is granted — in
  * that case no slot is consumed.
+ *
+ * Fair: a call is granted at once only when NOBODY is waiting, so it can never
+ * jump ahead of earlier waiters (e.g. right after `maxConcurrent` is raised,
+ * before the re-check runs). See change: manage-subagent-spawn-queue.
  */
-function acquireSpawnSlot(signal: AbortSignal | undefined): Promise<() => void> {
+function acquireSpawnSlot(
+  signal: AbortSignal | undefined,
+  onPosition?: (info: QueueInfo) => void,
+): Promise<() => void> {
   let released = false;
   const release = (): void => {
     if (released) return;
@@ -639,31 +702,100 @@ function acquireSpawnSlot(signal: AbortSignal | undefined): Promise<() => void> 
     dispatchSpawnWaiters();
   };
 
-  if (signal?.aborted) return Promise.reject(new SpawnAbortedError("aborted by parent"));
+  if (signal?.aborted) return Promise.reject(new SpawnAbortedError("aborted"));
 
   const limit = getMaxConcurrent();
-  if (limit === 0 || activeSpawns < limit) {
+  lastDispatchLimit = limit;
+  if (spawnWaiters.length === 0 && (limit === 0 || activeSpawns < limit)) {
     activeSpawns += 1;
     return Promise.resolve(release);
   }
 
   return new Promise<() => void>((resolve, reject) => {
-    const waiter: { start: () => void; onAbort?: () => void } = {
+    let onAbort: (() => void) | undefined;
+    const waiter: SpawnWaiter = {
       start: () => {
-        if (waiter.onAbort && signal) signal.removeEventListener("abort", waiter.onAbort);
+        if (onAbort && signal) signal.removeEventListener("abort", onAbort);
         resolve(release);
       },
+      onPosition,
     };
     if (signal) {
-      waiter.onAbort = () => {
+      onAbort = () => {
         const idx = spawnWaiters.indexOf(waiter);
         if (idx >= 0) spawnWaiters.splice(idx, 1); // slot never consumed
-        reject(new SpawnAbortedError("aborted by parent"));
+        schedulePositionPush();
+        syncRecheckTimer();
+        reject(new SpawnAbortedError("aborted"));
       };
-      signal.addEventListener("abort", waiter.onAbort, { once: true });
+      signal.addEventListener("abort", onAbort, { once: true });
     }
     spawnWaiters.push(waiter);
+    // Report this waiter's place synchronously (created snapshot) and
+    // through the batched push.
+    onPosition?.(queueInfoAt(spawnWaiters.length - 1, limit));
+    syncRecheckTimer();
   });
+}
+
+// ─── Per-subagent control (`subagents:stop`) ─────────────────────────────────
+//
+// One registry per activation (never module-level): a stop received on one
+// session's bus can only reach subagents that session created.
+// See change: manage-subagent-spawn-queue.
+
+export type AgentPhase = "queued" | "running" | "terminal";
+
+/** Result of one stop request (also what is logged). */
+export interface StopOutcome {
+  agentId: string;
+  phase: AgentPhase | "unknown";
+  outcome: "stopped" | "ignored";
+}
+
+/** What a run registers so it can be stopped. */
+export interface AgentControl {
+  phase(): AgentPhase;
+  /** Request a stop; false when the run already has an end reason. */
+  stop(): boolean;
+}
+
+export interface AgentControlRegistry {
+  /** Register a run; returns its unregister function. */
+  register(agentId: string, control: AgentControl): () => void;
+  /** Stop one subagent of this activation. Never throws; always logs. */
+  stop(agentId: unknown): StopOutcome;
+  /** Number of registered (non-finished) runs. */
+  size(): number;
+}
+
+export function createAgentControlRegistry(): AgentControlRegistry {
+  const controls = new Map<string, AgentControl>();
+  return {
+    register(agentId, control) {
+      controls.set(agentId, control);
+      return () => {
+        if (controls.get(agentId) === control) controls.delete(agentId);
+      };
+    },
+    stop(raw) {
+      const agentId = typeof raw === "string" ? raw : String(raw);
+      const control = typeof raw === "string" && raw !== "" ? controls.get(raw) : undefined;
+      let result: StopOutcome;
+      if (!control) {
+        result = { agentId, phase: "unknown", outcome: "ignored" };
+      } else {
+        const phase = control.phase();
+        const stopped = phase !== "terminal" && control.stop();
+        result = { agentId, phase, outcome: stopped ? "stopped" : "ignored" };
+      }
+      console.warn("[pi-dashboard-subagents] subagents:stop", result);
+      return result;
+    },
+    size() {
+      return controls.size;
+    },
+  };
 }
 
 /**
@@ -1202,7 +1334,7 @@ interface AgentToolArgs {
   isolated?: boolean;
 }
 
-function makeAgentTool(pi: ExtensionAPI, exposeIsolated: boolean) {
+function makeAgentTool(pi: ExtensionAPI, exposeIsolated: boolean, controls?: AgentControlRegistry) {
   return defineTool({
     name: AGENT_TOOL_NAME,
     label: "Agent",
@@ -1222,7 +1354,7 @@ function makeAgentTool(pi: ExtensionAPI, exposeIsolated: boolean) {
       onUpdate: AgentToolUpdateCallback<AgentDetails> | undefined,
       ctx: ExtensionContext,
     ): Promise<AgentToolResult<AgentDetails>> {
-      return runAgentTool(ctx.cwd, params, signal, onUpdate, ctx, pi, toolCallId) as Promise<
+      return runAgentTool(ctx.cwd, params, signal, onUpdate, ctx, pi, toolCallId, controls) as Promise<
         AgentToolResult<AgentDetails>
       >;
     },
@@ -1268,9 +1400,44 @@ export async function runAgentTool(
   pi: ExtensionAPI,
   /** Parent `Agent` tool call id, echoed on every `subagents:entry`. */
   toolCallId = "",
+  /** Activation's control registry; when set, `subagents:stop` can stop this run. */
+  controls?: AgentControlRegistry,
 ): Promise<AgentToolResultWithError<AgentDetails>> {
   const agentId = randomUUID();
+  /** Call-creation time; `durationMs` counts from here (queue time included). */
   const startedAt = Date.now();
+
+  // ── Per-agent abort, linked to the parent signal ──
+  // The first end reason wins: a parent abort keeps today's `aborted`
+  // outcome, a `subagents:stop` yields `stopped`. See change:
+  // manage-subagent-spawn-queue.
+  const ctrl = new AbortController();
+  let endReason: "parent" | { stop: "queued" | "running" } | undefined;
+  let phase: AgentPhase = "queued";
+  let slotGrantedAt: number | undefined;
+  let queueInfo: QueueInfo | undefined;
+  const onParentAbort = (): void => {
+    if (endReason) return;
+    endReason = "parent";
+    ctrl.abort();
+  };
+  if (signal?.aborted) onParentAbort();
+  else signal?.addEventListener("abort", onParentAbort, { once: true });
+  const unregister = controls?.register(agentId, {
+    phase: () => phase,
+    stop: () => {
+      if (endReason || phase === "terminal") return false;
+      endReason = { stop: phase };
+      ctrl.abort();
+      return true;
+    },
+  });
+  /** Detach from the parent + registry. Idempotent; runs on every exit path. */
+  function releaseControl(): void {
+    phase = "terminal";
+    signal?.removeEventListener("abort", onParentAbort);
+    unregister?.();
+  }
 
   // ── Resolve the agent .md (4-tier: project → user → bundled → package) ──
   // Ensure the package discovery index is built (fallback for hosts that never
@@ -1337,13 +1504,25 @@ export async function runAgentTool(
   const usage = createUsageAccumulator();
   // One throttled emitter feeding BOTH legs (dashboard progress + the tool's
   // `onUpdate`), so a chatty child cannot flood the parent's event loop.
-  const progress = createProgressEmitter((details) => {
+  const progressSink = (details: AgentDetails): void => {
     emitSubagentProgress(pi, { agentId, details });
     onUpdate?.({
       content: [{ type: "text", text: activity ?? "(running…)" }],
       details,
     });
-  });
+  };
+  const progress = createProgressEmitter(progressSink);
+  /**
+   * Queue frames go to the tool's `onUpdate` ONLY: re-pushing every waiter on
+   * the bus would grow bus volume with the square of the queue length. Bus
+   * consumers get the initial place on `subagents:created`.
+   */
+  function pushQueuedFrame(details: AgentDetails): void {
+    onUpdate?.({
+      content: [{ type: "text", text: `queued #${details.queuePosition ?? "?"}` }],
+      details,
+    });
+  }
 
   let session: Awaited<ReturnType<typeof createAgentSession>>["session"] | undefined;
   let unsubscribe: (() => void) | undefined;
@@ -1370,6 +1549,15 @@ export async function runAgentTool(
       agentMdSource,
       agentMdPkg,
       error,
+      stoppable: true,
+      ...(status === "queued"
+        ? {
+            queuePosition: queueInfo?.queuePosition,
+            activeSlots: queueInfo?.activeSlots ?? activeSpawns,
+            maxConcurrent: queueInfo?.maxConcurrent ?? getMaxConcurrent(),
+          }
+        : {}),
+      slotGrantedAt,
     });
   }
 
@@ -1411,6 +1599,51 @@ export async function runAgentTool(
     return errorResult(bounded.text, bounded.details);
   }
 
+  /**
+   * User/plugin stop (`subagents:stop`): `subagents:completed` with
+   * `status: "stopped"` and a NON-error result, so the parent turn goes on.
+   * See change: manage-subagent-spawn-queue.
+   */
+  function stopWith(stopPhase: "queued" | "running"): AgentToolResultWithError<AgentDetails> {
+    const partial = stopPhase === "running" ? (lastAssistant?.text.trim() ?? "") : "";
+    const resultText =
+      stopPhase === "queued"
+        ? "Subagent removed from queue before starting."
+        : partial
+          ? `Subagent stopped by user.\n\n${partial}`
+          : "Subagent stopped by user.";
+    const details: AgentDetails = { ...snapshotDetails("stopped"), stopReason: stopPhase };
+    emitSubagentCompleted(pi, {
+      agentId,
+      result: resultText,
+      durationMs: Date.now() - startedAt,
+      tokens: usage.totals(),
+      toolUses,
+      details,
+    });
+    pushTerminalUpdate(details);
+    const bounded = boundToolResult(resultText, details, limits);
+    return { content: [{ type: "text", text: bounded.text }], details: bounded.details };
+  }
+
+  /** Outcome once the run's own signal aborted: whichever reason came first. */
+  function endedByAbort(): AgentToolResultWithError<AgentDetails> {
+    if (endReason && endReason !== "parent") return stopWith(endReason.stop);
+    return failWith("aborted", "aborted by parent", "Subagent aborted by parent.");
+  }
+
+  // ── Concurrency gate ──
+  // Requested synchronously so the created snapshot already carries this
+  // call's queue position; awaited AFTER the card is on screen and BEFORE
+  // any loader / session work, so queued spawns cost nothing but a promise.
+  let announced = false;
+  const slot = acquireSpawnSlot(ctrl.signal, (info) => {
+    queueInfo = info;
+    // Batched queue frames bypass the throttle: one per waiter per change.
+    if (announced && phase === "queued") pushQueuedFrame(snapshotDetails("queued"));
+  });
+  slot.catch(() => {}); // handled at the await below
+
   // Emit created BEFORE we touch any other infrastructure so the dashboard
   // gets a card on screen as fast as possible.
   const initialDetails = snapshotDetails("queued");
@@ -1420,27 +1653,31 @@ export async function runAgentTool(
     description: args.description,
     details: initialDetails,
   });
+  announced = true;
+  if (queueInfo) pushQueuedFrame(initialDetails); // waiting: give the tool card its place
 
-  // ── Concurrency gate ──
-  // Acquired AFTER the card is on screen (status `queued`) and BEFORE any
-  // loader / session work, so queued spawns cost nothing but a promise.
   let releaseSlot: (() => void) | undefined;
   try {
-    releaseSlot = await acquireSpawnSlot(signal);
+    releaseSlot = await slot;
+    phase = "running";
+    slotGrantedAt = Date.now();
+    queueInfo = undefined;
   } catch (err) {
     // Only an abort-while-queued is expected here; anything else is reported
     // as a genuine failure rather than masquerading as a parent abort.
     progress.dispose();
-    if (err instanceof SpawnAbortedError) {
-      return failWith("aborted", "aborted by parent", "Subagent aborted by parent.");
+    try {
+      if (err instanceof SpawnAbortedError) return endedByAbort();
+      const message = err instanceof Error ? err.message : String(err);
+      return failWith("error", message, `Subagent failed: ${message}`);
+    } finally {
+      releaseControl();
     }
-    const message = err instanceof Error ? err.message : String(err);
-    return failWith("error", message, `Subagent failed: ${message}`);
   }
 
   try {
     // Stop may land between slot grant and here.
-    throwIfAborted(signal);
+    throwIfAborted(ctrl.signal);
     // ── Effective model ref: tool-call `args.model` > .md frontmatter ──
     // Per spec agent-md-frontmatter precedence rule + spec subagent-emission
     // "Tool-call `args.model` SHALL take precedence over `agentConfig.model`".
@@ -1513,7 +1750,7 @@ export async function runAgentTool(
     const resourceLoader = await createChildLoader(cwd);
     // pi's session.abort() is a no-op before a run starts, so a Stop pressed
     // during construction must be checked here, not relayed.
-    throwIfAborted(signal);
+    throwIfAborted(ctrl.signal);
     const parentRuntime = getParentModelRuntime(ctx);
     const effectiveThinking: ThinkingLevelString | undefined =
       resolvedThinkingLevel ??
@@ -1541,7 +1778,7 @@ export async function runAgentTool(
       ...(effectiveThinking ? { thinkingLevel: effectiveThinking } : {}),
     });
     session = createResult.session; // assigned first: `finally` disposes it
-    throwIfAborted(signal);
+    throwIfAborted(ctrl.signal);
     modelName = session.model?.id;
     // Requested level; snapshots prefer the session's live (possibly clamped) one.
     thinkingLevel = effectiveThinking;
@@ -1649,15 +1886,13 @@ export async function runAgentTool(
       pushUpdate("running");
     });
 
-    // ── Wire parent abort to subagent ──
-    if (signal) {
-      const onAbort = () => {
-        void session?.abort();
-      };
-      abortHandler = onAbort;
-      if (signal.aborted) onAbort();
-      else signal.addEventListener("abort", onAbort, { once: true });
-    }
+    // ── Wire this run's abort (parent or stop) to the subagent ──
+    const onAbort = () => {
+      void session?.abort();
+    };
+    abortHandler = onAbort;
+    if (ctrl.signal.aborted) onAbort();
+    else ctrl.signal.addEventListener("abort", onAbort, { once: true });
 
     // ── Announce running ──
     const startDetails = snapshotDetails("running");
@@ -1671,11 +1906,11 @@ export async function runAgentTool(
     // ── Run the subagent turn(s) ──
     await session.prompt(effectivePrompt);
 
-    // ── Aborted via parent signal? ──
-    if (signal?.aborted) {
+    // ── Aborted (parent) or stopped (`subagents:stop`)? ──
+    if (endReason) {
       blockDeltas.dispose();
       progress.flush();
-      return failWith("aborted", "aborted by parent", "Subagent aborted by parent.");
+      return endedByAbort();
     }
 
     // ── Outcome: the final assistant message decides ──
@@ -1702,20 +1937,14 @@ export async function runAgentTool(
   } catch (err) {
     blockDeltas.dispose();
     progress.flush();
-    if (err instanceof SpawnAbortedError) {
-      return failWith("aborted", "aborted by parent", "Subagent aborted by parent.");
-    }
+    // A child that rejects because it was aborted reports the abort reason.
+    if (err instanceof SpawnAbortedError || endReason) return endedByAbort();
     const message = err instanceof Error ? err.message : String(err);
     return failWith("error", message, `Subagent failed: ${message}`);
   } finally {
+    releaseControl();
     releaseSlot?.();
-    if (abortHandler && signal) {
-      try {
-        signal.removeEventListener("abort", abortHandler);
-      } catch {
-        /* ignore */
-      }
-    }
+    if (abortHandler) ctrl.signal.removeEventListener("abort", abortHandler);
     if (unsubscribe) {
       try {
         unsubscribe();
@@ -1788,7 +2017,18 @@ function errorResult(text: string, details: AgentDetails): AgentToolResultWithEr
  */
 export default function activate(pi: ExtensionAPI): void {
   const exposeIsolated = shouldExposeInheritanceInTool();
-  pi.registerTool(makeAgentTool(pi, exposeIsolated));
+  // Per-activation: a stop on this session's bus reaches only its subagents.
+  const controls = createAgentControlRegistry();
+  pi.registerTool(makeAgentTool(pi, exposeIsolated, controls));
+
+  // `subagents:stop { agentId }` stops one queued or running subagent.
+  // See change: manage-subagent-spawn-queue.
+  const bus = pi.events as { on?: (channel: string, h: (data: unknown) => void) => unknown } | undefined;
+  if (typeof bus?.on === "function") {
+    bus.on("subagents:stop", (data) => {
+      controls.stop((data as { agentId?: unknown } | undefined)?.agentId);
+    });
+  }
 
   // Build/refresh the package-agent discovery index whenever pi (re)discovers
   // resources. `cwd` is NOT available at activate() — it arrives on the event.

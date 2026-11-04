@@ -43,7 +43,7 @@ TBD - created by syncing change reduce-fanout-parent-stall. Update Purpose after
 
 ### Requirement: Concurrent child runs SHALL be bounded by `maxConcurrent`
 
-`DashboardAgentSettings` SHALL gain `maxConcurrent: number` (default `4`; `0` = unlimited). The extension SHALL hold a process-wide FIFO semaphore; an `Agent` call SHALL emit `subagents:created` with `status: "queued"` immediately, acquire the semaphore BEFORE loader access and `createAgentSession`, and release it when the run reaches a terminal state.
+`maxConcurrent` (default `4`, `0` = unlimited, clamped to 0–64) SHALL bound a process-wide FIFO semaphore. An `Agent` call SHALL emit `subagents:created` (`queued`) at once, acquire a slot before loader and session work, and release it on its terminal state. A call SHALL be granted at once only when no call is waiting. While calls wait, the limit SHALL be re-checked about every second.
 
 #### Scenario: excess calls wait in queued status
 
@@ -72,6 +72,34 @@ TBD - created by syncing change reduce-fanout-parent-stall. Update Purpose after
 - **GIVEN** the config file is edited to `maxConcurrent: 1` after activation
 - **WHEN** the next `Agent` call runs
 - **THEN** the new value SHALL apply without `/reload`
+
+#### Scenario: raising the limit starts waiting calls
+
+- **GIVEN** `maxConcurrent: 4`, 4 running and 3 waiting
+- **WHEN** the config file is edited to `maxConcurrent: 6`
+- **THEN** 2 waiting calls SHALL start within about 2 seconds, in queue order
+
+#### Scenario: a new call does not jump the queue
+
+- **GIVEN** calls are waiting and the limit was just raised
+- **WHEN** a new `Agent` call arrives before the re-check runs
+- **THEN** it SHALL wait behind the earlier waiters
+
+#### Scenario: lowering the limit stops nothing
+
+- **GIVEN** 4 running
+- **WHEN** the limit is lowered to 2
+- **THEN** all 4 SHALL keep running and no new call SHALL start until fewer than 2 run
+
+#### Scenario: out-of-range values are clamped
+
+- **WHEN** the config sets `maxConcurrent: 10000`
+- **THEN** the effective limit SHALL be 64
+
+#### Scenario: re-check stops when the queue is empty
+
+- **WHEN** the last waiting call starts or is removed
+- **THEN** no periodic re-check SHALL remain scheduled
 
 ### Requirement: Parent abort SHALL be honored during child construction
 

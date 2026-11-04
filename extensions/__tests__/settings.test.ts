@@ -124,6 +124,30 @@ describe("maxConcurrent", () => {
     }
   });
 
+  // See change: manage-subagent-spawn-queue.
+  it.each([
+    [10_000, 64],
+    [65, 64],
+    [64, 64],
+    [63, 63],
+    [0, 0],
+    [3.7, 3],
+    [Number.MAX_SAFE_INTEGER, 64],
+  ])("clamps maxConcurrent %p to %p", (raw, effective) => {
+    saveSettings({}); // ensure the config dir exists
+    writeFileSync(getSettingsPath(), JSON.stringify({ maxConcurrent: raw }));
+    invalidateSettingsCache();
+    expect(loadSettings().maxConcurrent).toBe(effective);
+    expect(getMaxConcurrent()).toBe(effective);
+  });
+
+  it("clamps on save too", () => {
+    saveSettings({ maxConcurrent: 500 });
+    expect(loadSettings().maxConcurrent).toBe(64);
+    invalidateSettingsCache();
+    expect(loadSettings().maxConcurrent).toBe(64);
+  });
+
   it("getMaxConcurrent picks up a hand-edit without an explicit invalidate", async () => {
     saveSettings({ maxConcurrent: 5 });
     expect(getMaxConcurrent()).toBe(5);

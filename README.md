@@ -64,7 +64,7 @@ Two persistent settings live at:
 | `inheritance.recentTurns`  | Verbatim turn pairs kept (default 6).                                                            |
 | `inheritance.toolOutputWindow` | Recent turns where tool outputs stay verbatim (default 2).                                   |
 | `inheritance.maxChars`     | Hard cap on the compressed context (default 24000 chars ≈ 6K tokens).                            |
-| `maxConcurrent`            | Maximum subagents running at once in this process (default 4). Extra spawns wait FIFO and their dashboard card shows `queued` until a slot frees. `0` = unlimited (the pre-0.2.5 behaviour). Re-read from disk per spawn — no `/reload` needed. |
+| `maxConcurrent`            | Maximum subagents running at once in this process (default 4, clamped to 0–64). Extra spawns wait FIFO and their dashboard card shows `queued` (with `queuePosition`) until a slot frees. `0` = unlimited (the pre-0.2.5 behaviour). Re-read from disk per spawn, and every ~1 s while calls wait, so raising it starts waiting calls live; lowering it never stops running ones. |
 | `resultMaxChars`           | Cap on the result text in the tool result pi saves to the parent session (default 16000). Head and tail are kept around a `[… N chars truncated …]` marker. `0` = unlimited. Re-read per spawn. |
 | `detailsMaxChars`          | Cap on the serialized `details.entries` in that saved tool result (default 20000). Head and tail entries are kept around one `[N timeline entries omitted]` entry; `details.entriesOmitted` = N. `0` = unlimited. |
 | `entryFieldMaxChars`       | Cap on each timeline entry's text / tool input / tool output in that saved tool result (default 2000). `0` = unlimited. |
@@ -99,6 +99,16 @@ or extend each subagent. Tool, provider and `message_end` hooks still run.
   earlier turn is never returned as the result.
 - **Stop** is honored at every stage: while queued, while the child loader is
   built, and while the session is created. An early Stop sends no model request.
+- **Per-subagent stop.** `pi.events.emit("subagents:stop", { agentId })` stops
+  ONE subagent of the session whose bus received it, without touching the
+  parent turn or its siblings. A queued one leaves the queue without using a
+  slot; a running one has only its child aborted and frees its slot for the
+  next waiter. It ends `status: "stopped"` (`stopReason: "queued" | "running"`)
+  on `subagents:completed` with a **non-error** tool result
+  (`Subagent removed from queue before starting.` / `Subagent stopped by user.`
+  plus any partial output), so the parent continues. Whichever comes first,
+  stop or parent abort, decides the outcome. Unknown or finished ids are
+  ignored; every request is logged. Snapshots carry `stoppable: true`.
 
 Four usage modes:
 
@@ -525,6 +535,18 @@ dashboard) can consume all six:
 | `subagents:completed`   | `subagent_completed`     | `await session.prompt(...)` resolves and the final assistant reply succeeded with text |
 | `subagents:failed`      | `subagent_failed`        | Any throw, abort, errored/empty final reply, or session error path |
 
+Inbound control channel (listened to, never emitted):
+
+| Channel           | Payload       | Effect |
+| ----------------- | ------------- | ------ |
+| `subagents:stop`  | `{ agentId }` | Stops that queued or running subagent of this session → `subagents:completed` with `details.status: "stopped"` |
+
+While calls wait for a slot, every queue change (slot granted, waiter removed,
+limit changed) re-pushes a queued snapshot to each remaining waiter, batched to
+one frame per waiter per task, through the tool's `onUpdate`
+(`tool_execution_update`) only. The bus gets each call's initial place on
+`subagents:created`, so bus volume stays proportional to the number of runs.
+
 Progress emissions are throttled to **≤4 per second per subagent** (`PROGRESS_THROTTLE_MS = 250`). The final progress snapshot is always flushed before `completed`/`failed`.
 
 `subagents:delta` carries the block currently streaming as exact, append-only
@@ -594,6 +616,12 @@ The `details` payload (defined in `extensions/events.ts`) carries everything the
 | `agentMdSource?` | `"project" \| "user" \| "bundled" \| "package"` | Tier that supplied `agentMdPath`. v0.2.0+ (`"package"` added in the package-discovery tier). Undefined when path is undefined or producer is older. |
 | `agentMdPkg?`  | `string`                        | Originating package `source` string when `agentMdSource === "package"` (e.g. `"@acme/pi-reviewers"`); undefined otherwise |
 | `error?`       | `string`                        | Set on `failed` emissions                                                |
+| `stoppable?`   | `true`                          | Producer honours `subagents:stop`; on every snapshot (0.6.0+)            |
+| `stopReason?`  | `"queued" \| "running"`         | Phase the stop landed in; only when `status === "stopped"`               |
+| `queuePosition?` | `number`                      | 1-based place in the spawn FIFO, no gaps; only while waiting             |
+| `activeSlots?` | `number`                        | Slots in use; only on queued snapshots                                   |
+| `maxConcurrent?` | `number`                      | Effective limit (`0` = unlimited); only on queued snapshots              |
+| `slotGrantedAt?` | `number`                      | Epoch ms the slot was granted; `durationMs` still counts from creation   |
 
 ### `SubagentTimelineEntry` kinds
 

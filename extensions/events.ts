@@ -117,6 +117,22 @@ export interface AgentDetails {
    */
   agentMdPkg?: string;
   error?: string;
+  /**
+   * `true` when this producer honours `subagents:stop { agentId }`; the
+   * dashboard offers a stop control only when set. See change:
+   * manage-subagent-spawn-queue.
+   */
+  stoppable?: boolean;
+  /** Phase a stop landed in; set only when `status === "stopped"`. */
+  stopReason?: "queued" | "running";
+  /** 1-based place in the spawn FIFO, without gaps. Set only while waiting. */
+  queuePosition?: number;
+  /** Spawn slots in use at snapshot time. Set only on queued snapshots. */
+  activeSlots?: number;
+  /** Effective `maxConcurrent` (`0` = unlimited). Set only on queued snapshots. */
+  maxConcurrent?: number;
+  /** Epoch ms the spawn slot was granted. `durationMs` still counts from call creation. */
+  slotGrantedAt?: number;
 }
 
 export interface TokenUsage {
@@ -577,6 +593,13 @@ export function buildDetails(snapshot: {
    */
   agentMdPkg?: string;
   error?: string;
+  /** Queue / stop fields; see `AgentDetails`. Omitted from the output when unset. */
+  stoppable?: boolean;
+  stopReason?: "queued" | "running";
+  queuePosition?: number;
+  activeSlots?: number;
+  maxConcurrent?: number;
+  slotGrantedAt?: number;
 }): AgentDetails {
   return {
     agentId: snapshot.agentId,
@@ -601,5 +624,11 @@ export function buildDetails(snapshot: {
     agentMdSource: snapshot.agentMdSource,
     agentMdPkg: snapshot.agentMdPkg,
     error: snapshot.error,
+    ...(snapshot.stoppable !== undefined ? { stoppable: snapshot.stoppable } : {}),
+    ...(snapshot.stopReason !== undefined ? { stopReason: snapshot.stopReason } : {}),
+    ...(snapshot.queuePosition !== undefined ? { queuePosition: snapshot.queuePosition } : {}),
+    ...(snapshot.activeSlots !== undefined ? { activeSlots: snapshot.activeSlots } : {}),
+    ...(snapshot.maxConcurrent !== undefined ? { maxConcurrent: snapshot.maxConcurrent } : {}),
+    ...(snapshot.slotGrantedAt !== undefined ? { slotGrantedAt: snapshot.slotGrantedAt } : {}),
   };
 }

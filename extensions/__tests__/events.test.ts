@@ -424,3 +424,35 @@ describe("formatTokens", () => {
     expect(formatTokens(2_300_000)).toBe("2.3M");
   });
 });
+
+// ── queue info + stop fields (change: manage-subagent-spawn-queue) ─────
+
+describe("buildDetails queue/stop fields", () => {
+  it("passes queue info and stop fields through when set", () => {
+    const d = snapshot({
+      status: "queued",
+      queuePosition: 3,
+      activeSlots: 4,
+      maxConcurrent: 4,
+      stoppable: true,
+    });
+    expect(d).toMatchObject({ queuePosition: 3, activeSlots: 4, maxConcurrent: 4, stoppable: true });
+
+    const s = snapshot({ status: "stopped", stopReason: "running", slotGrantedAt: 123, stoppable: true });
+    expect(s).toMatchObject({ status: "stopped", stopReason: "running", slotGrantedAt: 123 });
+  });
+
+  it("omits the keys entirely when unset (clean wire shape)", () => {
+    const d = snapshot();
+    for (const k of ["queuePosition", "activeSlots", "maxConcurrent", "slotGrantedAt", "stopReason", "stoppable"]) {
+      expect(d, k).not.toHaveProperty(k);
+    }
+  });
+
+  it("keeps maxConcurrent 0 and queuePosition-free queued snapshots", () => {
+    const d = snapshot({ status: "queued", activeSlots: 0, maxConcurrent: 0 });
+    expect(d.maxConcurrent).toBe(0);
+    expect(d.activeSlots).toBe(0);
+    expect(d).not.toHaveProperty("queuePosition");
+  });
+});

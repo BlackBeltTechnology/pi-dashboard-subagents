@@ -61,8 +61,9 @@ export interface DashboardAgentSettings {
   inheritance: InheritanceCompressionSettings;
   /**
    * Maximum number of subagent sessions running at once in this process.
-   * Excess spawns wait FIFO in `queued` status. `0` = unlimited.
-   * Default: 4.
+   * Excess spawns wait FIFO in `queued` status. `0` = unlimited; clamped to
+   * 64. Waiting calls re-check it about every second, so raising it applies
+   * live. Default: 4.
    */
   maxConcurrent: number;
   /**
@@ -177,8 +178,12 @@ function coerceLimit(value: unknown, fallback: number): number {
   return Math.floor(value);
 }
 
+/** Hard ceiling for `maxConcurrent`; a hand-edited 10000 must not run as-is. */
+export const MAX_CONCURRENT_CEILING = 64;
+
+/** Like `coerceLimit`, then clamped to `[0, 64]`. See change: manage-subagent-spawn-queue. */
 function coerceMaxConcurrent(value: unknown): number {
-  return coerceLimit(value, DEFAULT_SETTINGS.maxConcurrent);
+  return Math.min(MAX_CONCURRENT_CEILING, coerceLimit(value, DEFAULT_SETTINGS.maxConcurrent));
 }
 
 // ─── Write ───────────────────────────────────────────────────────────────

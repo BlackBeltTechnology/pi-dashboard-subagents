@@ -96,7 +96,7 @@ describe("real faux-provider entry stream", () => {
     activate(pi);
     const ctx: any = { cwd, modelRegistry };
     const of = (channel: string) => log.filter((e) => e.channel === channel).map((e) => e.data);
-    return { piAi, registration, modelRuntime, model, tool: tools[0], ctx, of, log };
+    return { piAi, registration, modelRuntime, model, tool: tools[0], ctx, of, log, bus };
   }
 
   it("rebuilds the exact final timeline from subagents:entry alone; progress stays thin", async () => {
@@ -328,6 +328,67 @@ describe("real faux-provider entry stream", () => {
       );
     } finally {
       modelRuntime.unregisterProvider(model.provider);
+    }
+  }, 30_000);
+  // See change: manage-subagent-spawn-queue.
+  it("subagents:stop on a real bus: stops a streaming child and a queued one; the parent result is not an error", async () => {
+    const configPath = join(agentDir, "extensions", "pi-dashboard-subagents", "config.json");
+    writeFileSync(configPath, JSON.stringify({ inheritContext: false, maxConcurrent: 1 }));
+    const warn = console.warn;
+    console.warn = () => {};
+    const { piAi, registration, modelRuntime, model, tool, ctx, of, bus } = await setup(150);
+    try {
+      const thought = Array.from({ length: 80 }, (_, i) => `slow-${i}`).join(" ");
+      registration.setResponses([
+        piAi.fauxAssistantMessage([piAi.fauxThinking(thought), piAi.fauxText("never reached")]),
+        piAi.fauxAssistantMessage("b finished"),
+      ]);
+      const call = (id: string, description: string) =>
+        tool.execute(id, { subagent_type: "faux-agent", description, prompt: "go", model: "@entry-faux" }, undefined, undefined, ctx);
+      const runA = call("call-a", "a");
+      const runB = call("call-b", "b");
+      const runC = call("call-c", "c");
+
+      const createdIds = () => of("subagents:created").map((d) => d.id as string);
+      await new Promise<void>((resolve) => {
+        const poll = () => (of("subagents:delta").length > 0 ? resolve() : setTimeout(poll, 10));
+        poll();
+      });
+      const [idA, idB, idC] = createdIds();
+      // B and C wait behind A; C sits at position 2.
+      const queuedC = of("subagents:created").find((d) => d.id === idC)!;
+      expect(queuedC.details).toMatchObject({ status: "queued", queuePosition: 2, maxConcurrent: 1, stoppable: true });
+
+      bus.emit("subagents:stop", { agentId: idC }); // queued
+      bus.emit("subagents:stop", { agentId: idA }); // streaming
+      const [a, b, c]: any[] = await Promise.all([runA, runB, runC]);
+
+      expect(a.isError).toBeUndefined();
+      expect(a.details).toMatchObject({ status: "stopped", stopReason: "running" });
+      expect(a.content[0].text.startsWith("Subagent stopped by user.")).toBe(true);
+      expect(c.isError).toBeUndefined();
+      expect(c.details).toMatchObject({ status: "stopped", stopReason: "queued" });
+      expect(c.details.entries).toEqual([]);
+      expect(b.details.status).toBe("completed");
+      expect(b.content[0].text).toBe("b finished");
+      expect(b.details.slotGrantedAt).toBeGreaterThan(0);
+
+      // Exactly one terminal event per subagent, all on subagents:completed.
+      for (const id of [idA, idB, idC]) {
+        const terminal = [...of("subagents:completed"), ...of("subagents:failed")].filter((d) => d.id === id);
+        expect(terminal, id).toHaveLength(1);
+      }
+      expect(of("subagents:failed")).toHaveLength(0);
+      // The streamed timeline of the stopped child still rebuilds exactly.
+      const rebuilt: any[] = [];
+      for (const s of of("subagents:entry").filter((e) => e.agentId === idA)) rebuilt[s.index] = s.entry;
+      expect(rebuilt).toEqual(a.details.entries);
+      // The stopped waiter never ran a child: no entries, no deltas.
+      expect(of("subagents:delta").filter((d) => d.agentId === idC)).toHaveLength(0);
+    } finally {
+      console.warn = warn;
+      modelRuntime.unregisterProvider(model.provider);
+      writeFileSync(configPath, JSON.stringify({ inheritContext: false, maxConcurrent: 0 }));
     }
   }, 30_000);
 });

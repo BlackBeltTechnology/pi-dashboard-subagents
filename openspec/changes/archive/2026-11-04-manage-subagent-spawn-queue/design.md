@@ -82,7 +82,7 @@ The parent turn therefore continues normally. `before_store`-style hooks are not
 
 `startedAt` stays the creation time, so `durationMs` keeps its meaning.
 
-Any change to the queue (push, grant, remove, limit change) sets a module flag and schedules one `queueMicrotask(flushPositions)`. `flushPositions` walks the remaining waiters and calls each `onPosition(i+1, activeSpawns, limit)`. That updates the snapshot and pushes it through the run's existing `pushUpdate("queued")` path, which feeds `onUpdate` and the progress bus emitter. The result is one frame per waiter per task.
+Any change to the queue (push, grant, remove, limit change) sets a module flag and schedules one `queueMicrotask(flushPositions)`. `flushPositions` walks the remaining waiters and calls each `onPosition(i+1, activeSpawns, limit)`. That updates the snapshot and pushes it to the tool's `onUpdate` only (`tool_execution_update`), bypassing the progress throttle. The result is one frame per waiter per task. Queued frames are deliberately NOT emitted on the bus: re-pushing every waiter there would grow bus volume with the square of the queue length (the opt-in fan-out memory test bounds `subagents:started` to 4 per run). Bus consumers get each call's initial position on `subagents:created`.
 
 ### D8. Fair granting and live re-check
 
