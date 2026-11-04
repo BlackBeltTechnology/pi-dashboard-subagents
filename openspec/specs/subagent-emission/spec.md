@@ -1,7 +1,7 @@
 # subagent-emission Specification
 
 ## Purpose
-TBD - created by archiving change scaffold-foreground-subagent-extension. Update Purpose after archive.
+Defines the `Agent` tool and what it emits: an in-memory foreground subagent per call, its `subagents:*` lifecycle and timeline events on pi's event bus, the `AgentDetails` payload the dashboard consumes, context inheritance, the per-call `model` override, and the extension settings file.
 
 ## Requirements
 
@@ -79,7 +79,7 @@ The dashboard bridge's emit intercept maps `subagents:*` channels to `subagent_*
 
 #### Scenario: terminal onUpdate always flushes
 
-- **WHEN** the run reaches `completed`, `error`, or `aborted`
+- **WHEN** the run reaches `completed`, `error`, `aborted`, or `stopped`
 - **THEN** the last `onUpdate` call SHALL carry `details.status` equal to that terminal status
 - **AND** it SHALL be delivered synchronously before the tool result resolves
 
@@ -152,9 +152,10 @@ Every emission's `details` field SHALL be an `AgentDetails` object matching the 
 - **GIVEN** an agent type matches a file at a resolved tier
 - **WHEN** the extension builds initial `AgentDetails`
 - **THEN** `details.agentMdPath` SHALL be set from `resolveAgentMdPath`'s result
-- **AND** the structure SHALL include the `source` field (`"project"`, `"user"`, or `"bundled"`) reflecting which tier resolved the .md file
+- **AND** `details.agentMdSource` SHALL be set (`"project"`, `"user"`, `"bundled"`, or `"package"`) reflecting which tier resolved the .md file
+- **AND** `details.agentMdPkg` SHALL carry the originating package source string only when `agentMdSource` is `"package"`
 - **AND WHEN** no matching file exists (built-in or anonymous agent)
-- **THEN** `details.agentMdPath` SHALL be undefined
+- **THEN** `details.agentMdPath` and `details.agentMdSource` SHALL be undefined
 
 #### Scenario: Token usage uses raw breakdown on completion
 
@@ -164,16 +165,7 @@ Every emission's `details` field SHALL be an `AgentDetails` object matching the 
 
 ### Requirement: Context inheritance SHALL be compressed via verbatim compaction by default
 
-When inheritance is on, the extension SHALL prepend a compressed copy of the parent's conversation to the subagent's prompt. The compression SHALL be verbatim-compaction (no LLM call, zero hallucination risk).
-
-The extension SHALL read parent messages via pi-coding-agent's `ReadonlySessionManager` interface exposed at `ctx.sessionManager`. The specific API used SHALL be `getBranch(fromId?)`, which returns the current branch's entries in leaf→root path order. The extension SHALL filter those entries to those of `type === "message"`, extract `entry.message` (an `AgentMessage`), further filter to messages with role `"user"` or `"assistant"`, and reverse to chronological (root→leaf) order before feeding the result into the verbatim-compaction routine.
-
-The extension SHALL NOT call any of the following because they do not exist on `ReadonlySessionManager`:
-
-- `sessionManager.getMessages()` (never existed; the v0.1.1 shipped `extensions/events.ts:393–394` mistakenly references it via defensive optional chaining and silently returns no inherited context)
-- `sessionManager.buildSessionContext()` (exists on the full `SessionManager` but is NOT part of the `Pick` set exposed as `ReadonlySessionManager`)
-
-The extension MAY use defensive optional chaining (`sm?.getBranch?.()`) to soft-fail on future SDK shape changes, but the method name MUST be the real one.
+When inheritance is on, the extension SHALL prepend a compressed copy of the parent's conversation to the subagent's prompt. The compression SHALL be verbatim compaction: no LLM call, zero hallucination risk.
 
 #### Scenario: Parent messages are read via getBranch + filter
 
@@ -228,6 +220,16 @@ The extension MAY use defensive optional chaining (`sm?.getBranch?.()`) to soft-
 - **THEN** the middle portion SHALL be replaced with `"[…middle omitted for length…]"`
 - **AND** the first ~40% of `maxChars` SHALL be preserved (head, including first turn)
 - **AND** the trailing portion SHALL be preserved (most recent turns)
+
+### Requirement: Parent conversation SHALL be read through `ReadonlySessionManager.getBranch()`
+
+The extension SHALL read parent messages via `ctx.sessionManager.getBranch()`, which returns the current branch leaf→root. It SHALL keep entries with `type === "message"`, extract `entry.message`, keep roles `"user"` and `"assistant"`, and reverse to root→leaf order before compression. It SHALL NOT call `getMessages()` or `buildSessionContext()`, which are not on `ReadonlySessionManager`. It MAY use optional chaining (`sm?.getBranch?.()`) to soft-fail on SDK shape changes.
+
+#### Scenario: Missing getBranch degrades to no context
+
+- **GIVEN** `ctx.sessionManager` has no `getBranch` method
+- **WHEN** `buildInheritedContext(ctx, { isolated: false })` is invoked
+- **THEN** it SHALL return `""` without throwing
 
 ### Requirement: The Agent tool's JSON schema SHALL be controllable via the `exposeInheritanceInTool` setting
 
@@ -286,18 +288,22 @@ The extension SHALL persist its settings at this path. Missing files / malformed
 - **THEN** the config file SHALL be written via a tmp+rename sequence
 - **AND** the in-memory cache SHALL reflect the new value on the next `loadSettings()` call
 
-#### Scenario: Setting changes require /reload (same-session caveat)
+#### Scenario: Tool-schema setting changes require /reload
 
-- **GIVEN** the user edits `config.json` while pi is running
+- **GIVEN** the user edits `exposeInheritanceInTool` in `config.json` while pi is running
 - **WHEN** the user does NOT run `/reload`
-- **THEN** the extension SHALL continue using the cached settings from initial activation
-- **AND** running `/reload` (or starting a new pi session) SHALL re-trigger activation and pick up the new values
+- **THEN** the registered tool's schema SHALL stay as built at activation
+- **AND** running `/reload` (or starting a new pi session) SHALL re-activate the extension and rebuild the schema
+
+#### Scenario: Per-spawn settings apply without /reload
+
+- **GIVEN** the user edits `maxConcurrent` or a result-size limit in `config.json` while pi is running
+- **WHEN** the next `Agent` call runs
+- **THEN** the new value SHALL apply without `/reload` (see capabilities `subagent-spawn-cost` and `subagent-result-bounds`)
 
 ### Requirement: The `Agent` tool's parameter schema SHALL accept an optional `model` field for per-call model override
 
-The tool's TypeBox parameter schema SHALL include an optional string field named `model`. When present, its value SHALL be a non-empty string accepting any of the three input forms supported by the `model:resolve` event-bus contract: `"@role"`, `"provider/model-id[:thinking]"`, or bare `"model-id"`. When absent, the tool's behaviour SHALL be unchanged from the pre-change state.
-
-The field SHALL be documented in its schema description as accepting all three forms and as overriding any `.md` frontmatter `model` value when both are present.
+The tool's TypeBox parameter schema SHALL include an optional string field named `model`. When present, its value SHALL be a non-empty string in any of the three forms of the `model:resolve` contract: `"@role"`, `"provider/model-id[:thinking]"`, or bare `"model-id"`. When absent, the tool's behaviour SHALL be unchanged.
 
 #### Scenario: Schema declares the optional `model` field
 
@@ -310,6 +316,16 @@ The field SHALL be documented in its schema description as accepting all three f
 
 - **WHEN** the LLM inspects the `Agent` tool's top-level `description` field
 - **THEN** the description SHALL explain that the tool supports two modes: curated (when `subagent_type` matches an `.md` file) and inline (when no `.md` matches, callers can pass `model` directly)
+
+### Requirement: The `model` field description SHALL document its forms and precedence
+
+The schema description of the `model` field SHALL state that it accepts all three forms and that it overrides any `.md` frontmatter `model` value when both are present.
+
+#### Scenario: Field description documents forms and override
+
+- **WHEN** the LLM inspects the `model` field's schema description
+- **THEN** it SHALL name `@role`, `provider/model-id[:thinking]` and bare `model-id`
+- **AND** it SHALL state that the field overrides the agent `.md` `model:` value
 
 ### Requirement: `args.model` SHALL be resolved via the same `resolveModelFromRef` mechanism as `agentConfig.model`
 
@@ -353,9 +369,7 @@ When `args.model` is a non-empty string, the extension SHALL route it through th
 
 ### Requirement: Tool-call `args.model` SHALL take precedence over `agentConfig.model`
 
-When BOTH `args.model` and `agentConfig.model` are non-empty strings, the extension SHALL use `args.model` and ignore `agentConfig.model` for resolution. When `args.model` is absent and `agentConfig.model` is present, the existing frontmatter behaviour applies. When both are absent, no model override is passed to `createAgentSession`.
-
-The effective ref selection SHALL be expressible as: `const effectiveModelRef = args.model ?? agentConfig?.model;`.
+When both `args.model` and `agentConfig.model` are non-empty after trimming, the extension SHALL use `args.model` and ignore `agentConfig.model`. Empty or whitespace-only values SHALL count as absent. When only `agentConfig.model` is present, the frontmatter behaviour applies. Selection is implemented by `selectEffectiveModelRef(args.model, agentConfig?.model)`.
 
 #### Scenario: Tool-call model wins when both are set
 
@@ -371,10 +385,32 @@ The effective ref selection SHALL be expressible as: `const effectiveModelRef = 
 - **THEN** the resolver SHALL be invoked with `"@coding"`
 - **AND** the spawn SHALL behave identically to the pre-change frontmatter path
 
-#### Scenario: No-override path unchanged when both are absent
+#### Scenario: Empty args.model does not shadow frontmatter
 
-- **GIVEN** no `.md` matches `subagent_type` AND `args.model` is undefined
+- **GIVEN** the resolved `.md` has `model: "@coding"` AND `args.model` is `"  "`
+- **WHEN** the extension determines the effective model ref
+- **THEN** the resolver SHALL be invoked with `"@coding"`
+
+#### Scenario: No ref passes the parent's live model
+
+- **GIVEN** no `.md` matches `subagent_type` AND `args.model` is undefined AND the parent session runs model M
 - **WHEN** the `Agent` tool runs
 - **THEN** `resolveModelFromRef` SHALL NOT be called
-- **AND** `createAgentSession` SHALL be invoked with no `model` argument
-- **AND** the subagent SHALL run with pi's default model (parent inheritance, unchanged from today)
+- **AND** `createAgentSession` SHALL be invoked with `model: M` (the parent's live `ctx.model`)
+
+#### Scenario: No ref and no parent model omits the model key
+
+- **GIVEN** no `.md` model, no `args.model`, and `ctx.model` is undefined
+- **WHEN** the `Agent` tool runs
+- **THEN** `createAgentSession` SHALL be invoked with no `model` key
+- **AND** the SDK default model (settings `defaultModel`) SHALL apply
+
+### Requirement: With no model ref the subagent SHALL inherit the parent's live model
+
+When neither `args.model` nor `agentConfig.model` supplies a ref, the extension SHALL NOT call the resolver. The effective model SHALL be the parent session's live model (`ctx.model`), then the SDK default (settings `defaultModel`). The `model` key SHALL be omitted from `createAgentSession` options only when no parent live model exists.
+
+#### Scenario: Live model beats settings default
+
+- **GIVEN** the parent switched to model M via `/model` and `settings.json` has `defaultModel` D
+- **WHEN** a subagent is spawned with no model ref
+- **THEN** the subagent session SHALL start on M, not D

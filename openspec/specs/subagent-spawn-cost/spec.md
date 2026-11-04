@@ -1,13 +1,13 @@
 # subagent-spawn-cost Specification
 
 ## Purpose
-TBD - created by syncing change reduce-fanout-parent-stall. Update Purpose after archive.
+Keeps spawning many subagents cheap for the parent process: each child gets its own lean resource loader, concurrent children are bounded by a FIFO `maxConcurrent` queue, and a parent abort is honored while a child is still being constructed.
 
 ## Requirements
 
 ### Requirement: Child sessions SHALL receive an isolated lean resource loader
 
-`runAgentTool` SHALL pass a `resourceLoader` to every `createAgentSession` call. The loader SHALL be a `DefaultResourceLoader({ cwd, agentDir, noSkills: true, noPromptTemplates: true, noThemes: true, extensionsOverride })` constructed and `reload()`ed once per spawn. Loaders SHALL NOT be shared between concurrent child sessions. The `extensionsOverride` SHALL remove every extension's handlers for `turn_end`, `agent_end`, `agent_before_settle` and `agent_settled`, and SHALL leave all other handlers and all extension tools in place.
+`runAgentTool` SHALL pass a `resourceLoader` to every `createAgentSession` call. The loader SHALL be a `DefaultResourceLoader({ cwd, agentDir, noSkills: true, noPromptTemplates: true, noThemes: true, extensionsOverride })` constructed and `reload()`ed once per spawn. Loaders SHALL NOT be shared between concurrent child sessions.
 
 #### Scenario: each spawn gets its own loader
 
@@ -40,6 +40,16 @@ TBD - created by syncing change reduce-fanout-parent-stall. Update Purpose after
 - **THEN** none of those handlers SHALL be invoked for the child run
 - **AND** the same extension's `message_end` and `tool_call` handlers SHALL still be invoked
 - **AND** the parent session's handler maps SHALL be unchanged
+
+### Requirement: Child loaders SHALL strip settlement-event handlers only
+
+The loader's `extensionsOverride` SHALL remove every extension's handlers for `turn_end`, `agent_end`, `agent_before_settle` and `agent_settled`, and SHALL leave all other handlers and all extension tools in place.
+
+#### Scenario: Override touches only the child's extension objects
+
+- **WHEN** the override runs on a child loader's extension set
+- **THEN** only the four settlement event keys SHALL be deleted from each extension's handler map
+- **AND** every other handler key and every registered tool SHALL remain
 
 ### Requirement: Concurrent child runs SHALL be bounded by `maxConcurrent`
 

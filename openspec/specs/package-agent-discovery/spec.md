@@ -1,19 +1,11 @@
 # package-agent-discovery Specification
 
 ## Purpose
-TBD - created by archiving change add-package-agent-discovery-tier. Update Purpose after archive.
+Lets agents shipped inside installed pi packages (`agents/*.md`) be spawned by name, as the fourth and lowest-precedence agent resolution tier. Defines which packages are scanned, when the discovery index is built and cached, how name collisions resolve, and how discovery fails safely without affecting the other tiers.
 ## Requirements
 ### Requirement: The extension SHALL discover agents shipped by installed pi packages
 
-The extension SHALL scan every installed pi package for an `agents/` directory and register
-each `*.md` file found there as a spawnable agent type, keyed by the file's basename
-(`reviewer.md` → type `reviewer`). Discovery SHALL use `PackageManager.listConfiguredPackages()`
-to enumerate packages and SHALL scan `<installedPath>/agents/*.md` for each package that has a
-defined `installedPath`.
-
-Discovery SHALL be a passive read only. It SHALL NOT trigger a package install, clone, pull, or
-any network activity (i.e. it SHALL NOT call `PackageManager.resolve()` with an installing
-`onMissing`).
+The extension SHALL scan each eligible installed pi package (user scope, per the user-scope-only requirement) for an `agents/` directory and register each `*.md` file there as a spawnable agent type keyed by the file's basename (`reviewer.md` → type `reviewer`). It SHALL enumerate packages with `PackageManager.listConfiguredPackages()` and scan `<installedPath>/agents/*.md` for each package with a defined `installedPath`.
 
 #### Scenario: A package's agents/*.md become spawnable
 
@@ -50,14 +42,20 @@ any network activity (i.e. it SHALL NOT call `PackageManager.resolve()` with an 
 - **THEN** the source SHALL contribute a single entry from its `user`-scope form (the `project`-scope form is never indexed — see the user-scope-only requirement)
 - **AND** NO cross-package collision warning SHALL be emitted for this single logical package
 
+### Requirement: Package discovery SHALL be a passive read
+
+Discovery SHALL NOT trigger a package install, clone, pull, or any network activity. In particular it SHALL NOT call `PackageManager.resolve()` with an installing `onMissing`.
+
+#### Scenario: Discovery never installs
+
+- **GIVEN** a configured package whose `installedPath` is undefined because it is not installed
+- **WHEN** the discovery index is built
+- **THEN** no install, clone, pull or network call SHALL be made
+- **AND** that package SHALL contribute no entries
+
 ### Requirement: Package discovery SHALL be built lazily, cached, and rebuilt on reload
 
-The extension SHALL NOT build the index at `activate(pi)` (the extension factory receives no `cwd`).
-It SHALL build the index lazily from an `ExtensionContext` — from the `resources_discover` handler's
-`ctx`/event (on `reason` `"startup"` or `"reload"`) and/or on the first `Agent` spawn's `ctx` — using
-`cwd` (there is no trust signal to read — see the user-scope-only requirement). It SHALL cache the result (keyed by `cwd`) and reuse it for
-per-spawn resolution, which SHALL NOT walk the filesystem across all packages on each call. It SHALL
-rebuild when `cwd` changes or on `resources_discover` `reason: "reload"`.
+The extension SHALL NOT build the index in `activate(pi)`, because the factory receives no `cwd`. It SHALL build it lazily from a `cwd`: in the `resources_discover` handler (fired on `startup` and `reload`, using the event's `cwd`) and, as a fallback, on the first `Agent` spawn (using `ctx.cwd`). It SHALL rebuild on every `resources_discover` and when `cwd` differs from the cwd the cached index was built for.
 
 #### Scenario: Index is not built at activation
 
@@ -85,6 +83,16 @@ rebuild when `cwd` changes or on `resources_discover` `reason: "reload"`.
 - **WHEN** `resources_discover` fires with `reason: "reload"`
 - **THEN** the index SHALL be rebuilt
 - **AND** `x` SHALL become resolvable via the package tier without a full process restart
+
+### Requirement: Per-spawn resolution SHALL read the cached index
+
+The extension SHALL cache the built index keyed by `cwd` and reuse it for every package-tier resolution at that `cwd`. Per-spawn resolution SHALL NOT walk the filesystem across all packages on each call.
+
+#### Scenario: Cwd change rebuilds the cache
+
+- **GIVEN** the index was built for `/a`
+- **WHEN** an `Agent` call runs with `ctx.cwd === "/b"`
+- **THEN** the index SHALL be rebuilt for `/b` before resolution
 
 ### Requirement: Package-vs-package name collisions SHALL resolve deterministically
 
@@ -128,18 +136,7 @@ continue to function even when package discovery fails entirely.
 
 ### Requirement: Package discovery SHALL be user-scope-only and SHALL surface provenance
 
-Discovery SHALL scan ONLY packages with `scope === "user"` (installed into `<agentDir>` by the
-operator). Project-scoped packages SHALL NOT be indexed for agents, regardless of any trust state.
-The rationale is a deliberate conservative design choice, NOT an SDK limitation: installing a
-package into `<agentDir>` is the operator's explicit consent, and skipping project-scoped packages
-closes the untrusted-checkout injection surface entirely without having to reason about trust.
-(The SDK *does* expose a project-trust signal — `ExtensionContext.isProjectTrusted()` and
-`SettingsManagerCreateOptions.projectTrusted` exist — so a future opt-in MAY gate project scope on
-trust; that is deferred by choice, not a capability gap.)
-
-Provenance SHALL be surfaced: a package-sourced agent SHALL carry `source: "package"` and the
-originating package `source` string through to `AgentDetails`, and the operator SHALL be able to
-shadow any package agent by placing a project- or user-tier `.md` of the same name.
+Discovery SHALL scan ONLY packages with `scope === "user"` (installed into `<agentDir>` by the operator). Project-scoped packages SHALL NOT be indexed for agents, regardless of trust state. This is a deliberate choice, not an SDK limitation: skipping them closes the untrusted-checkout injection surface without reasoning about trust. A future opt-in MAY gate project scope on `ExtensionContext.isProjectTrusted()`.
 
 #### Scenario: Project-scoped package agents are never discovered
 
@@ -161,3 +158,13 @@ shadow any package agent by placing a project- or user-tier `.md` of the same na
 - **THEN** `resolveAgentMdPath("reviewer", cwd)` SHALL return `source: "project"`
 - **AND** the package-tier definition SHALL NOT be used
 
+### Requirement: Package-sourced agents SHALL carry provenance and be shadowable
+
+A package-sourced agent SHALL carry `source: "package"` and the originating package `source` string through to `AgentDetails` (`agentMdSource`, `agentMdPkg`). The operator SHALL be able to shadow any package agent by placing a project- or user-tier `.md` of the same name.
+
+#### Scenario: Provenance reaches AgentDetails
+
+- **GIVEN** an agent resolved from package `@acme/pi-reviewers`
+- **WHEN** `AgentDetails` is built
+- **THEN** `details.agentMdSource` SHALL be `"package"`
+- **AND** `details.agentMdPkg` SHALL be `"@acme/pi-reviewers"`

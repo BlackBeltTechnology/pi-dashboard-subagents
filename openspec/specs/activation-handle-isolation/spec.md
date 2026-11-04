@@ -1,7 +1,7 @@
 # activation-handle-isolation Specification
 
 ## Purpose
-TBD - created by syncing change fix-stale-pi-handle-on-reactivation. Update Purpose after archive.
+Keeps the `Agent` tool bound to the `pi` handle of the activation that registered it, so a nested subagent session that re-activates the extension cannot invalidate or replace the parent's handle. Guarantees a session can run the `Agent` tool any number of times in a row.
 ## Requirements
 ### Requirement: The Agent tool SHALL bind its `pi` handle per activation via lexical closure
 

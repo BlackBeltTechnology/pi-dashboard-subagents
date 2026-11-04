@@ -1,25 +1,11 @@
 # subagent-role-aliasing Specification
 
 ## Purpose
-TBD - created by archiving change add-agent-md-frontmatter-and-bundled-explore. Update Purpose after archive.
+Defines how a model reference (`@role`, `provider/model[:thinking]` or bare `model-id`, from frontmatter or the tool call) becomes a concrete Model and thinking level. Resolution goes through the cooperative `model:resolve` event first, then an in-process `pi.modelRegistry` fallback that never resolves `@role`.
 ## Requirements
 ### Requirement: Frontmatter `model:` field SHALL be resolved via `model:resolve` event when a handler is available
 
-When `AgentMdConfig.model` is a non-empty string, the extension SHALL attempt resolution by emitting a `model:resolve` probe on `pi.events`. The probe MUST be a single object of the shape:
-
-```
-{ ref: string, resolved?: string, model?: Model, thinkingLevel?: ThinkingLevelString, auth?: object, error?: string, available?: { roles?, models? } }
-```
-
-The extension SHALL call `pi.events.emit("model:resolve", probe)` exactly once, then read `probe.model`, `probe.thinkingLevel`, and `probe.error` synchronously after the emit returns. If `probe.model` is set, that Model SHALL be passed to `createAgentSession({ model, thinkingLevel })`. If `probe.error` is set (handler ran but rejected the ref), the tool call SHALL fail with that error. If neither is set (no handler registered, silent emit), the extension SHALL fall through to the in-process fallback defined in the next requirement.
-
-The handler is responsible for handling all three input forms transparently:
-
-- `@role` — looked up in `~/.pi/agent/providers.json#roles` (handler-side, NOT extension-side).
-- `provider/model[:thinking]` — split and resolved via `pi.modelRegistry.find()`.
-- bare `model` — "like" query against `pi.modelRegistry.getAll()`, first hit by `m.id === ref` wins.
-
-The thinking-level suffix (`:low|medium|high`) SHALL be parsed by the handler before any registry lookup; the resulting `thinkingLevel` SHALL be filled separately from `resolved` (which is the canonical literal without the suffix).
+The extension SHALL emit `model:resolve` on `pi.events` exactly once with a probe `{ ref, resolved?, model?, thinkingLevel?, auth?, error?, available? }`, then synchronously read `probe.model`, `probe.thinkingLevel` and `probe.error`. A set `probe.model` SHALL be passed to `createAgentSession`. A set `probe.error` SHALL fail the tool call with that error. If neither is set (silent emit), the in-process fallback SHALL run.
 
 #### Scenario: Event handler resolves @role to a Model
 
@@ -28,7 +14,7 @@ The thinking-level suffix (`:low|medium|high`) SHALL be parsed by the handler be
 - **THEN** `pi.events.emit("model:resolve", probe)` SHALL be called exactly once with `probe.ref === "@fast"`
 - **AND** after the emit returns, `probe.model` SHALL be a Model object
 - **AND** `probe.resolved` SHALL be the canonical literal `"provider/model-id"` form
-- **AND** `createAgentSession` SHALL be called with `{ model: probe.model, thinkingLevel: probe.thinkingLevel }`
+- **AND** `createAgentSession` SHALL be called with `model: probe.model` and, when `probe.thinkingLevel` is set, `thinkingLevel: probe.thinkingLevel` (otherwise the parent's live level applies, per capability `subagent-thinking-level`)
 
 #### Scenario: Event handler resolves provider/model to a Model
 
@@ -72,16 +58,27 @@ The thinking-level suffix (`:low|medium|high`) SHALL be parsed by the handler be
 - **AND** the first handler to populate `probe.model` SHALL be the winner
 - **AND** subsequent handlers SHALL be no-ops
 
+### Requirement: The `model:resolve` handler SHALL resolve three input forms and the thinking suffix
+
+A handler SHALL handle `@role` (looked up in `~/.pi/agent/providers.json#roles`, handler-side, not extension-side), `provider/model[:thinking]` (via `pi.modelRegistry.find()`) and bare `model` (first `m.id === ref` hit in `pi.modelRegistry.getAll()`). It SHALL parse the thinking suffix before any registry lookup and fill `thinkingLevel` separately from `resolved`, the canonical literal without suffix. Valid suffixes are `minimal`, `low`, `medium`, `high`, `xhigh`, `max` and `off`.
+
+#### Scenario: Suffix values beyond low, medium and high are parsed
+
+- **GIVEN** frontmatter `model: "anthropic/claude-opus-4:max"` OR `"anthropic/claude-haiku-4-5:off"` AND a handler is registered
+- **WHEN** the model is resolved
+- **THEN** `probe.thinkingLevel` SHALL be `"max"` OR `"off"` respectively
+- **AND** `probe.resolved` SHALL carry no suffix
+
+#### Scenario: Unrecognised suffix is part of the model id
+
+- **GIVEN** a ref whose text after the last `:` is not a valid thinking level
+- **WHEN** the in-process fallback splits the model reference
+- **THEN** that text SHALL stay part of the model id
+- **AND** `thinkingLevel` SHALL be undefined
+
 ### Requirement: In-process registry fallback SHALL resolve `provider/model` and bare `model` when no `model:resolve` handler is registered
 
-When the `model:resolve` emit returns with both `probe.model` and `probe.error` unset (silent emit — no handler reacted), the extension SHALL attempt in-process resolution using `pi.modelRegistry` directly. The fallback SHALL handle the same two literal forms the handler does (`provider/model[:thinking]` and bare `model`) but SHALL NOT attempt `@role` lookup (which requires reading `providers.json`, a responsibility owned by the handler).
-
-The fallback SHALL parse the `:thinking` suffix before registry lookup, then:
-
-- If the literal contains `/`, split into provider + id and call `registry.find(provider, id)`.
-- Otherwise treat as bare id and call `registry.getAll().find(m => m.id === literal)`.
-
-On success, the fallback SHALL pass the resolved Model and thinking level to `createAgentSession`. On failure, the tool call SHALL fail with `isError: true` and an error message naming the unresolved ref.
+When the `model:resolve` emit returns with both `probe.model` and `probe.error` unset, the extension SHALL resolve in-process using `pi.modelRegistry`. The fallback SHALL handle `provider/model[:thinking]` and bare `model`, but SHALL NOT attempt `@role` lookup, which requires reading `providers.json` and is owned by the handler.
 
 #### Scenario: Fallback resolves provider/model without any handler
 
@@ -127,6 +124,17 @@ On success, the fallback SHALL pass the resolved Model and thinking level to `cr
 - **THEN** the tool call SHALL fail with `isError: true`
 - **AND** the error message SHALL name the unresolved ref `"made-up-model"`
 - **AND** the error message MAY include a list of known model ids from `registry.getAll()` (capped to a reasonable count)
+
+### Requirement: The fallback SHALL parse the thinking suffix, look up the model, and report failures
+
+The fallback SHALL parse the `:thinking` suffix before lookup. If the literal contains `/`, it SHALL split provider and id and call `registry.find(provider, id)`; otherwise it SHALL call `registry.getAll().find(m => m.id === literal)`. On success it SHALL pass the Model and thinking level to `createAgentSession`. On failure the tool call SHALL fail with `isError: true` and an error naming the unresolved ref.
+
+#### Scenario: Registry unavailable
+
+- **GIVEN** no handler is registered AND `pi.modelRegistry` is unavailable
+- **WHEN** a literal ref is resolved
+- **THEN** the tool call SHALL fail with `isError: true`
+- **AND** the error SHALL name the unresolved ref
 
 ### Requirement: The `model:resolve` event contract SHALL be documented
 

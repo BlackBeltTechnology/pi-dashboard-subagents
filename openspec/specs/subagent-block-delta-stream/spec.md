@@ -8,13 +8,9 @@ Streams each running subagent's in-progress thinking and text blocks as exact, a
 ### Requirement: The extension SHALL emit streaming block content as append-only pieces on `subagents:delta`
 
 While a subagent streams a thinking or text block, the extension SHALL emit `pi.events.emit("subagents:delta", { v: 1, agentId, toolCallId, blockId, kind, offset, text, final })`.
-- `blockId` SHALL be an integer, unique per block within one subagent run, starting at `0` and increasing by 1 each time a block opens.
+- `blockId` SHALL be an integer, unique per block within one run, starting at `0` and increasing by 1 each time a block opens.
 - `kind` SHALL be `"thinking"` or `"text"`.
-- `offset` SHALL be the position of `text`'s first character within the block, counted in JavaScript string length (UTF-16 code units).
 - `toolCallId` SHALL be the parent `Agent` tool call id, or `""` when unknown.
-- Pieces of one block SHALL be contiguous: the first piece has `offset` 0, and each later piece's `offset` equals the previous piece's `offset + text.length`.
-- No character of a block SHALL be emitted more than once or omitted.
-- Joining the `text` of a block's pieces in order SHALL equal the concatenation of that block's streamed deltas.
 
 #### Scenario: Pieces reconstruct the streamed block exactly
 
@@ -37,15 +33,19 @@ While a subagent streams a thinking or text block, the extension SHALL emit `pi.
 - **THEN** one piece SHALL carry all of those characters, contiguous with the previous piece
 - **AND** no characters SHALL be dropped
 
+### Requirement: Delta pieces of one block SHALL be contiguous and lossless
+
+`offset` SHALL be the position of `text`'s first character within the block, counted in JavaScript string length (UTF-16 code units). The first piece of a block SHALL have `offset` 0 and each later piece's `offset` SHALL equal the previous piece's `offset + text.length`. No character SHALL be emitted twice or omitted, so joining a block's pieces in order SHALL equal the concatenation of its streamed deltas.
+
+#### Scenario: Offsets count UTF-16 code units
+
+- **GIVEN** a text block streams `"a😀"` (3 UTF-16 code units) and then `"b"`
+- **WHEN** the pieces are emitted
+- **THEN** the piece carrying `"b"` SHALL have `offset` equal to 3 when it directly follows the piece carrying `"a😀"`
+
 ### Requirement: Delta pieces SHALL be batched within the progress throttle window and never coalesced away
 
-The extension SHALL accumulate pending block text and emit it at most once per 250 ms throttle window per subagent. Pending text SHALL be appended to, never replaced, so a coalesced window loses no characters. Pending text SHALL also be flushed synchronously at these points:
-- when the block ends,
-- when a different block starts,
-- when the assistant message ends,
-- before any terminal emission (`subagents:completed`, `subagents:failed`, or abort).
-
-A delta emission SHALL NOT change the cadence or the content of `subagents:started` progress ticks or `details.liveTail`.
+The extension SHALL accumulate pending block text and emit it at most once per 250 ms throttle window per subagent. Pending text SHALL be appended to, never replaced, so a coalesced window loses no characters.
 
 #### Scenario: Throttled delta rate
 
@@ -65,9 +65,30 @@ A delta emission SHALL NOT change the cadence or the content of `subagents:start
 - **WHEN** the run is aborted or fails
 - **THEN** the pending text SHALL be emitted as a `final: true` piece before the terminal emission
 
+### Requirement: Pending delta text SHALL be flushed synchronously at block boundaries and before terminal emissions
+
+The extension SHALL flush pending block text synchronously when the block ends, when a different block starts, when the assistant message ends, and before any terminal emission (`subagents:completed`, `subagents:failed`, or abort).
+
+#### Scenario: A new block flushes the previous one
+
+- **GIVEN** a thinking block has unflushed pending text
+- **WHEN** a text block opens
+- **THEN** the thinking block's pending text SHALL be emitted at once as its `final: true` piece
+- **AND** the text block's first piece SHALL carry a new, higher `blockId`
+
+### Requirement: Delta emission SHALL NOT alter progress ticks or the live tail
+
+A delta emission SHALL NOT change the cadence or the content of `subagents:started` progress ticks or of `details.liveTail`.
+
+#### Scenario: Progress cadence is independent of deltas
+
+- **GIVEN** a block streams deltas continuously for 1 second
+- **WHEN** progress ticks are emitted
+- **THEN** they SHALL follow the same at-most-4-per-second cadence as without delta emission
+
 ### Requirement: Every opened block SHALL receive exactly one final piece, emitted before its entry
 
-For each block that opens, the extension SHALL emit exactly one piece with `final: true`. That piece carries any remaining pending text, possibly `""`. It SHALL be the last piece emitted for that `blockId`. When the block produces a timeline entry, its final piece SHALL be emitted before that block's `subagents:entry`. No piece for a `blockId` SHALL follow its `final: true` piece. A block SHALL get its final piece when it ends, when the message ends without an end event, or when the run terminates, whichever comes first.
+For each block that opens, the extension SHALL emit exactly one piece with `final: true`. It carries any remaining pending text, possibly `""`, and SHALL be the last piece emitted for that `blockId`: no piece for the `blockId` SHALL follow it. When the block produces a timeline entry, the final piece SHALL be emitted before that block's `subagents:entry`.
 
 #### Scenario: Final piece precedes the block's entry
 
@@ -87,6 +108,16 @@ For each block that opens, the extension SHALL emit exactly one piece with `fina
 - **GIVEN** a block streams deltas but produces no timeline entry (for example, empty or redacted content)
 - **WHEN** the block ends
 - **THEN** it SHALL still receive exactly one `final: true` piece
+
+### Requirement: A block's final piece SHALL be emitted at the earliest block close
+
+A block SHALL get its final piece when it ends, when the message ends without an end event, or when the run terminates, whichever comes first.
+
+#### Scenario: Run termination closes an open block
+
+- **GIVEN** a block is open and no end event has arrived
+- **WHEN** the run terminates
+- **THEN** the block SHALL receive its `final: true` piece before the terminal emission
 
 ### Requirement: Entries for streamed blocks SHALL carry the block's id
 

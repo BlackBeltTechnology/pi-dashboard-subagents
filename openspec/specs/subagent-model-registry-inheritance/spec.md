@@ -1,7 +1,7 @@
 # subagent-model-registry-inheritance Specification
 
 ## Purpose
-TBD - created by archiving change inherit-parent-model-registry. Update Purpose after archive.
+Ensures a subagent session resolves models and credentials from the parent session's live model runtime, so providers registered at runtime (such as custom providers) work in subagents without a missing-API-key failure. Falls back to pi's default runtime with a warning when the parent runtime cannot be read.
 
 ## Requirements
 
@@ -28,7 +28,7 @@ When spawning a subagent session, the extension SHALL hand the parent session's 
 
 When spawning a subagent session, the subagent SHALL resolve auth through the same credential source as the parent. On pi versions where auth is owned by the model runtime, inheriting the runtime satisfies this requirement.
 
-#### Scenario: Auth storage passed alongside registry
+#### Scenario: Auth resolves from the inherited runtime
 
 - **WHEN** a subagent is spawned on pi 1.x
 - **THEN** its auth resolution uses the parent's runtime credentials, identical to the parent session
