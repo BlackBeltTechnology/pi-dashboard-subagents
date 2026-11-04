@@ -1,14 +1,16 @@
 # Tasks
 
+> Prerequisite: `manage-subagent-spawn-queue` is implemented and archived (per-agent controller, agent registry, `subagents:stop`, `stopped` outcome, queue info, fair grant, live re-check).
+
 ## 1. Settings
 
 - [ ] 1.1 Write failing tests in `__tests__/settings.test.ts` for `allowBackground` (default true), `maxBackgroundPending` (default 8, coercion, `0`), `backgroundTimeoutSec` (default 0, coercion), and mtime refresh of the two numeric keys; then add the keys, merge/save logic and getters in `settings.ts`. Verify: `npm test -- settings` green.
 - [ ] 1.2 Export the new getters and types from `index.ts`, and update the `settings.ts` row in `extensions/AGENTS.md`. Verify: `npm run typecheck`.
 
-## 2. Two-lane semaphore (foreground-first)
+## 2. Foreground-first lanes
 
-- [ ] 2.1 Add a failing spawn-path test: `maxConcurrent: 1`, 3 background waiters queued, then a foreground call. The foreground call starts next and background order is preserved. Existing FIFO, cap-0 and abort-while-queued tests stay green.
-- [ ] 2.2 Split `spawnWaiters` into foreground and background lanes, add a `lane` argument to `acquireSpawnSlot`, and make `dispatchSpawnWaiters` drain foreground first. Verify: 2.1 plus the existing semaphore suite green.
+- [ ] 2.1 Failing spawn-path test: `maxConcurrent: 1`, 3 background waiters queued, then a foreground call. The foreground call starts next, background order is preserved, and `queuePosition` follows dispatch order (renumbered in one batched frame per waiter). Fair grant, the live re-check and the existing stop/queue suites stay green.
+- [ ] 2.2 Add `lane` to waiter records; make `dispatchSpawnWaiters` and position numbering drain the foreground lane first; keep "immediate grant only when nobody waits" across both lanes. Verify: 2.1 green.
 
 ## 3. Background registry and `Agent(run_in_background)`
 
@@ -26,7 +28,7 @@
   - `false` leaves the schema identical to today and registers only `Agent`
 - [ ] 3.4 Implement the background branch of `execute`. It:
   - checks the pending cap
-  - creates the record with its own `AbortController` and calls `runAgentTool(..., controller.signal, record.sink, ...)` unawaited
+  - creates the record and calls `runAgentTool` with no parent signal (the per-agent controller is not linked to the parent turn) and `record.sink` as `onUpdate`, unawaited
   - returns id, position and counts with `details: { background: true, id, status }` and no `agentId`
   - sets `details.background` on every emitted `AgentDetails`
 
@@ -56,27 +58,26 @@
 - [ ] 4.4 Failing test for `AgentList` (mixed states, counts line, unread flag), then implement it. Verify: green.
 - [ ] 4.5 Extend `entry-stream-faux.test.ts` with a real-session background run: the spawn returns early, `AgentStatus wait:"all"` yields the same final text a foreground run would, and the `subagents:entry` stream is identical to foreground.
 
-## 5. Cancellation, timeout, shutdown
+## 5. Cancellation, timeout, shutdown (all through the shared stop path)
 
 - [ ] 5.1 Failing tests for `AgentCancel`:
-  - running → `cancelled`, then `aborted` + `subagents:failed`, entries still readable
-  - queued → never takes a slot
+  - running → `stopped` + `stopReason: "running"` + `stoppedBy: "tool"`, emitted on `subagents:completed`, entries still readable
+  - queued → `stopReason: "queued"`, never takes a slot
   - `ids: "all", status: "queued"` bulk
-  - finished → `already_finished`
-  - unknown → `not_found`
-  - emits `subagents:cancelled { by: "tool" }`
+  - finished → `already_finished`; unknown → `not_found`
+  - a dashboard `subagents:stop` on a background subagent → `stoppedBy: "event"`, reflected in the stored record
 
-  Then implement. Verify: green.
-- [ ] 5.2 Failing tests for the run-time limit: `timeout_s` aborts with `by: "timeout"`; queue time is not counted; timer cleared on terminal; `backgroundTimeoutSec` default applies when `timeout_s` is absent. Then implement. Verify: green (fake timers).
-- [ ] 5.3 Failing test for the `session_shutdown` handler: aborts queued and running with `by: "shutdown"`, idempotent on a second fire, no slot left held. Then implement. Verify: green.
+  Then implement on `AgentControl.stop()` and add `stoppedBy` to `AgentDetails`. Verify: green.
+- [ ] 5.2 Failing tests for the run-time limit: `timeout_s` stops with `stoppedBy: "timeout"`; queue time not counted; timer cleared on terminal; `backgroundTimeoutSec` default applies. Then implement. Verify: green (fake timers).
+- [ ] 5.3 Failing test for the `session_shutdown` handler: stops queued and running background subagents with `stoppedBy: "shutdown"`, idempotent, no slot left held. Then implement. Verify: green.
 
 ## 6. Plugin hooks
 
 - [ ] 6.1 Failing tests for `subagents:before_spawn`: veto → error result and no `subagents:created`; patch prompt/model/description applied; throwing handler ignored; applies to foreground and background. Then implement. Verify: green.
 - [ ] 6.2 Failing tests for `subagents:before_store`: patch replaces the result for foreground (returned) and background (stored); throwing handler ignored. Then implement. Verify: green.
 - [ ] 6.3 Failing tests for `subagents:result_read` emission (status and messages) and for the `background` flag on every lifecycle event. Then implement in `events.ts`. Verify: `events.test.ts` green.
-- [ ] 6.4 Failing tests for the query channels `subagents:list`, `subagents:get` and `subagents:cancel`: same data as the tools, an existing `out` not overwritten, plugin cancel emits `by: "plugin"`. Then wire the registry handlers. Verify: green.
-- [ ] 6.5 Export typed helpers and payload types from `index.ts` (`onSubagentEvent`, `listBackgroundAgents`, `getBackgroundAgent`, `cancelBackgroundAgents`). Add a helper round-trip test. Update the `events.ts` and `index.ts` rows in `extensions/AGENTS.md`.
+- [ ] 6.4 Failing tests for the query channels `subagents:list` and `subagents:get`: same data as the tools, an existing `out` not overwritten, own activation only. Then wire the registry handlers. Verify: green.
+- [ ] 6.5 Export typed helpers and payload types from `index.ts` (`onSubagentEvent`, `listBackgroundAgents`, `getBackgroundAgent`, `stopSubagent` (wraps `subagents:stop`)). Add a helper round-trip test. Update the `events.ts` and `index.ts` rows in `extensions/AGENTS.md`.
 
 ## 7. Docs and integration
 
@@ -94,5 +95,5 @@
 
 ## Workflow follow-up
 
-- Dashboard repo (`pi-agent-dashboard`): optionally forward `subagents:cancelled`, show a "background" badge on cards, and link the `Agent` chat row to the card via `details.id`.
+- Dashboard repo (`pi-agent-dashboard`): show a "background" badge and `stoppedBy` on cards, and link the `Agent` chat row to the card via `details.id`.
 - Archive this change after release.

@@ -32,7 +32,7 @@ Lets the parent LLM start subagents that run without blocking it, then check, wa
 
 ### Requirement: `Agent` with `run_in_background: true` SHALL return immediately with an id
 
-The call SHALL register the subagent and return without awaiting it. The text result SHALL contain a short id (`bg-` prefix), the queue position or `running`, and the counts of running, queued and finished-unread background subagents. The run SHALL proceed exactly as a foreground run: same lifecycle events, same `maxConcurrent` semaphore. Interrupting the parent turn SHALL NOT abort it.
+The call SHALL register the subagent and return without awaiting it. The text result SHALL contain a short id (`bg-` prefix), the queue position or `running`, and the counts of running, queued and finished-unread background subagents. The run SHALL proceed as a foreground run (same events, semaphore, queue info, `subagents:stop`). Interrupting the parent turn SHALL NOT abort it.
 
 #### Scenario: Immediate return while the run continues
 
@@ -144,27 +144,33 @@ On a terminal state the extension SHALL store status, result text or error, toke
 - **THEN** all three SHALL be listed with their statuses
 - **AND** the counts line SHALL read 1 running, 1 queued, 1 finished-unread
 
-### Requirement: `AgentCancel` SHALL abort queued or running background subagents
+### Requirement: `AgentCancel` SHALL stop background subagents through the shared stop path
 
-`AgentCancel({ ids, status?, reason? })` SHALL accept an id list or `"all"`, optionally filtered by `status` (`queued`|`running`). It SHALL return a per-id outcome: `cancelled`, `already_finished` or `not_found`. A cancelled queued subagent SHALL never take a slot. Partial timelines SHALL remain readable. The call SHALL NOT wait for the stop to finish.
+`AgentCancel({ ids, status? })` SHALL accept an id list or `"all"`, optionally filtered by `status` (`queued`|`running`). It SHALL stop subagents exactly as `subagents:stop` does, giving `status: "stopped"` with `stopReason` and `stoppedBy: "tool"`. It SHALL return per-id `stopped`, `already_finished` or `not_found`, not wait for the stop, and keep partial timelines readable.
 
 #### Scenario: Cancel a running subagent
 
 - **WHEN** `AgentCancel({ ids: ["bg-a"] })` is called on a running subagent
-- **THEN** the outcome SHALL be `cancelled`
-- **AND** the subagent SHALL reach `status: aborted` and emit `subagents:failed`
+- **THEN** the outcome SHALL be `stopped`
+- **AND** the subagent SHALL emit `subagents:completed` with `details.status: "stopped"`, `stopReason: "running"`, `stoppedBy: "tool"`
 - **AND** `AgentMessages({ id: "bg-a" })` SHALL still return its entries
 
 #### Scenario: Bulk-cancel the queue
 
 - **GIVEN** 2 running and 5 queued background subagents
 - **WHEN** `AgentCancel({ ids: "all", status: "queued" })` is called
-- **THEN** the 5 queued SHALL be `cancelled` without starting and the 2 running SHALL be unaffected
+- **THEN** the 5 queued SHALL end `stopped` with `stopReason: "queued"` without starting
+- **AND** the 2 running SHALL be unaffected
 
 #### Scenario: Already finished
 
 - **WHEN** `AgentCancel` targets a completed subagent
 - **THEN** its outcome SHALL be `already_finished` and its stored result SHALL be unchanged
+
+#### Scenario: Dashboard stop on a background subagent
+
+- **WHEN** `subagents:stop` names a running background subagent
+- **THEN** it SHALL end `stopped` with `stoppedBy: "event"` and its stored result SHALL reflect that
 
 ### Requirement: Outstanding background subagents SHALL be capped by `maxBackgroundPending`
 
@@ -185,13 +191,13 @@ On a terminal state the extension SHALL store status, result text or error, toke
 
 ### Requirement: Background subagents SHALL honor an optional run-time limit
 
-`DashboardAgentSettings` SHALL gain `backgroundTimeoutSec` (default `0` = off); `Agent` SHALL accept `timeout_s` overriding it per call. The limit SHALL count from leaving `queued`. On expiry the subagent SHALL be aborted with status `aborted` and `subagents:cancelled` with `by: "timeout"`.
+`DashboardAgentSettings` SHALL gain `backgroundTimeoutSec` (default `0` = off); `Agent` SHALL accept `timeout_s` overriding it per call. The limit SHALL count from slot grant. On expiry the subagent SHALL be stopped through the shared stop path with `stopReason: "running"` and `stoppedBy: "timeout"`.
 
 #### Scenario: Timeout aborts a long run
 
 - **GIVEN** a background spawn with `timeout_s: 60`
 - **WHEN** the run is still going 60 s after starting
-- **THEN** it SHALL be aborted and `subagents:cancelled` SHALL carry `by: "timeout"`
+- **THEN** it SHALL end `stopped` with `stoppedBy: "timeout"`
 
 #### Scenario: Queue time not counted
 
@@ -199,12 +205,12 @@ On a terminal state the extension SHALL store status, result text or error, toke
 - **WHEN** it starts running
 - **THEN** it SHALL still have 60 s before the limit applies
 
-### Requirement: Background subagents SHALL be aborted on session shutdown
+### Requirement: Background subagents SHALL be stopped on session shutdown
 
-On `session_shutdown`, every queued or running background subagent of the activation SHALL be aborted and `subagents:cancelled` emitted with `by: "shutdown"`. The handler SHALL be idempotent.
+On `session_shutdown`, every queued or running background subagent of the activation SHALL be stopped through the shared stop path with `stoppedBy: "shutdown"`. The handler SHALL be idempotent.
 
 #### Scenario: Shutdown with work outstanding
 
 - **GIVEN** 1 running and 1 queued background subagent
 - **WHEN** `session_shutdown` fires
-- **THEN** both SHALL reach `aborted`, and no slot SHALL stay held
+- **THEN** both SHALL end `stopped` with `stoppedBy: "shutdown"`, and no slot SHALL stay held

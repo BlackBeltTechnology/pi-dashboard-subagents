@@ -15,14 +15,9 @@ Every `subagents:*` lifecycle event's `details` SHALL carry `background: boolean
 - **WHEN** a foreground and a background subagent each emit `subagents:created`
 - **THEN** their `details.background` SHALL be `false` and `true` respectively
 
-### Requirement: The extension SHALL emit `subagents:cancelled` and `subagents:result_read`
+### Requirement: The extension SHALL emit `subagents:result_read`
 
-`subagents:cancelled` SHALL fire once per cancelled background subagent with `{ id, agentId, by, reason? }`, where `by` ∈ `tool`|`plugin`|`timeout`|`shutdown`. `subagents:result_read` SHALL fire when `AgentStatus` returns a terminal result or `AgentMessages` returns entries, with `{ id, agentId, via }`.
-
-#### Scenario: Cancel via tool
-
-- **WHEN** `AgentCancel` cancels `bg-a`
-- **THEN** `subagents:cancelled` SHALL fire with `id: "bg-a"` and `by: "tool"`
+`subagents:result_read` SHALL fire when `AgentStatus` returns a terminal result or `AgentMessages` returns entries, with `{ id, agentId, via }` where `via` is `status` or `messages`.
 
 #### Scenario: Result read
 
@@ -68,7 +63,7 @@ Intercept and query channels SHALL be filled synchronously during `emit`. Values
 
 ### Requirement: Query channels SHALL expose the background registry
 
-The activation owning the registry SHALL answer `subagents:list` (`{ filter?, out? }`), `subagents:get` (`{ id, from?, limit?, kinds?, out? }`) and `subagents:cancel` (`{ ids, status?, reason?, out? }`) by filling `out` with the same data as `AgentList`, `AgentStatus`/`AgentMessages` and `AgentCancel`. A handler SHALL NOT overwrite an `out` that is already set. A plugin cancel SHALL emit `subagents:cancelled` with `by: "plugin"`.
+The owning activation SHALL answer `subagents:list` (`{ filter?, out? }`) and `subagents:get` (`{ id, from?, limit?, kinds?, out? }`) by filling `out` with the same data as `AgentList` and `AgentStatus`/`AgentMessages`. A handler SHALL NOT overwrite an `out` that is already set. Stopping SHALL use the existing `subagents:stop` event; no separate cancel channel SHALL exist.
 
 #### Scenario: Plugin lists agents
 
@@ -76,14 +71,14 @@ The activation owning the registry SHALL answer `subagents:list` (`{ filter?, ou
 - **WHEN** a plugin emits `subagents:list` with an empty payload
 - **THEN** `payload.out` SHALL hold both, with the same fields as `AgentList`
 
-#### Scenario: Plugin cancels
+#### Scenario: Another activation's answer is kept
 
-- **WHEN** a plugin emits `subagents:cancel` with `ids: ["bg-a"]`
-- **THEN** `payload.out` SHALL report `bg-a: cancelled` and `subagents:cancelled` SHALL carry `by: "plugin"`
+- **GIVEN** `payload.out` is already set when a second activation's handler runs
+- **THEN** that handler SHALL leave `payload.out` unchanged
 
 ### Requirement: Typed helpers SHALL be exported for plugin authors
 
-The package entry SHALL export payload types for every hook channel and helpers wrapping the query channels (list, get, cancel) and event subscription, so plugins need not hand-write channel names.
+The package entry SHALL export payload types for every hook channel and helpers wrapping the query channels (list, get), `subagents:stop` and event subscription, so plugins need not hand-write channel names.
 
 #### Scenario: Helper round-trip
 
