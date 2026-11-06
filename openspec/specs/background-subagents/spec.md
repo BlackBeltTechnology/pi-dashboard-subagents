@@ -1,10 +1,9 @@
-# Spec Delta
+# background-subagents Specification
 
 ## Purpose
-
 Lets the parent LLM start subagents that run without blocking it, then check, wait on, read the messages of, list and cancel them, with safeguards against forgotten queued work.
 
-## ADDED Requirements
+## Requirements
 
 ### Requirement: Background support SHALL be controlled by the `allowBackground` setting
 
@@ -54,7 +53,7 @@ The call SHALL register the subagent and return without awaiting it. The text re
 - **WHEN** the parent turn's abort signal fires
 - **THEN** the background subagent SHALL keep running
 
-#### Scenario: Dashboard card is not finalized by the early tool end
+#### Scenario: The early tool result does not carry the run id
 
 - **WHEN** a background `Agent` call returns
 - **THEN** its result `details` SHALL NOT contain `agentId`
@@ -167,7 +166,7 @@ On a terminal state the extension SHALL store status, result text or error, toke
 - **WHEN** `AgentCancel` targets a completed subagent
 - **THEN** its outcome SHALL be `already_finished` and its stored result SHALL be unchanged
 
-#### Scenario: Dashboard stop on a background subagent
+#### Scenario: Bus stop on a background subagent
 
 - **WHEN** `subagents:stop` names a running background subagent
 - **THEN** it SHALL end `stopped` with `stoppedBy: "event"` and its stored result SHALL reflect that

@@ -7,13 +7,20 @@ Defines the `Agent` tool and what it emits: an in-memory foreground subagent per
 
 ### Requirement: The extension SHALL register an `Agent` tool that spawns foreground subagents in-memory
 
-The extension's `activate` entry point SHALL call `pi.registerTool` exactly once with a `ToolDefinition` named `"Agent"`. The tool's `execute` callback SHALL spawn a subagent via `createAgentSession` with `sessionManager: SessionManager.inMemory(cwd)`. The extension SHALL NOT spawn a separate `pi` CLI process for the subagent.
+The extension's `activate` entry point SHALL call `pi.registerTool` exactly once with a `ToolDefinition` named `"Agent"`, and, when `allowBackground` is on, once each for `AgentStatus`, `AgentMessages`, `AgentList` and `AgentCancel`. The tool's `execute` callback SHALL spawn a subagent via `createAgentSession` with `sessionManager: SessionManager.inMemory(cwd)`. The extension SHALL NOT spawn a separate `pi` CLI process for the subagent.
 
 #### Scenario: Single Agent tool registration at activation
 
 - **WHEN** the extension activates in a fresh pi session
 - **THEN** `pi.registerTool` is called exactly once with `tool.name === "Agent"`
 - **AND** the registered tool's parameters schema includes at minimum `subagent_type`, `description`, and `prompt`
+
+#### Scenario: Background tools registered only when enabled
+
+- **WHEN** the extension activates with `allowBackground: false`
+- **THEN** `"Agent"` SHALL be the only tool registered
+- **WHEN** it activates with `allowBackground: true`
+- **THEN** `AgentStatus`, `AgentMessages`, `AgentList` and `AgentCancel` SHALL each be registered exactly once
 
 #### Scenario: In-memory subagent session per Agent tool invocation
 
@@ -26,8 +33,8 @@ The extension's `activate` entry point SHALL call `pi.registerTool` exactly once
 
 - **GIVEN** a subagent session has been created
 - **WHEN** the extension finalizes the subagent's active tool set
-- **THEN** it SHALL call `session.setActiveToolsByName(...)` with a list that does NOT include `"Agent"`
-- **AND** the subagent SHALL NOT be able to spawn nested sub-subagents
+- **THEN** it SHALL call `session.setActiveToolsByName(...)` with a list that does NOT include `"Agent"`, `"AgentStatus"`, `"AgentMessages"`, `"AgentList"` or `"AgentCancel"`
+- **AND** the subagent SHALL NOT be able to spawn nested sub-subagents or manage background subagents
 
 ### Requirement: The extension SHALL emit lifecycle events on pi's event bus using the `subagents:*` channel namespace
 
@@ -122,9 +129,9 @@ The dashboard bridge's emit intercept maps `subagents:*` channels to `subagent_*
 - **THEN** the call SHALL NOT throw
 - **AND** the subagent run SHALL continue normally (silent degradation)
 
-### Requirement: AgentDetails payload SHALL contain the full timeline + metadata the dashboard inspector consumes
+### Requirement: AgentDetails payload SHALL contain the full timeline and run metadata
 
-Every emission's `details` field SHALL be an `AgentDetails` object matching the wire shape defined in `extensions/events.ts`. The dashboard's `add-subagent-inspector` reducer reads these fields by name.
+Every emission's `details` field SHALL be an `AgentDetails` object matching the wire shape defined in `extensions/events.ts`. Consumers read these fields by name.
 
 #### Scenario: Required fields are always present
 
@@ -133,10 +140,11 @@ Every emission's `details` field SHALL be an `AgentDetails` object matching the 
 
 #### Scenario: entries[] is populated for the timeline
 
-- **GIVEN** the subagent has performed at least one tool call, emitted assistant text, or emitted a thinking block
+- **GIVEN** the subagent has performed at least one tool call, emitted assistant text, emitted a thinking block, or had a retry scheduled
 - **WHEN** the next progress / completion / failure emission fires
 - **THEN** `details.entries` SHALL be a non-empty array of `SubagentTimelineEntry` objects
-- **AND** each entry SHALL have a `kind` value in `{"tool", "text", "thinking", "error"}`
+- **AND** each entry SHALL have a `kind` value in `{"tool", "text", "thinking", "error", "retry"}`
+- **AND** a `retry` entry SHALL have the shape defined by capability `subagent-retry-visibility`
 - **AND** each entry SHALL have a `ts` epoch-ms timestamp
 
 #### Scenario: Tool entries pair input args with output result

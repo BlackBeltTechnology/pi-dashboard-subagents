@@ -16,10 +16,13 @@ import { join } from "node:path";
 
 import {
   DEFAULT_SETTINGS,
+  getBackgroundTimeoutSec,
+  getMaxBackgroundPending,
   getSettingsPath,
   getMaxConcurrent,
   getResultLimits,
   invalidateSettingsCache,
+  isBackgroundAllowed,
   loadSettings,
   resolveIsolated,
   saveSettings,
@@ -278,5 +281,63 @@ describe("result limits", () => {
     const t = new Date(Date.now() + 5_000);
     utimesSync(getSettingsPath(), t, t);
     expect(getResultLimits().resultMaxChars).toBe(42);
+  });
+});
+
+// ── background settings (change: add-background-subagents) ────────────────
+
+describe("background settings", () => {
+  it("defaults: allowBackground true, maxBackgroundPending 8, backgroundTimeoutSec 0", () => {
+    expect(DEFAULT_SETTINGS.allowBackground).toBe(true);
+    expect(DEFAULT_SETTINGS.maxBackgroundPending).toBe(8);
+    expect(DEFAULT_SETTINGS.backgroundTimeoutSec).toBe(0);
+    const s = loadSettings();
+    expect(s.allowBackground).toBe(true);
+    expect(s.maxBackgroundPending).toBe(8);
+    expect(s.backgroundTimeoutSec).toBe(0);
+    expect(isBackgroundAllowed()).toBe(true);
+    expect(getMaxBackgroundPending()).toBe(8);
+    expect(getBackgroundTimeoutSec()).toBe(0);
+  });
+
+  it("honours explicit values, 0 meaning unlimited / off", () => {
+    saveSettings({ allowBackground: false, maxBackgroundPending: 0, backgroundTimeoutSec: 90 });
+    invalidateSettingsCache();
+    expect(isBackgroundAllowed()).toBe(false);
+    expect(getMaxBackgroundPending()).toBe(0);
+    expect(getBackgroundTimeoutSec()).toBe(90);
+  });
+
+  it.each([-1, "3", Number.NaN, null, {}])("coerces invalid numeric value %p to the default", (bad) => {
+    saveSettings({});
+    writeFileSync(getSettingsPath(), JSON.stringify({ maxBackgroundPending: bad, backgroundTimeoutSec: bad }));
+    invalidateSettingsCache();
+    expect(getMaxBackgroundPending()).toBe(8);
+    expect(getBackgroundTimeoutSec()).toBe(0);
+  });
+
+  it("floors fractional numeric values", () => {
+    saveSettings({ maxBackgroundPending: 3.9, backgroundTimeoutSec: 12.5 });
+    invalidateSettingsCache();
+    expect(getMaxBackgroundPending()).toBe(3);
+    expect(getBackgroundTimeoutSec()).toBe(12);
+  });
+
+  it("non-boolean allowBackground falls back to the default", () => {
+    saveSettings({});
+    writeFileSync(getSettingsPath(), JSON.stringify({ allowBackground: "no" }));
+    invalidateSettingsCache();
+    expect(isBackgroundAllowed()).toBe(true);
+  });
+
+  it("numeric background keys are re-read when the config file changes", () => {
+    expect(getMaxBackgroundPending()).toBe(8);
+    expect(getBackgroundTimeoutSec()).toBe(0);
+    saveSettings({});
+    writeFileSync(getSettingsPath(), JSON.stringify({ maxBackgroundPending: 2, backgroundTimeoutSec: 30 }));
+    const t = new Date(Date.now() + 5_000);
+    utimesSync(getSettingsPath(), t, t);
+    expect(getMaxBackgroundPending()).toBe(2);
+    expect(getBackgroundTimeoutSec()).toBe(30);
   });
 });

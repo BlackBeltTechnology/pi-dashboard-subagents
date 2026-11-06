@@ -6,6 +6,58 @@ All notable changes to this package are documented here. Format follows
 
 ## [Unreleased]
 
+### Added
+
+- **Background subagents.** `Agent({ run_in_background: true })` returns a
+  short `bg-` id at once while the subagent runs on, with the same
+  `subagents:*` events (now carrying `details.background`), slots, queue info
+  and `subagents:stop` as a foreground run. Interrupting the parent turn does
+  not stop it. Results are stored in memory for the session and never pushed
+  into the parent.
+- **New tools** (registered when background is on): `AgentStatus` (state and
+  stored result; `wait: "any" | "all"` with `timeout_s` that never cancels),
+  `AgentMessages` (paged, bounded timeline with `from` / `next_from` and a
+  `kinds` filter), `AgentList` (status, age, tokens, unread flag, counts) and
+  `AgentCancel` (ids or `"all"`, optional `status` filter, via the shared stop
+  path). Ids accept the short id, full `agentId` or a unique prefix.
+- **Settings:** `allowBackground` (default `true`, read at activation),
+  `maxBackgroundPending` (default 8, `0` = unlimited) and
+  `backgroundTimeoutSec` (default `0` = off; `timeout_s` overrides per call,
+  counted from slot grant).
+- **`details.stoppedBy`** on stopped runs: `"tool"`, `"event"`, `"timeout"`
+  or `"shutdown"`. Background subagents are stopped on `session_shutdown`.
+- **Visible provider retries.** pi's own auto-retry already ran inside every
+  subagent but was invisible. Each scheduled retry now adds a
+  `{ kind: "retry", attempt, maxAttempts, delayMs, text, ts }` timeline entry
+  (streamed on `subagents:entry`), the activity line shows
+  `retrying (attempt N/M) in <delay>…` during the backoff, and
+  `details.retries` counts the attempts in the run. A new `subagents:retry`
+  event publishes each scheduled retry (`phase: "scheduled"`, with attempt,
+  budget, delay and error) and each sequence end (`phase: "ended"`, with
+  `success` and `finalError`). A run that fails after its last retry sequence
+  failed reports it, e.g.
+  `Subagent failed: 429 rate_limit_error (after 2 retries)`. No retry policy is
+  added; outcomes are unchanged.
+- **Plugin hooks on `pi.events`:** `subagents:before_spawn` (veto or patch
+  prompt / model / description), `subagents:before_store` (replace a terminal
+  result), `subagents:result_read`, and the query channels `subagents:list` /
+  `subagents:get`. Typed helpers `onSubagentEvent`, `listBackgroundAgents`,
+  `getBackgroundAgent`, `stopSubagent` and payload types are exported.
+
+### Changed
+
+- **BREAKING (behavioral):** activation now registers five tools by default
+  (`Agent` plus the four background tools), and `Agent` gains
+  `run_in_background` / `timeout_s`. Set `"allowBackground": false` and
+  `/reload` to restore the previous single-tool surface.
+- **BREAKING (behavioral):** the spawn queue is foreground-first. A free slot
+  goes to the oldest foreground waiter before any background one; order stays
+  FIFO within each lane, and queue positions follow dispatch order.
+- Child sessions now have `AgentStatus`, `AgentMessages`, `AgentList` and
+  `AgentCancel` removed as well as `Agent`.
+- **BREAKING (wire contract):** `SubagentTimelineEntry` has a fifth kind,
+  `"retry"`. Consumers that switch exhaustively on `kind` must add a case.
+
 ## [0.6.0] - 2026-11-04
 
 ### Added

@@ -53,7 +53,7 @@ The loader's `extensionsOverride` SHALL remove every extension's handlers for `t
 
 ### Requirement: Concurrent child runs SHALL be bounded by `maxConcurrent`
 
-`maxConcurrent` (default `4`, `0` = unlimited, clamped to 0–64) SHALL bound a process-wide FIFO semaphore. An `Agent` call SHALL emit `subagents:created` (`queued`) at once, acquire a slot before loader and session work, and release it on its terminal state. A call SHALL be granted at once only when no call is waiting. While calls wait, the limit SHALL be re-checked about every second.
+`maxConcurrent` (default `4`, `0` = unlimited, clamped to 0–64) SHALL bound a process-wide semaphore with a foreground and a background FIFO lane; a free slot SHALL go to the oldest foreground waiter, else the oldest background one. An `Agent` call SHALL emit `subagents:created` (`queued`) at once, acquire a slot before loader and session work, and release it on its terminal state. A call SHALL be granted at once only when no call is waiting.
 
 #### Scenario: excess calls wait in queued status
 
@@ -62,6 +62,14 @@ The loader's `extensionsOverride` SHALL remove every extension's handlers for `t
 - **THEN** at most 2 `createAgentSession` calls SHALL be in flight at any time
 - **AND** the 3 waiting calls SHALL have emitted `subagents:created` with `details.status === "queued"`
 - **AND** waiting calls SHALL start in the order they were invoked
+
+#### Scenario: foreground waiters go before background waiters
+
+- **GIVEN** `maxConcurrent: 1`, one run holding the slot, and 3 background calls queued
+- **WHEN** a foreground `Agent` call is made and then the slot frees
+- **THEN** the foreground call SHALL start next
+- **AND** the 3 background calls SHALL then start in the order they were invoked
+- **AND** queue positions SHALL follow dispatch order (the foreground call at position 1)
 
 #### Scenario: unlimited when zero
 

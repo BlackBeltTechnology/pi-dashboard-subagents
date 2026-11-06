@@ -2,7 +2,7 @@
 
 ## Why
 
-Every `Agent` call blocks the parent until the subagent finishes. The parent cannot fan out long-running work and keep going, check on it later, read its messages, or stop it. The README lists background spawning as out of scope; users now need it. Other packages also have no supported way to gate or query subagents beyond the dashboard's `subagents:*` stream and the `subagents:stop` control event.
+Every `Agent` call blocks the parent until the subagent finishes. The parent cannot fan out long-running work and keep going, check on it later, read its messages, or stop it. The README lists background spawning as out of scope; users now need it. Other packages also have no supported way to gate or query subagents beyond the `subagents:*` stream and the `subagents:stop` control event.
 
 **Depends on:** `manage-subagent-spawn-queue`. That change supplies the per-agent abort controller, the per-activation agent registry, the `subagents:stop` event with its `stopped` outcome, queue info fields, fair granting and the live limit re-check. This change builds on those and does not redefine them.
 
@@ -52,10 +52,7 @@ Every `Agent` call blocks the parent until the subagent finishes. The parent can
 - **Docs:**
   - README "Scope" section.
   - `extensions/AGENTS.md`.
-- **Dashboard (`pi-agent-dashboard`, follow-up):**
-  - The background `Agent` result omits `details.agentId`, so the card is not finalized early.
-  - Optional "background" badge.
-  - The stop button already works through `subagents:stop`.
+- **Consumers:** the background `Agent` result omits `details.agentId`, so a listener that finalizes a run on the `Agent` tool result does not end it early. Runs are followed through `subagents:*`, and `subagents:stop` stops them.
 - **Dependencies:** none new.
 
 ## Discipline Skills

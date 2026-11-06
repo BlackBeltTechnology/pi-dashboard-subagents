@@ -19,7 +19,7 @@ import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { Type } from "@sinclair/typebox";
+import { type TProperties, Type } from "@sinclair/typebox";
 
 import {
   type AgentSessionEvent,
@@ -55,22 +55,62 @@ import {
   emitSubagentEntry,
   emitSubagentFailed,
   emitSubagentProgress,
+  emitSubagentRetry,
   emitSubagentStarted,
+  formatRetryDelay,
   mapSessionEventToEntry,
+  retryEntryFromEvent,
 } from "./events.js";
 
 import {
+  getBackgroundTimeoutSec,
   getInheritanceCompression,
+  getMaxBackgroundPending,
   getMaxConcurrent,
   getResultLimits,
+  isBackgroundAllowed,
   type ResultLimits,
   resolveIsolated,
   shouldExposeInheritanceInTool,
 } from "./settings.js";
 
+import {
+  type BackgroundCounts,
+  type BackgroundRecord,
+  type BackgroundRegistry,
+  createBackgroundRegistry,
+  type RunResultLike,
+} from "./background.js";
+
+import {
+  countsLine,
+  makeAgentCancelTool,
+  messagesPage,
+  statusOf,
+  summaryOf,
+  makeAgentListTool,
+  makeAgentMessagesTool,
+  makeAgentStatusTool,
+} from "./background-tools.js";
+
+import { type GetQueryPayload, type ListQueryPayload, onGuarded, runBeforeSpawn, runBeforeStore, SUBAGENT_CHANNELS } from "./hooks.js";
+
 // ─── Tool name (also used to exclude self from subagent tool set) ────────
 
 const AGENT_TOOL_NAME = "Agent";
+
+/**
+ * Every tool that manages subagents. All are stripped from child sessions, so
+ * a subagent can neither spawn nor manage subagents.
+ * See change: add-background-subagents (D12).
+ */
+export const SUBAGENT_MANAGEMENT_TOOLS: readonly string[] = [
+  AGENT_TOOL_NAME,
+  "AgentStatus",
+  "AgentMessages",
+  "AgentList",
+  "AgentCancel",
+];
 
 // ─── Extension directory (for the bundled-agents tier) ─────────────────
 //
@@ -623,14 +663,38 @@ export interface QueueInfo {
   maxConcurrent: number;
 }
 
+/**
+ * Dispatch lane. Foreground waiters always go before background ones; FIFO
+ * within each lane. See change: add-background-subagents.
+ */
+export type SpawnLane = "foreground" | "background";
+
 interface SpawnWaiter {
+  lane: SpawnLane;
   start(): void;
   /** Fresh queue info for this waiter; called from the batched flush. */
   onPosition?: (info: QueueInfo) => void;
 }
 
 let activeSpawns = 0;
+/**
+ * Waiters in dispatch order: every foreground waiter, then every background
+ * one. Kept ordered on insert, so dispatch is `shift()` and the index is the
+ * queue position.
+ */
 const spawnWaiters: SpawnWaiter[] = [];
+
+/** Insert a waiter at the end of its lane; returns its index. */
+function enqueueWaiter(waiter: SpawnWaiter): number {
+  if (waiter.lane === "background") {
+    spawnWaiters.push(waiter);
+    return spawnWaiters.length - 1;
+  }
+  const firstBg = spawnWaiters.findIndex((w) => w.lane === "background");
+  const at = firstBg === -1 ? spawnWaiters.length : firstBg;
+  spawnWaiters.splice(at, 0, waiter);
+  return at;
+}
 let recheckTimer: ReturnType<typeof setInterval> | undefined;
 let positionsDirty = false;
 /** Limit seen by the last dispatch; a change re-pushes queue info. */
@@ -693,6 +757,7 @@ function dispatchSpawnWaiters(): void {
 function acquireSpawnSlot(
   signal: AbortSignal | undefined,
   onPosition?: (info: QueueInfo) => void,
+  lane: SpawnLane = "foreground",
 ): Promise<() => void> {
   let released = false;
   const release = (): void => {
@@ -714,6 +779,7 @@ function acquireSpawnSlot(
   return new Promise<() => void>((resolve, reject) => {
     let onAbort: (() => void) | undefined;
     const waiter: SpawnWaiter = {
+      lane,
       start: () => {
         if (onAbort && signal) signal.removeEventListener("abort", onAbort);
         resolve(release);
@@ -730,10 +796,12 @@ function acquireSpawnSlot(
       };
       signal.addEventListener("abort", onAbort, { once: true });
     }
-    spawnWaiters.push(waiter);
+    const index = enqueueWaiter(waiter);
     // Report this waiter's place synchronously (created snapshot) and
-    // through the batched push.
-    onPosition?.(queueInfoAt(spawnWaiters.length - 1, limit));
+    // through the batched push. A foreground insert ahead of background
+    // waiters renumbers them in the same batched frame.
+    onPosition?.(queueInfoAt(index, limit));
+    if (index < spawnWaiters.length - 1) schedulePositionPush();
     syncRecheckTimer();
   });
 }
@@ -753,18 +821,24 @@ export interface StopOutcome {
   outcome: "stopped" | "ignored";
 }
 
+/** Who requested a stop. See change: add-background-subagents. */
+export type StopSource = NonNullable<AgentDetails["stoppedBy"]>;
+
 /** What a run registers so it can be stopped. */
 export interface AgentControl {
   phase(): AgentPhase;
   /** Request a stop; false when the run already has an end reason. */
-  stop(): boolean;
+  stop(by: StopSource): boolean;
 }
 
 export interface AgentControlRegistry {
   /** Register a run; returns its unregister function. */
   register(agentId: string, control: AgentControl): () => void;
-  /** Stop one subagent of this activation. Never throws; always logs. */
-  stop(agentId: unknown): StopOutcome;
+  /**
+   * Stop one subagent of this activation. Never throws; always logs.
+   * `by` defaults to `"event"` (a `subagents:stop` from the bus).
+   */
+  stop(agentId: unknown, by?: StopSource): StopOutcome;
   /** Number of registered (non-finished) runs. */
   size(): number;
 }
@@ -778,7 +852,7 @@ export function createAgentControlRegistry(): AgentControlRegistry {
         if (controls.get(agentId) === control) controls.delete(agentId);
       };
     },
-    stop(raw) {
+    stop(raw, by = "event") {
       const agentId = typeof raw === "string" ? raw : String(raw);
       const control = typeof raw === "string" && raw !== "" ? controls.get(raw) : undefined;
       let result: StopOutcome;
@@ -786,7 +860,7 @@ export function createAgentControlRegistry(): AgentControlRegistry {
         result = { agentId, phase: "unknown", outcome: "ignored" };
       } else {
         const phase = control.phase();
-        const stopped = phase !== "terminal" && control.stop();
+        const stopped = phase !== "terminal" && control.stop(by);
         result = { agentId, phase, outcome: stopped ? "stopped" : "ignored" };
       }
       console.warn("[pi-dashboard-subagents] subagents:stop", result);
@@ -1280,7 +1354,7 @@ export function selectEffectiveModelRef(
  * activation time. Schema is fixed for the lifetime of the extension run
  * (pi.registerTool has no unregister counterpart — see design.md Decision 6).
  */
-export function buildAgentParametersSchema(exposeIsolated: boolean) {
+export function buildAgentParametersSchema(exposeIsolated: boolean, allowBackground = false) {
   const base = {
     subagent_type: Type.String({
       description:
@@ -1304,18 +1378,34 @@ export function buildAgentParametersSchema(exposeIsolated: boolean) {
       }),
     ),
   };
-  if (!exposeIsolated) {
-    return Type.Object(base);
-  }
-  return Type.Object({
-    ...base,
-    isolated: Type.Optional(
+  // One concrete property map: TypeBox cannot infer a union of conditional
+  // shapes, and the tool's `execute` reads params as `AgentToolArgs` anyway.
+  const properties: TProperties = { ...base };
+  if (exposeIsolated) {
+    properties.isolated = Type.Optional(
       Type.Boolean({
         description:
           "When true, the subagent runs WITHOUT inheriting parent context. Defaults to the global setting.",
       }),
-    ),
-  });
+    );
+  }
+  // Background parameters exist only when `allowBackground` is on at
+  // activation. See change: add-background-subagents (D3).
+  if (allowBackground) {
+    properties.run_in_background = Type.Optional(
+      Type.Boolean({
+        description:
+          "When true, return at once with a `bg-` id while the subagent runs on. Read it later with AgentStatus / AgentMessages, list with AgentList, stop with AgentCancel. Nothing is sent back automatically.",
+      }),
+    );
+    properties.timeout_s = Type.Optional(
+      Type.Number({
+        description:
+          "Background only: stop the subagent after this many seconds of running (queue time not counted). Overrides the configured default; 0 = no limit.",
+      }),
+    );
+  }
+  return Type.Object(properties);
 }
 
 // ─── Tool definition ─────────────────────────────────────────────────────
@@ -1332,33 +1422,192 @@ interface AgentToolArgs {
    */
   model?: string;
   isolated?: boolean;
+  /** Background spawn (only honored when `allowBackground` is on). */
+  run_in_background?: boolean;
+  /** Background run-time limit in seconds; `0` = none. */
+  timeout_s?: number;
 }
 
-function makeAgentTool(pi: ExtensionAPI, exposeIsolated: boolean, controls?: AgentControlRegistry) {
+/** `details` of an `Agent` call a `subagents:before_spawn` handler vetoed. */
+export interface SpawnVetoDetails {
+  vetoed: true;
+  reason: string;
+  background: boolean;
+}
+
+/** `details` of a background `Agent` call: no `agentId`, so the dashboard does not finalize the card. */
+export interface BackgroundSpawnDetails {
+  background: true;
+  /** Short `bg-` id; absent when the spawn was rejected. */
+  id?: string;
+  status: AgentStatus | "rejected";
+  queuePosition?: number;
+  counts: BackgroundCounts;
+  /** Outstanding ids, set only on a pending-cap rejection. */
+  outstanding?: string[];
+}
+
+function makeAgentTool(
+  pi: ExtensionAPI,
+  exposeIsolated: boolean,
+  controls?: AgentControlRegistry,
+  background?: BackgroundRegistry,
+) {
   return defineTool({
     name: AGENT_TOOL_NAME,
     label: "Agent",
     description: [
       "Spawn a foreground subagent in-memory with a focused task.",
-      "Runs synchronously; returns when the subagent finishes.",
+      background
+        ? "Runs synchronously and returns when the subagent finishes, unless `run_in_background` is true: then it returns a `bg-` id at once (check later with AgentStatus)."
+        : "Runs synchronously; returns when the subagent finishes.",
       "Two modes: (1) curated — when `subagent_type` matches a project/user/bundled `.md`, that file's frontmatter supplies model/tools/prompt defaults; (2) inline — any label works without a `.md`; pass `model` to pick @role / provider/model / bare id at call time.",
       "Subagent's full timeline (tool calls, reasoning, assistant text) is",
       "streamed to the dashboard inspector and embedded in the returned result.",
     ].join(" "),
-    parameters: buildAgentParametersSchema(exposeIsolated),
+    parameters: buildAgentParametersSchema(exposeIsolated, background !== undefined),
 
     async execute(
       toolCallId: string,
-      params: AgentToolArgs,
+      rawParams: Record<string, unknown>,
       signal: AbortSignal | undefined,
       onUpdate: AgentToolUpdateCallback<AgentDetails> | undefined,
       ctx: ExtensionContext,
     ): Promise<AgentToolResult<AgentDetails>> {
+      // pi validates against the schema above; the property map is untyped
+      // because its keys depend on activation settings.
+      const raw = rawParams as unknown as AgentToolArgs;
+      const wantsBackground = background !== undefined && raw.run_in_background === true;
+      // Plugins may veto or patch any spawn before a record, event or slot
+      // exists. See change: add-background-subagents (D10).
+      const hook = runBeforeSpawn(pi, raw, wantsBackground);
+      if (hook.veto) {
+        // No agentId: nothing was created, so no dashboard card to finalize.
+        const vetoed: AgentToolResultWithError<SpawnVetoDetails> = {
+          content: [{ type: "text", text: `Subagent spawn vetoed: ${hook.reason}` }],
+          details: { vetoed: true, reason: hook.reason, background: wantsBackground },
+          isError: true,
+        };
+        return vetoed as unknown as AgentToolResult<AgentDetails>;
+      }
+      const params: AgentToolArgs = { ...raw, ...hook.args };
+      if (background && wantsBackground) {
+        return spawnInBackground(pi, background, controls, params, ctx, toolCallId) as unknown as AgentToolResult<AgentDetails>;
+      }
       return runAgentTool(ctx.cwd, params, signal, onUpdate, ctx, pi, toolCallId, controls) as Promise<
         AgentToolResult<AgentDetails>
       >;
     },
   });
+}
+
+/** Per-call `timeout_s` (when a finite number ≥ 0) wins over `backgroundTimeoutSec`. */
+function effectiveTimeoutSec(perCall: unknown): number {
+  if (typeof perCall === "number" && Number.isFinite(perCall) && perCall >= 0) return perCall;
+  return getBackgroundTimeoutSec();
+}
+
+/**
+ * Background branch of `Agent.execute` (design D1, D8): check the pending
+ * cap, register a record, start `runAgentTool` unawaited with no parent
+ * signal, and return the short id at once. Every `subagents:*` event still
+ * fires exactly as for a foreground run.
+ */
+function spawnInBackground(
+  pi: ExtensionAPI,
+  registry: BackgroundRegistry,
+  controls: AgentControlRegistry | undefined,
+  params: AgentToolArgs,
+  ctx: ExtensionContext,
+  toolCallId: string,
+): AgentToolResultWithError<BackgroundSpawnDetails> {
+  const cap = getMaxBackgroundPending();
+  const outstanding = registry.outstanding();
+  if (cap > 0 && outstanding.length >= cap) {
+    const ids = outstanding.map((r) => r.id);
+    return {
+      content: [
+        {
+          type: "text",
+          text:
+            `Background limit reached: ${outstanding.length} of ${cap} background subagents are still queued or running ` +
+            `(${ids.join(", ")}). Wait for them with AgentStatus({ ids, wait: "any" }) or stop some with AgentCancel.`,
+        },
+      ],
+      details: { background: true, status: "rejected", counts: registry.counts(), outstanding: ids },
+      isError: true,
+    };
+  }
+
+  let record: BackgroundRecord | undefined;
+  let sink: ((update: { details?: AgentDetails }) => void) | undefined;
+  // No parent signal: interrupting the parent turn must not stop background
+  // work. AgentCancel, subagents:stop, the timeout and shutdown do (D1).
+  const run = runAgentTool(
+    ctx.cwd,
+    params,
+    undefined,
+    (update) => sink?.(update as { details?: AgentDetails }),
+    ctx,
+    pi,
+    toolCallId,
+    controls,
+    {
+      background: true,
+      timeoutMs: effectiveTimeoutSec(params.timeout_s) * 1000,
+      backgroundId: () => record?.id,
+      onAgentId: (agentId) => {
+        record = registry.create({ agentId, subagentType: params.subagent_type, description: params.description });
+        sink = registry.sink(record);
+      },
+      onEntry: (entry) => {
+        if (record) registry.appendEntry(record, entry);
+      },
+      onRunning: () => {
+        if (record) registry.markRunning(record);
+      },
+    },
+  );
+  // `runAgentTool` registers the record and announces the run synchronously
+  // (it first awaits at the spawn slot), so `record` is set here.
+  const rec = record!;
+  run.then(
+    (res) => registry.finish(rec, res as RunResultLike),
+    (err: unknown) => {
+      const message = err instanceof Error ? err.message : String(err);
+      registry.finish(rec, {
+        content: [{ type: "text", text: `Subagent failed: ${message}` }],
+        details: { status: "error", error: message },
+        isError: true,
+      });
+    },
+  );
+
+  // A waiter has already received its queued frame; otherwise the slot was
+  // granted at once and the run is about to start.
+  const queuePosition = rec.latest?.status === "queued" ? rec.latest.queuePosition : undefined;
+  if (queuePosition === undefined) registry.markRunning(rec);
+  const status = rec.status;
+  const counts = registry.counts();
+  const where = status === "queued" ? `queued #${queuePosition}` : "running";
+  return {
+    content: [
+      {
+        type: "text",
+        text:
+          `Started background subagent ${rec.id} (${where}). ` +
+          `Background: ${countsLine(counts)}. ` +
+          `Check it with AgentStatus({ ids: ["${rec.id}"] }) (wait: "all" to block until done); nothing is sent back automatically.`,
+      },
+    ],
+    details: {
+      background: true,
+      id: rec.id,
+      status,
+      ...(queuePosition !== undefined ? { queuePosition } : {}),
+      counts,
+    },
+  };
 }
 
 // The tool's `execute` callback receives `ctx: ExtensionContext` but NOT the
@@ -1368,6 +1617,29 @@ function makeAgentTool(pi: ExtensionAPI, exposeIsolated: boolean, controls?: Age
 // which its own dispose() then invalidates.
 
 // ─── The main spawn loop ────────────────────────────────────────────────
+
+/** Per-run options beyond the tool args. See change: add-background-subagents. */
+export interface RunAgentOptions {
+  /**
+   * Background run: background dispatch lane, `details.background: true`.
+   * The caller passes no parent signal so a parent-turn interrupt does not
+   * reach it.
+   */
+  background?: boolean;
+  /** Called synchronously with the new `agentId`, before `subagents:created`. */
+  onAgentId?: (agentId: string) => void;
+  /** Called once per timeline step, right after `subagents:entry`. */
+  onEntry?: (entry: SubagentTimelineEntry) => void;
+  /** Called synchronously when the run is granted its slot. */
+  onRunning?: () => void;
+  /**
+   * Run-time limit in ms, counted from slot grant (`0`/absent = none). On
+   * expiry the run is stopped with `stoppedBy: "timeout"`.
+   */
+  timeoutMs?: number;
+  /** Short `bg-` id, reported on `subagents:before_store`. */
+  backgroundId?: () => string | undefined;
+}
 
 /** Warned-once latch for {@link getParentModelRuntime}. */
 let warnedMissingRuntime = false;
@@ -1402,17 +1674,21 @@ export async function runAgentTool(
   toolCallId = "",
   /** Activation's control registry; when set, `subagents:stop` can stop this run. */
   controls?: AgentControlRegistry,
+  /** Background-run options. See change: add-background-subagents. */
+  runOpts: RunAgentOptions = {},
 ): Promise<AgentToolResultWithError<AgentDetails>> {
   const agentId = randomUUID();
   /** Call-creation time; `durationMs` counts from here (queue time included). */
   const startedAt = Date.now();
+  const background = runOpts.background === true;
+  runOpts.onAgentId?.(agentId);
 
   // ── Per-agent abort, linked to the parent signal ──
   // The first end reason wins: a parent abort keeps today's `aborted`
   // outcome, a `subagents:stop` yields `stopped`. See change:
   // manage-subagent-spawn-queue.
   const ctrl = new AbortController();
-  let endReason: "parent" | { stop: "queued" | "running" } | undefined;
+  let endReason: "parent" | { stop: "queued" | "running"; by: StopSource } | undefined;
   let phase: AgentPhase = "queued";
   let slotGrantedAt: number | undefined;
   let queueInfo: QueueInfo | undefined;
@@ -1423,18 +1699,19 @@ export async function runAgentTool(
   };
   if (signal?.aborted) onParentAbort();
   else signal?.addEventListener("abort", onParentAbort, { once: true });
-  const unregister = controls?.register(agentId, {
-    phase: () => phase,
-    stop: () => {
-      if (endReason || phase === "terminal") return false;
-      endReason = { stop: phase };
-      ctrl.abort();
-      return true;
-    },
-  });
+  const requestStop = (by: StopSource): boolean => {
+    if (endReason || phase === "terminal") return false;
+    endReason = { stop: phase, by };
+    ctrl.abort();
+    return true;
+  };
+  const unregister = controls?.register(agentId, { phase: () => phase, stop: requestStop });
+  let runTimer: ReturnType<typeof setTimeout> | undefined;
   /** Detach from the parent + registry. Idempotent; runs on every exit path. */
   function releaseControl(): void {
     phase = "terminal";
+    if (runTimer) clearTimeout(runTimer);
+    runTimer = undefined;
     signal?.removeEventListener("abort", onParentAbort);
     unregister?.();
   }
@@ -1476,6 +1753,14 @@ export async function runAgentTool(
    * `prompt()` resolves). See change: harden-subagent-lifecycle.
    */
   let lastAssistant: { stopReason?: string; errorMessage?: string; text: string } | undefined;
+  /**
+   * pi's own auto-retry, observed (never driven). `retries` sums every
+   * scheduled attempt; `lastRetrySequence` is the most recent sequence, whose
+   * `success === false` decorates a final failure. See change:
+   * surface-subagent-retries.
+   */
+  let retries = 0;
+  let lastRetrySequence: { attempts: number; success?: boolean } | undefined;
 
   /**
    * The ONLY way a step joins the timeline: push, then announce it once on
@@ -1491,6 +1776,7 @@ export async function runAgentTool(
       entry,
       ...(blockId !== undefined ? { blockId } : {}),
     });
+    runOpts.onEntry?.(entry);
   }
 
   // Append-only pieces of the streaming block on `subagents:delta`. Closed
@@ -1558,6 +1844,8 @@ export async function runAgentTool(
           }
         : {}),
       slotGrantedAt,
+      background,
+      retries,
     });
   }
 
@@ -1578,6 +1866,15 @@ export async function runAgentTool(
   }
 
   /**
+   * `subagents:before_store`: a plugin may replace the terminal result text
+   * before it is emitted, bounded, stored or returned.
+   */
+  function storeText(status: AgentStatus, result: string): string {
+    const id = runOpts.backgroundId?.();
+    return runBeforeStore(pi, { ...(id ? { id } : {}), agentId, background, status, result });
+  }
+
+  /**
    * Terminal failure: emit `subagents:failed` (full details), flush the
    * terminal `onUpdate`, and return a bounded error result.
    */
@@ -1587,6 +1884,7 @@ export async function runAgentTool(
     resultText: string,
   ): AgentToolResultWithError<AgentDetails> {
     const details = snapshotDetails(status, message);
+    const text = storeText(status, resultText);
     emitSubagentFailed(pi, {
       agentId,
       error: message,
@@ -1595,7 +1893,7 @@ export async function runAgentTool(
       details,
     });
     pushTerminalUpdate(details);
-    const bounded = boundToolResult(resultText, details, limits);
+    const bounded = boundToolResult(text, details, limits);
     return errorResult(bounded.text, bounded.details);
   }
 
@@ -1604,15 +1902,17 @@ export async function runAgentTool(
    * `status: "stopped"` and a NON-error result, so the parent turn goes on.
    * See change: manage-subagent-spawn-queue.
    */
-  function stopWith(stopPhase: "queued" | "running"): AgentToolResultWithError<AgentDetails> {
+  function stopWith(stopPhase: "queued" | "running", stoppedBy: StopSource): AgentToolResultWithError<AgentDetails> {
     const partial = stopPhase === "running" ? (lastAssistant?.text.trim() ?? "") : "";
-    const resultText =
+    const resultText = storeText(
+      "stopped",
       stopPhase === "queued"
         ? "Subagent removed from queue before starting."
         : partial
           ? `Subagent stopped by user.\n\n${partial}`
-          : "Subagent stopped by user.";
-    const details: AgentDetails = { ...snapshotDetails("stopped"), stopReason: stopPhase };
+          : "Subagent stopped by user.",
+    );
+    const details: AgentDetails = { ...snapshotDetails("stopped"), stopReason: stopPhase, stoppedBy };
     emitSubagentCompleted(pi, {
       agentId,
       result: resultText,
@@ -1628,7 +1928,7 @@ export async function runAgentTool(
 
   /** Outcome once the run's own signal aborted: whichever reason came first. */
   function endedByAbort(): AgentToolResultWithError<AgentDetails> {
-    if (endReason && endReason !== "parent") return stopWith(endReason.stop);
+    if (endReason && endReason !== "parent") return stopWith(endReason.stop, endReason.by);
     return failWith("aborted", "aborted by parent", "Subagent aborted by parent.");
   }
 
@@ -1637,11 +1937,15 @@ export async function runAgentTool(
   // call's queue position; awaited AFTER the card is on screen and BEFORE
   // any loader / session work, so queued spawns cost nothing but a promise.
   let announced = false;
-  const slot = acquireSpawnSlot(ctrl.signal, (info) => {
-    queueInfo = info;
-    // Batched queue frames bypass the throttle: one per waiter per change.
-    if (announced && phase === "queued") pushQueuedFrame(snapshotDetails("queued"));
-  });
+  const slot = acquireSpawnSlot(
+    ctrl.signal,
+    (info) => {
+      queueInfo = info;
+      // Batched queue frames bypass the throttle: one per waiter per change.
+      if (announced && phase === "queued") pushQueuedFrame(snapshotDetails("queued"));
+    },
+    runOpts.background ? "background" : "foreground",
+  );
   slot.catch(() => {}); // handled at the await below
 
   // Emit created BEFORE we touch any other infrastructure so the dashboard
@@ -1662,6 +1966,11 @@ export async function runAgentTool(
     phase = "running";
     slotGrantedAt = Date.now();
     queueInfo = undefined;
+    runOpts.onRunning?.();
+    // Run-time limit counts from slot grant, so queue time is free (D8).
+    if (runOpts.timeoutMs && runOpts.timeoutMs > 0) {
+      runTimer = setTimeout(() => requestStop("timeout"), runOpts.timeoutMs);
+    }
   } catch (err) {
     // Only an abort-while-queued is expected here; anything else is reported
     // as a genuine failure rather than masquerading as a parent abort.
@@ -1790,7 +2099,9 @@ export async function runAgentTool(
     // silently dropped — a typo doesn't crash the spawn) and apply via
     // `setActiveToolsByName`. Otherwise keep every tool the parent has
     // except `Agent` (unchanged pre-frontmatter behavior).
-    const availableTools = session.getActiveToolNames().filter((n) => n !== AGENT_TOOL_NAME);
+    const availableTools = session
+      .getActiveToolNames()
+      .filter((n) => !SUBAGENT_MANAGEMENT_TOOLS.includes(n));
     const activeTools = agentConfig?.tools
       ? availableTools.filter((n) => agentConfig.tools!.includes(n))
       : availableTools;
@@ -1801,6 +2112,51 @@ export async function runAgentTool(
     // Important: call `tracker.onEvent(event)` EXACTLY ONCE per event.
     // It is destructive on `tool_execution_end` (deletes the pairing entry).
     unsubscribe = session.subscribe((event: AgentSessionEvent) => {
+      // ── pi auto-retry (observed only) ──
+      // A provider error reaches the child only as an errored `message_end`,
+      // so the `retry` entry is the timeline's record of the failed attempt.
+      const retryEntry = retryEntryFromEvent(event);
+      if (retryEntry && retryEntry.kind === "retry") {
+        blockDeltas.close();
+        appendEntry(retryEntry);
+        retries += 1;
+        lastRetrySequence = { attempts: retryEntry.attempt };
+        emitSubagentRetry(pi, {
+          agentId,
+          toolCallId,
+          phase: "scheduled",
+          attempt: retryEntry.attempt,
+          maxAttempts: retryEntry.maxAttempts,
+          delayMs: retryEntry.delayMs,
+          error: retryEntry.text,
+          retries,
+        });
+        activity = `retrying (attempt ${retryEntry.attempt}/${retryEntry.maxAttempts}) in ${formatRetryDelay(retryEntry.delayMs)}…`;
+        liveTail = CLEARED_LIVE_TAIL;
+        pushUpdate("running");
+        return;
+      }
+      if ((event as { type?: string }).type === "auto_retry_end") {
+        const end = event as { success?: unknown; attempt?: unknown; finalError?: unknown };
+        const success = end.success === true;
+        const attempt =
+          typeof end.attempt === "number" && end.attempt > 0 ? end.attempt : (lastRetrySequence?.attempts ?? 0);
+        if (lastRetrySequence) {
+          lastRetrySequence.success = success;
+          lastRetrySequence.attempts = attempt;
+        }
+        emitSubagentRetry(pi, {
+          agentId,
+          toolCallId,
+          phase: "ended",
+          attempt,
+          success,
+          ...(!success && typeof end.finalError === "string" ? { finalError: end.finalError } : {}),
+          retries,
+        });
+        return;
+      }
+
       usage.observe(event);
       const pairing = tracker.onEvent(event); // null on non-tool, { input } on end
       const newActivity = activityFromEvent(event);
@@ -1916,9 +2272,13 @@ export async function runAgentTool(
     // ── Outcome: the final assistant message decides ──
     blockDeltas.dispose();
     progress.flush();
-    const failure = finalReplyFailure(lastAssistant);
+    // Only an errored final reply can be the end of a failed retry sequence.
+    const failure = withRetrySuffix(
+      finalReplyFailure(lastAssistant),
+      lastAssistant?.stopReason === "error" ? lastRetrySequence : undefined,
+    );
     if (failure) return failWith("error", failure, `Subagent failed: ${failure}`);
-    const finalText = lastAssistant!.text;
+    const finalText = storeText("completed", lastAssistant!.text);
     const completedDetails = snapshotDetails("completed");
     emitSubagentCompleted(pi, {
       agentId,
@@ -1985,6 +2345,19 @@ function finalReplyFailure(
   return undefined;
 }
 
+/**
+ * Add ` (after N retries)` to a final failure when the last retry sequence
+ * ended unsuccessfully. A recovered earlier sequence never decorates a later
+ * unrelated failure. See change: surface-subagent-retries.
+ */
+export function withRetrySuffix(
+  failure: string | undefined,
+  seq: { attempts: number; success?: boolean } | undefined,
+): string | undefined {
+  if (!failure || !seq || seq.success !== false || seq.attempts <= 0) return failure;
+  return `${failure} (after ${seq.attempts} ${seq.attempts === 1 ? "retry" : "retries"})`;
+}
+
 /** Throw `SpawnAbortedError` once the parent signal has aborted. */
 function throwIfAborted(signal: AbortSignal | undefined): void {
   if (signal?.aborted) throw new SpawnAbortedError("aborted by parent");
@@ -2019,7 +2392,47 @@ export default function activate(pi: ExtensionAPI): void {
   const exposeIsolated = shouldExposeInheritanceInTool();
   // Per-activation: a stop on this session's bus reaches only its subagents.
   const controls = createAgentControlRegistry();
-  pi.registerTool(makeAgentTool(pi, exposeIsolated, controls));
+  // Read once: the tool surface is fixed for the activation (D3).
+  const background = isBackgroundAllowed()
+    ? createBackgroundRegistry({
+        cutEntry: (e) => cutEntry(e, getResultLimits().entryFieldMaxChars),
+      })
+    : undefined;
+  pi.registerTool(makeAgentTool(pi, exposeIsolated, controls, background));
+  if (background) {
+    pi.registerTool(makeAgentStatusTool(pi, background));
+    pi.registerTool(makeAgentMessagesTool(pi, background));
+    pi.registerTool(makeAgentListTool(background));
+    pi.registerTool(
+      makeAgentCancelTool(background, (agentId, by) => controls.stop(agentId, by).outcome === "stopped"),
+    );
+    // Stop every outstanding background subagent when the session ends (D9).
+    // Idempotent: a second call finds nothing outstanding to stop.
+    pi.on("session_shutdown", () => {
+      for (const r of background.outstanding()) controls.stop(r.agentId, "shutdown");
+      return undefined;
+    });
+
+    // Query channels (D10): answer only when no other activation has, and
+    // only from this activation's registry. Reads here never mark results read.
+    onGuarded(pi, SUBAGENT_CHANNELS.list, (data) => {
+      const q = data as ListQueryPayload | undefined;
+      if (!q || typeof q !== "object" || q.out !== undefined) return;
+      const status = q.filter?.status;
+      const now = Date.now();
+      q.out = background
+        .list()
+        .filter((r) => !status || r.status === status)
+        .map((r) => summaryOf(r, now));
+    });
+    onGuarded(pi, SUBAGENT_CHANNELS.get, (data) => {
+      const q = data as GetQueryPayload | undefined;
+      if (!q || typeof q !== "object" || q.out !== undefined || typeof q.id !== "string") return;
+      const hit = background.lookup(q.id);
+      if (typeof hit === "string") return; // unknown here: another activation may own it
+      q.out = { status: statusOf(hit), messages: messagesPage(hit, q) };
+    });
+  }
 
   // `subagents:stop { agentId }` stops one queued or running subagent.
   // See change: manage-subagent-spawn-queue.

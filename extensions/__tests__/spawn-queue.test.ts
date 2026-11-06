@@ -268,7 +268,8 @@ describe("per-agent abort linked to the parent signal", () => {
     expect(res.details.status).toBe("completed");
     expect(res.isError).toBeUndefined();
     for (const e of emitted) {
-      if (e.channel === "subagents:entry" || e.channel === "subagents:delta") continue;
+      // Only lifecycle snapshots carry details (not steps, pieces or plugin hooks).
+      if (e.channel === "subagents:entry" || e.channel === "subagents:delta" || e.channel.startsWith("subagents:before_")) continue;
       expect(e.data.details?.stoppable, e.channel).toBe(true);
     }
     for (const [u] of r.onUpdate.mock.calls) expect(u.details.stoppable).toBe(true);
@@ -1038,5 +1039,88 @@ describe("live maxConcurrent re-check and fair granting", () => {
     created[0].finish();
     await runs[0].promise;
     expect(vi.getTimerCount()).toBe(0);
+  });
+});
+
+// ─── Foreground-first lanes (change: add-background-subagents) ──────────────
+
+describe("foreground-first lanes", () => {
+  function startBg(pi: any, controls: ReturnType<typeof createAgentControlRegistry> | undefined, prompt: string) {
+    const onUpdate = vi.fn();
+    const promise = runAgentTool(tmpCwd, args(prompt), undefined, onUpdate, ctx(), pi, `tc-${prompt}`, controls, {
+      background: true,
+    }) as Promise<any>;
+    return { promise, onUpdate };
+  }
+
+  it("a foreground call jumps queued background calls; background order is kept", async () => {
+    writeConfig({ maxConcurrent: 1 });
+    const created = installSessions();
+    const { pi } = fakePi();
+    const controls = createAgentControlRegistry();
+    const holder = start(pi, controls, "holder");
+    const bg = [0, 1, 2].map((i) => startBg(pi, controls, `bg${i}`));
+    await tick();
+    expect(created.length).toBe(1);
+    expect(bg.map((r) => lastQueued(r.onUpdate).queuePosition)).toEqual([1, 2, 3]);
+    const framesBefore = bg.map((r) => r.onUpdate.mock.calls.length);
+
+    const fg = start(pi, controls, "fg");
+    await tick();
+    // The foreground call is next in dispatch order…
+    expect(lastQueued(fg.onUpdate).queuePosition).toBe(1);
+    // …and every background waiter was renumbered in exactly one batched frame.
+    expect(bg.map((r) => lastQueued(r.onUpdate).queuePosition)).toEqual([2, 3, 4]);
+    expect(bg.map((r, i) => r.onUpdate.mock.calls.length - framesBefore[i])).toEqual([1, 1, 1]);
+
+    const order: string[] = [];
+    for (let i = 0; i < 4; i++) {
+      created.at(-1)!.finish();
+      await tick();
+      order.push(created.at(-1)!.session.lastPrompt);
+    }
+    expect(order.map((p) => p.match(/<task>\n(\w+)/)![1])).toEqual(["fg", "bg0", "bg1", "bg2"]);
+    created.at(-1)!.finish();
+    await Promise.all([holder, fg, ...bg].map((r) => r.promise));
+  });
+
+  it("a later foreground call queues behind an earlier foreground waiter but ahead of background", async () => {
+    writeConfig({ maxConcurrent: 1 });
+    const created = installSessions();
+    const { pi } = fakePi();
+    const holder = start(pi, undefined, "holder");
+    const b = startBg(pi, undefined, "b");
+    const f1 = start(pi, undefined, "f1");
+    const f2 = start(pi, undefined, "f2");
+    await tick();
+    expect(lastQueued(f1.onUpdate).queuePosition).toBe(1);
+    expect(lastQueued(f2.onUpdate).queuePosition).toBe(2);
+    expect(lastQueued(b.onUpdate).queuePosition).toBe(3);
+    for (let i = 0; i < 4; i++) {
+      created.at(-1)!.finish();
+      await tick();
+    }
+    expect(created.map((c) => c.session.lastPrompt.match(/<task>\n(\w+)/)![1])).toEqual(["holder", "f1", "f2", "b"]);
+    await Promise.all([holder, b, f1, f2].map((r) => r.promise));
+  });
+
+  it("a background call is granted at once only when nobody waits in either lane", async () => {
+    writeConfig({ maxConcurrent: 2 });
+    const created = installSessions();
+    const { pi } = fakePi();
+    const a = startBg(pi, undefined, "a");
+    await tick();
+    expect(created.length).toBe(1); // free slot, empty queue → immediate
+    const h = start(pi, undefined, "h");
+    const w = start(pi, undefined, "w"); // waits (limit 2 reached)
+    const late = startBg(pi, undefined, "late");
+    await tick();
+    expect(created.length).toBe(2);
+    expect(lastQueued(late.onUpdate).queuePosition).toBe(2);
+    for (let i = 0; i < 4; i++) {
+      created.forEach((c) => c.finish());
+      await tick();
+    }
+    await Promise.all([a, h, w, late].map((r) => r.promise));
   });
 });

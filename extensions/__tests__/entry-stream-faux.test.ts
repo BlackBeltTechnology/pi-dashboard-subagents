@@ -96,7 +96,8 @@ describe("real faux-provider entry stream", () => {
     activate(pi);
     const ctx: any = { cwd, modelRegistry };
     const of = (channel: string) => log.filter((e) => e.channel === channel).map((e) => e.data);
-    return { piAi, registration, modelRuntime, model, tool: tools[0], ctx, of, log, bus };
+    const toolNamed = (name: string) => tools.find((t) => t.name === name);
+    return { piAi, registration, modelRuntime, model, tool: tools[0], toolNamed, ctx, of, log, bus };
   }
 
   it("rebuilds the exact final timeline from subagents:entry alone; progress stays thin", async () => {
@@ -213,6 +214,58 @@ describe("real faux-provider entry stream", () => {
     }
   }, 30_000);
 
+  // See change: add-background-subagents (task 4.5).
+  it("background run: early return, same entry stream and final text as foreground", async () => {
+    const { piAi, registration, modelRuntime, model, tool, toolNamed, ctx, of, log } = await setup();
+    const script = () => [
+      piAi.fauxAssistantMessage(
+        [
+          piAi.fauxThinking("Reading the notes first."),
+          piAi.fauxToolCall("read", { path: "notes.txt" }, { id: "tc-bg-read" }),
+        ],
+        { stopReason: "toolUse" },
+      ),
+      piAi.fauxAssistantMessage([piAi.fauxText("FINAL: faux file body.")]),
+    ];
+    const params = { subagent_type: "faux-agent", description: "bg e2e", prompt: "summarize notes.txt", model: "@entry-faux" };
+    const strip = (entries: any[]) => entries.map(({ ts: _ts, ...e }) => e);
+    try {
+      // Foreground reference run.
+      registration.setResponses(script());
+      const fg: any = await tool.execute("call-fg", params, undefined, undefined, ctx);
+      expect(fg.details.status).toBe("completed");
+      const fgSteps = of("subagents:entry").filter((s) => s.agentId === fg.details.agentId);
+      log.length = 0;
+
+      // Background run of the same script.
+      registration.setResponses(script());
+      const spawned: any = await tool.execute("call-bg", { ...params, run_in_background: true }, undefined, undefined, ctx);
+      expect(spawned.details).toMatchObject({ background: true, id: expect.stringMatching(/^bg-/) });
+      expect(spawned.details.agentId).toBeUndefined();
+      // Returned before the run finished.
+      expect(of("subagents:completed")).toHaveLength(0);
+
+      const status: any = await toolNamed("AgentStatus").execute(
+        "call-status",
+        { ids: [spawned.details.id], wait: "all", timeout_s: 20 },
+        undefined,
+        undefined,
+        ctx,
+      );
+      expect(status.details.agents[0]).toMatchObject({ status: "completed", result: fg.content[0].text });
+
+      const completed = of("subagents:completed");
+      expect(completed).toHaveLength(1);
+      expect(completed[0].details.background).toBe(true);
+      const bgSteps = of("subagents:entry").filter((s) => s.agentId === completed[0].id);
+      expect(bgSteps.map((s) => s.index)).toEqual(fgSteps.map((s) => s.index));
+      expect(strip(bgSteps.map((s) => s.entry))).toEqual(strip(fgSteps.map((s) => s.entry)));
+      expect(bgSteps.every((s) => s.toolCallId === "call-bg")).toBe(true);
+    } finally {
+      modelRuntime.unregisterProvider(model.provider);
+    }
+  }, 30_000);
+
   it("long run: progress frame size stays flat while the timeline grows", async () => {
     const { piAi, registration, modelRuntime, model, tool, ctx, of } = await setup(150);
     const TURNS = 30;
@@ -317,6 +370,16 @@ describe("real faux-provider entry stream", () => {
       expect(terminal[0].details.entries).toEqual(result.details.entries);
       expect(result.details.entryCount).toBe(result.details.entries.length);
       expect(steps.slice(0, 2).map((s) => s.entry.kind)).toEqual(["text", "tool"]);
+      // "faux upstream 500" is retryable, so pi (default settings) retries it
+      // once; the retried call then hits the faux provider's non-retryable
+      // "No more faux responses queued" (change: surface-subagent-retries).
+      // (The faux "" message carries an empty text block, backfilled before the retry.)
+      const retrySteps = steps.filter((s) => s.entry.kind === "retry");
+      expect(retrySteps).toHaveLength(1);
+      expect(retrySteps[0].entry).toMatchObject({ kind: "retry", attempt: 1, text: "faux upstream 500" });
+      expect(retrySteps[0].index).toBeGreaterThan(1);
+      expect(result.details.retries).toBe(1);
+      expect(result.details.error).toMatch(/ \(after 1 retry\)$/);
       // The errored final reply decides the outcome (change: harden-subagent-lifecycle).
       expect(result.details.status).toBe("error");
       expect(result.isError).toBe(true);

@@ -74,6 +74,24 @@ export interface DashboardAgentSettings {
   resultMaxChars: number;
   detailsMaxChars: number;
   entryFieldMaxChars: number;
+  /**
+   * Whether background subagents are available (`Agent.run_in_background`
+   * plus the `AgentStatus` / `AgentMessages` / `AgentList` / `AgentCancel`
+   * tools). Read once at activation; changes need `/reload`. Default: true.
+   * See change: add-background-subagents.
+   */
+  allowBackground: boolean;
+  /**
+   * Cap on outstanding (queued + running) background subagents; a spawn at
+   * the cap is rejected. `0` = unlimited. Read per call. Default: 8.
+   */
+  maxBackgroundPending: number;
+  /**
+   * Default run-time limit for a background subagent, in seconds, counted
+   * from slot grant. `0` = off. `Agent.timeout_s` overrides it. Read per
+   * call. Default: 0.
+   */
+  backgroundTimeoutSec: number;
 }
 
 /** The three result-size limits, as read by `getResultLimits()`. */
@@ -94,6 +112,9 @@ export const DEFAULT_SETTINGS: DashboardAgentSettings = Object.freeze({
   resultMaxChars: 16_000,
   detailsMaxChars: 20_000,
   entryFieldMaxChars: 2_000,
+  allowBackground: true,
+  maxBackgroundPending: 8,
+  backgroundTimeoutSec: 0,
 }) as DashboardAgentSettings;
 
 // ─── Storage location ────────────────────────────────────────────────────
@@ -169,7 +190,15 @@ function mergeWithDefaults(partial: Partial<DashboardAgentSettings>): DashboardA
     resultMaxChars: coerceLimit(partial.resultMaxChars, DEFAULT_SETTINGS.resultMaxChars),
     detailsMaxChars: coerceLimit(partial.detailsMaxChars, DEFAULT_SETTINGS.detailsMaxChars),
     entryFieldMaxChars: coerceLimit(partial.entryFieldMaxChars, DEFAULT_SETTINGS.entryFieldMaxChars),
+    allowBackground: coerceBoolean(partial.allowBackground, DEFAULT_SETTINGS.allowBackground),
+    maxBackgroundPending: coerceLimit(partial.maxBackgroundPending, DEFAULT_SETTINGS.maxBackgroundPending),
+    backgroundTimeoutSec: coerceLimit(partial.backgroundTimeoutSec, DEFAULT_SETTINGS.backgroundTimeoutSec),
   };
+}
+
+/** Non-boolean values fall back to `fallback`. */
+function coerceBoolean(value: unknown, fallback: boolean): boolean {
+  return typeof value === "boolean" ? value : fallback;
 }
 
 /** Non-number, non-finite or negative values fall back to `fallback`. `0` is valid (unlimited). */
@@ -211,6 +240,15 @@ export function saveSettings(patch: Partial<DashboardAgentSettings>): DashboardA
     entryFieldMaxChars: coerceLimit(
       patch.entryFieldMaxChars ?? current.entryFieldMaxChars,
       current.entryFieldMaxChars,
+    ),
+    allowBackground: coerceBoolean(patch.allowBackground, current.allowBackground),
+    maxBackgroundPending: coerceLimit(
+      patch.maxBackgroundPending ?? current.maxBackgroundPending,
+      current.maxBackgroundPending,
+    ),
+    backgroundTimeoutSec: coerceLimit(
+      patch.backgroundTimeoutSec ?? current.backgroundTimeoutSec,
+      current.backgroundTimeoutSec,
     ),
   };
   writeSettingsToDisk(next);
@@ -295,6 +333,28 @@ export function getResultLimits(): ResultLimits {
     detailsMaxChars: s.detailsMaxChars,
     entryFieldMaxChars: s.entryFieldMaxChars,
   };
+}
+
+/**
+ * Whether background subagents are enabled. Read once at activation (the
+ * tool surface cannot change without `/reload`). See change:
+ * add-background-subagents.
+ */
+export function isBackgroundAllowed(): boolean {
+  refreshIfConfigChanged();
+  return loadSettings().allowBackground;
+}
+
+/** Outstanding background cap (`0` = unlimited). Read per call. */
+export function getMaxBackgroundPending(): number {
+  refreshIfConfigChanged();
+  return loadSettings().maxBackgroundPending;
+}
+
+/** Default background run-time limit in seconds (`0` = off). Read per call. */
+export function getBackgroundTimeoutSec(): number {
+  refreshIfConfigChanged();
+  return loadSettings().backgroundTimeoutSec;
 }
 
 function refreshIfConfigChanged(): void {

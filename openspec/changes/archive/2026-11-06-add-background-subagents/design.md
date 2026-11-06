@@ -19,7 +19,7 @@ runAgentTool(…, parentSignal, onUpdate, …)
 Constraints:
 - `pi.registerTool` has no unregister, so the tool surface is fixed at `activate()`.
 - `pi` and any per-session state are per-activation.
-- The dashboard marks a subagent `completed` when an `Agent` `tool_execution_end` carries `details.agentId`, so a background call's early end must not carry it.
+- A listener may treat an `Agent` `tool_execution_end` carrying `details.agentId` as that run's end, so a background call's early end must not carry it.
 
 ## Goals / Non-Goals
 
@@ -67,6 +67,8 @@ On a terminal state the record stores `{ status, stopReason?, stoppedBy?, result
 
 Reads the record's live entries. Default is the last 20; returns `{ total, from, next_from, entries }`. The `kinds` filter is applied before paging. Output is bounded per field and in total.
 
+`kinds` accepts any `SubagentTimelineEntry` kind, including `retry` from `surface-subagent-retries` (pi auto-retry attempts). The filter matches strings, so new kinds need no change here.
+
 ### D7. Cancellation = the existing stop path
 
 `AgentCancel` resolves ids to `agentId`s and calls the same `AgentControl.stop()` the `subagents:stop` listener uses, tagging `stoppedBy: "tool"`. A `subagents:stop` received from the bus tags `stoppedBy: "event"`.
@@ -77,7 +79,7 @@ Outcomes:
 
 Per-id result is `stopped`, `already_finished` or `not_found`. `ids: "all"` with an optional `status` filter supports bulk cleanup. The call does not wait for the stop to finish. Partial timelines stay readable.
 
-*Alternative:* a separate `aborted` path with a `subagents:cancelled` event. Rejected: it would give the dashboard and plugins two terminal shapes for the same intent.
+*Alternative:* a separate `aborted` path with a `subagents:cancelled` event. Rejected: it would give listeners two terminal shapes for the same intent.
 
 ### D8. Queue safeguards
 
@@ -108,9 +110,9 @@ The `session_shutdown` handler stops every non-terminal background record throug
 - Query handlers answer only if `out` is unset, and only from their own activation.
 - Helpers exported from `index.ts`: `onSubagentEvent`, `listBackgroundAgents`, `getBackgroundAgent`, `stopSubagent`.
 
-### D11. Dashboard compatibility
+### D11. The early tool result does not end the run
 
-The background `Agent` tool result omits `agentId` and carries `{ background: true, id, status }`, so `toolRowFinalizer.onEnd` returns early. The card is driven by `subagents:*`, and the stop button sends the existing `subagents:stop`.
+The background `Agent` tool result omits `agentId` and carries `{ background: true, id, status }`, so it cannot be mistaken for the run's end. The run's lifecycle is published on `subagents:*`, and `subagents:stop` stops it.
 
 ### D12. Children never manage background work
 
@@ -118,7 +120,7 @@ The child tool filter strips `Agent`, `AgentStatus`, `AgentMessages`, `AgentList
 
 ## Risks / Trade-offs
 
-- [The background `Agent` row is not linked to the card through `agentId`] → The card renders from `subagents:*`. Row linkage is a dashboard follow-up.
+- [The background `Agent` tool result does not carry `agentId`] → Listeners follow the run on `subagents:*`; `subagents:created` carries `details.background: true`.
 - [Foreground-first renumbers background waiters] → Batched one frame per waiter (existing push).
 - [Session-long retention grows memory] → Entries are cut on store, and the pending cap bounds new work.
 - [Sync-only intercept hooks] → Documented; async can come later.

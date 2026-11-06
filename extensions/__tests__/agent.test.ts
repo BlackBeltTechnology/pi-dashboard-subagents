@@ -598,6 +598,17 @@ describe("boundToolResult", () => {
     expect(out.details.tokens).toBe("1k");
   });
 
+  // See change: surface-subagent-retries.
+  it("cuts a retry entry's text like other entries and keeps its numbers", () => {
+    const retry = { kind: "retry", attempt: 3, maxAttempts: 18, delayMs: 7_200, text: "e".repeat(100), ts: 5 };
+    const out = boundToolResult("x", details([retry]), { resultMaxChars: 0, detailsMaxChars: 0, entryFieldMaxChars: 20 });
+    const [cut] = out.details.entries as any[];
+    expect(cut.text).toContain("chars truncated");
+    expect(cut.text.startsWith("e".repeat(10))).toBe(true);
+    expect(cut).toMatchObject({ kind: "retry", attempt: 3, maxAttempts: 18, delayMs: 7_200, ts: 5 });
+    expect(retry.text).toHaveLength(100);
+  });
+
   it("passes details without entries through", () => {
     const d = { agentId: "a", status: "error", toolUses: 0, tokens: "0", durationMs: 1 } as any;
     expect(boundToolResult("x", d, L).details).toEqual(d);
@@ -1232,6 +1243,132 @@ describe("runAgentTool spawn path", () => {
     vi.setSystemTime(Date.now() + ms);
   }
 
+  // See change: surface-subagent-retries.
+  describe("pi auto-retry", () => {
+    beforeEach(() => {
+      vi.useFakeTimers({ toFake: ["Date"] });
+    });
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
+    const retryStart = (attempt: number, maxAttempts: number, delayMs: number, errorMessage = "503") => ({
+      type: "auto_retry_start",
+      attempt,
+      maxAttempts,
+      delayMs,
+      errorMessage,
+    });
+
+    it("shows the backoff on the activity line with a progress update, then returns to normal", async () => {
+      writeConfig({ maxConcurrent: 0 });
+      const created = installSessions();
+      const onUpdate = vi.fn();
+      const pi = fakePi();
+      const run = runAgentTool(tmpCwd, args("p"), undefined, onUpdate, fakeCtx(), pi);
+      await settle();
+      advance();
+      const before = onUpdate.mock.calls.length;
+      created[0].emit(retryStart(2, 18, 4_000));
+      expect(onUpdate.mock.calls.length).toBe(before + 1);
+      const frame = onUpdate.mock.calls.at(-1)![0].details;
+      expect(frame.activity).toBe("retrying (attempt 2/18) in 4s…");
+      expect(frame.retries).toBe(1);
+      const progress = pi.events.emit.mock.calls.filter(([ch]: any[]) => ch === "subagents:started").at(-1)![1];
+      expect(progress.details.activity).toBe("retrying (attempt 2/18) in 4s…");
+
+      advance();
+      created[0].emit(mu("thinking_start"));
+      expect(onUpdate.mock.calls.at(-1)![0].details.activity).toBe("thinking");
+      created[0].finish();
+      const res: any = await run;
+      expect(res.details.retries).toBe(1);
+      expect(res.details.entries.map((e: any) => e.kind)).toEqual(["retry", "text"]);
+    });
+
+    it("counts retries across sequences and ignores auto_retry_end for the timeline", async () => {
+      writeConfig({ maxConcurrent: 0 });
+      const created = installSessions();
+      const pi = fakePi();
+      const run = runAgentTool(tmpCwd, args("p"), undefined, undefined, fakeCtx(), pi, "tc-r");
+      await settle();
+      created[0].emit(retryStart(1, 3, 10));
+      created[0].emit({ type: "auto_retry_end", success: true, attempt: 1 });
+      created[0].emit(retryStart(1, 3, 10));
+      created[0].emit(retryStart(2, 3, 20));
+      created[0].emit({ type: "auto_retry_end", success: true, attempt: 2 });
+      created[0].finish();
+      const res: any = await run;
+      expect(res.details.status).toBe("completed");
+      expect(res.details.retries).toBe(3);
+      expect(res.details.entries.filter((e: any) => e.kind === "retry")).toHaveLength(3);
+
+      // Every scheduled retry and every sequence end goes out on subagents:retry.
+      const events = pi.events.emit.mock.calls.filter(([ch]: any[]) => ch === "subagents:retry").map(([, d]: any[]) => d);
+      expect(events.map((e: any) => [e.phase, e.attempt, e.retries])).toEqual([
+        ["scheduled", 1, 1],
+        ["ended", 1, 1],
+        ["scheduled", 1, 2],
+        ["scheduled", 2, 3],
+        ["ended", 2, 3],
+      ]);
+      expect(events[0]).toEqual({
+        v: 1,
+        agentId: res.details.agentId,
+        toolCallId: "tc-r",
+        phase: "scheduled",
+        attempt: 1,
+        maxAttempts: 3,
+        delayMs: 10,
+        error: "503",
+        retries: 1,
+      });
+      expect(events[1]).toEqual({
+        v: 1,
+        agentId: res.details.agentId,
+        toolCallId: "tc-r",
+        phase: "ended",
+        attempt: 1,
+        success: true,
+        retries: 1,
+      });
+    });
+
+    it("decorates only a failure whose last retry sequence ended unsuccessfully", async () => {
+      writeConfig({ maxConcurrent: 0 });
+      const created = installSessions();
+      const pi = fakePi();
+      const run = runAgentTool(tmpCwd, args("p"), undefined, undefined, fakeCtx(), pi);
+      await settle();
+      created[0].emit(retryStart(1, 2, 10, "429"));
+      created[0].emit(retryStart(2, 2, 20, "429"));
+      created[0].emit({ type: "auto_retry_end", success: false, attempt: 2, finalError: "429" });
+      created[0].finish({ stopReason: "error", errorMessage: "429", content: [] });
+      const res: any = await run;
+      expect(
+        pi.events.emit.mock.calls.filter(([ch]: any[]) => ch === "subagents:retry").at(-1)![1],
+      ).toMatchObject({ phase: "ended", attempt: 2, success: false, finalError: "429", retries: 2 });
+      expect(res.details.error).toBe("429 (after 2 retries)");
+      expect(res.content[0].text).toBe("Subagent failed: 429 (after 2 retries)");
+    });
+
+    it("never decorates an aborted run", async () => {
+      writeConfig({ maxConcurrent: 0 });
+      const created = installSessions();
+      const ac = new AbortController();
+      const run = runAgentTool(tmpCwd, args("p"), ac.signal, undefined, fakeCtx(), fakePi());
+      await settle();
+      created[0].emit(retryStart(1, 2, 60_000));
+      ac.abort();
+      // pi cancels the backoff and ends the run (this fake's abort() is a no-op).
+      created[0].emit({ type: "auto_retry_end", success: false, attempt: 1, finalError: "Retry cancelled" });
+      created[0].finish({ stopReason: "aborted", content: [] });
+      const res: any = await run;
+      expect(res.details.status).toBe("aborted");
+      expect(res.details.error).toBe("aborted by parent");
+    });
+  });
+
   describe("liveTail", () => {
     beforeEach(() => {
       vi.useFakeTimers({ toFake: ["Date"] });
@@ -1311,8 +1448,9 @@ describe("runAgentTool spawn path", () => {
       await run;
       expect(onUpdate.mock.calls.at(-1)![0].details.liveTail).toEqual(CLEARED);
       for (const [ch, payload] of pi.events.emit.mock.calls) {
-        // `subagents:delta` pieces and `subagents:entry` steps are not snapshots (no `details`).
-        if (ch === "subagents:delta" || ch === "subagents:entry") continue;
+        // `subagents:delta` pieces, `subagents:entry` steps and the plugin hook
+        // channels are not snapshots (no `details`).
+        if (ch === "subagents:delta" || ch === "subagents:entry" || ch.startsWith("subagents:before_")) continue;
         expect(payload.details, ch).toHaveProperty("liveTail");
       }
 

@@ -31,7 +31,15 @@ export type SubagentTimelineEntry =
   | { kind: "tool"; toolName: string; input: unknown; output?: unknown; isError?: boolean; ts: number }
   | { kind: "text"; text: string; ts: number }
   | { kind: "thinking"; text: string; ts: number }
-  | { kind: "error"; text: string; ts: number };
+  | { kind: "error"; text: string; ts: number }
+  /**
+   * pi scheduled an auto-retry of a failed provider call. `attempt` is the
+   * 1-based retry number, `maxAttempts` the retry budget, `delayMs` the
+   * scheduled backoff and `text` the provider error that triggered it. The
+   * only timeline record of the failed attempt. See change:
+   * surface-subagent-retries.
+   */
+  | { kind: "retry"; attempt: number; maxAttempts: number; delayMs: number; text: string; ts: number };
 
 export type AgentStatus =
   | "queued" | "running" | "completed" | "aborted" | "stopped" | "error";
@@ -133,6 +141,23 @@ export interface AgentDetails {
   maxConcurrent?: number;
   /** Epoch ms the spawn slot was granted. `durationMs` still counts from call creation. */
   slotGrantedAt?: number;
+  /**
+   * `true` for a background subagent (`Agent` with `run_in_background`),
+   * `false` for a foreground one. Set on every snapshot this producer emits.
+   * See change: add-background-subagents.
+   */
+  background?: boolean;
+  /**
+   * Who stopped the run; set only when `status === "stopped"` and known.
+   * See change: add-background-subagents.
+   */
+  stoppedBy?: "tool" | "event" | "timeout" | "shutdown";
+  /**
+   * Total auto-retry attempts pi scheduled in this run, summed across every
+   * retry sequence. Absent until the first retry. See change:
+   * surface-subagent-retries.
+   */
+  retries?: number;
 }
 
 export interface TokenUsage {
@@ -227,6 +252,40 @@ export function mapSessionEventToEntry(event: AgentSessionEvent): SubagentTimeli
 }
 
 /**
+ * Map pi's `auto_retry_start` to a `retry` timeline entry; `null` for any
+ * other event. Fields are read defensively so a reshaped upstream event
+ * degrades to zeros rather than throwing. See change: surface-subagent-retries.
+ */
+export function retryEntryFromEvent(event: AgentSessionEvent): SubagentTimelineEntry | null {
+  if ((event as { type?: string }).type !== "auto_retry_start") return null;
+  const e = event as { attempt?: unknown; maxAttempts?: unknown; delayMs?: unknown; errorMessage?: unknown };
+  const num = (v: unknown): number => (typeof v === "number" && Number.isFinite(v) ? v : 0);
+  return {
+    kind: "retry",
+    attempt: num(e.attempt),
+    maxAttempts: num(e.maxAttempts),
+    delayMs: num(e.delayMs),
+    text: typeof e.errorMessage === "string" && e.errorMessage !== "" ? e.errorMessage : "Unknown error",
+    ts: Date.now(),
+  };
+}
+
+/**
+ * Human-readable backoff delay: `4s`, `2m 30s`, `1h 5m`. Rounds to whole
+ * seconds; a positive delay under a second reads `1s`.
+ */
+export function formatRetryDelay(ms: number): string {
+  if (!Number.isFinite(ms) || ms <= 0) return "0s";
+  const total = Math.max(1, Math.round(ms / 1000));
+  const h = Math.floor(total / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  const sec = total % 60;
+  if (h > 0) return m > 0 ? `${h}h ${m}m` : `${h}h`;
+  if (m > 0) return sec > 0 ? `${m}m ${sec}s` : `${m}m`;
+  return `${sec}s`;
+}
+
+/**
  * tool_execution_end events arrive without args (only the final result).
  * Pair them with the matching tool_execution_start to fill in `input`.
  * Call from a subscription closure that tracks pending starts.
@@ -318,6 +377,47 @@ export function emitSubagentProgress(
 export function emitSubagentEntry(pi: ExtensionAPI, event: Omit<SubagentEntryEvent, "v">): void {
   const payload: SubagentEntryEvent = { v: 1, ...event };
   emit(pi, "subagents:entry", payload as unknown as Record<string, unknown>);
+}
+
+/**
+ * Payload of `subagents:retry`: pi's own auto-retry inside a subagent.
+ * `scheduled` fires when a backoff starts (with the attempt, budget, delay and
+ * the provider error); `ended` fires when the retry sequence finishes, with
+ * `success` and, on failure, `finalError`. The producer never drives retries.
+ * See change: surface-subagent-retries.
+ */
+export type SubagentRetryEvent =
+  | {
+      v: 1;
+      agentId: string;
+      /** Parent `Agent` tool call id; `""` when unknown. */
+      toolCallId: string;
+      phase: "scheduled";
+      attempt: number;
+      maxAttempts: number;
+      delayMs: number;
+      error: string;
+      /** Total retry attempts scheduled so far in the run, this one included. */
+      retries: number;
+    }
+  | {
+      v: 1;
+      agentId: string;
+      toolCallId: string;
+      phase: "ended";
+      attempt: number;
+      success: boolean;
+      finalError?: string;
+      retries: number;
+    };
+
+/** Distributes `Omit` over each member of a union. */
+type DistributiveOmit<T, K extends PropertyKey> = T extends unknown ? Omit<T, K> : never;
+
+/** One `subagents:retry` event; never throttled. */
+export function emitSubagentRetry(pi: ExtensionAPI, event: DistributiveOmit<SubagentRetryEvent, "v">): void {
+  const payload = { v: 1, ...event } as SubagentRetryEvent;
+  emit(pi, "subagents:retry", payload as unknown as Record<string, unknown>);
 }
 
 /** One append-only block piece on `subagents:delta`. Batched by the caller. */
@@ -600,6 +700,9 @@ export function buildDetails(snapshot: {
   activeSlots?: number;
   maxConcurrent?: number;
   slotGrantedAt?: number;
+  background?: boolean;
+  stoppedBy?: AgentDetails["stoppedBy"];
+  retries?: number;
 }): AgentDetails {
   return {
     agentId: snapshot.agentId,
@@ -630,5 +733,8 @@ export function buildDetails(snapshot: {
     ...(snapshot.activeSlots !== undefined ? { activeSlots: snapshot.activeSlots } : {}),
     ...(snapshot.maxConcurrent !== undefined ? { maxConcurrent: snapshot.maxConcurrent } : {}),
     ...(snapshot.slotGrantedAt !== undefined ? { slotGrantedAt: snapshot.slotGrantedAt } : {}),
+    ...(snapshot.background !== undefined ? { background: snapshot.background } : {}),
+    ...(snapshot.stoppedBy !== undefined ? { stoppedBy: snapshot.stoppedBy } : {}),
+    ...(snapshot.retries !== undefined && snapshot.retries > 0 ? { retries: snapshot.retries } : {}),
   };
 }

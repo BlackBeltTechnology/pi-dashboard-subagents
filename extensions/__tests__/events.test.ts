@@ -25,8 +25,10 @@ import {
   emitSubagentFailed,
   emitSubagentProgress,
   emitSubagentStarted,
+  formatRetryDelay,
   formatTokens,
   mapSessionEventToEntry,
+  retryEntryFromEvent,
 } from "../events.js";
 
 // ── Fixtures ────────────────────────────────────────────────────────────
@@ -454,5 +456,88 @@ describe("buildDetails queue/stop fields", () => {
     expect(d.maxConcurrent).toBe(0);
     expect(d.activeSlots).toBe(0);
     expect(d).not.toHaveProperty("queuePosition");
+  });
+});
+
+// ── retries (change: surface-subagent-retries) ─────────────────────────────
+
+describe("retryEntryFromEvent", () => {
+  it("maps auto_retry_start to a retry entry", () => {
+    const e = retryEntryFromEvent({
+      type: "auto_retry_start",
+      attempt: 2,
+      maxAttempts: 18,
+      delayMs: 4000,
+      errorMessage: "503 service unavailable",
+    } as any);
+    expect(e).toEqual({ kind: "retry", attempt: 2, maxAttempts: 18, delayMs: 4000, text: "503 service unavailable", ts: expect.any(Number) });
+  });
+
+  it("fills defensive defaults for missing or malformed fields", () => {
+    expect(retryEntryFromEvent({ type: "auto_retry_start" } as any)).toMatchObject({
+      kind: "retry",
+      attempt: 0,
+      maxAttempts: 0,
+      delayMs: 0,
+      text: "Unknown error",
+    });
+    expect(
+      retryEntryFromEvent({ type: "auto_retry_start", attempt: "x", delayMs: Number.NaN, errorMessage: "" } as any),
+    ).toMatchObject({ attempt: 0, delayMs: 0, text: "Unknown error" });
+  });
+
+  it("returns null for every other event", () => {
+    for (const type of ["auto_retry_end", "message_end", "tool_execution_end", "agent_end", "turn_end"]) {
+      expect(retryEntryFromEvent({ type, success: true, attempt: 1 } as any), type).toBeNull();
+    }
+  });
+
+  it("mapSessionEventToEntry still ignores retry events", () => {
+    expect(mapSessionEventToEntry({ type: "auto_retry_start", attempt: 1 } as any)).toBeNull();
+  });
+});
+
+describe("formatRetryDelay", () => {
+  it.each([
+    [0, "0s"],
+    [-5, "0s"],
+    [Number.NaN, "0s"],
+    [10, "1s"],
+    [950, "1s"],
+    [1_000, "1s"],
+    [4_000, "4s"],
+    [59_400, "59s"],
+    [59_600, "1m"],
+    [60_000, "1m"],
+    [150_000, "2m 30s"],
+    [3_599_000, "59m 59s"],
+    [3_600_000, "1h"],
+    [3_900_000, "1h 5m"],
+    [3_000_000, "50m"],
+  ])("%p ms → %p", (ms, text) => {
+    expect(formatRetryDelay(ms)).toBe(text);
+  });
+});
+
+describe("buildDetails retries", () => {
+  const base = {
+    agentId: "a",
+    displayName: "d",
+    description: "d",
+    subagentType: "t",
+    status: "running" as const,
+    entries: [],
+    toolUses: 0,
+    tokensTotal: 0,
+    startedAt: Date.now(),
+  };
+
+  it("omits retries when absent or zero", () => {
+    expect("retries" in buildDetails(base)).toBe(false);
+    expect("retries" in buildDetails({ ...base, retries: 0 })).toBe(false);
+  });
+
+  it("passes a positive count through", () => {
+    expect(buildDetails({ ...base, retries: 3 }).retries).toBe(3);
   });
 });

@@ -1,6 +1,7 @@
 # pi-dashboard-subagents
 
-A lightweight **foreground** subagent extension for [pi](https://github.com/mariozechner/pi).
+A lightweight subagent extension for [pi](https://github.com/mariozechner/pi):
+foreground by default, with optional [background subagents](#background-subagents).
 
 Spawns subagents **in-memory** (no new sessions appear in `~/.pi/agent/sessions/`, no
 clutter in the dashboard's session list) and emits **every event, tool call, and
@@ -9,8 +10,12 @@ subagent inspector and pop out into a new tab.
 
 ## Scope
 
-- **Foreground only.** Subagents block the caller until completion.
-- **No background spawning.** No `get_subagent_result`. No `steer_subagent`.
+- **Foreground by default.** An `Agent` call blocks the caller until completion.
+- **Optional background spawning.** `Agent({ run_in_background: true })` returns
+  a `bg-` id at once; `AgentStatus`, `AgentMessages`, `AgentList` and
+  `AgentCancel` check, read, list and stop it. Results are read on request and
+  never pushed into the parent. No steering of a running subagent. Turn the
+  whole feature off with `"allowBackground": false`.
 - **No new sessions on disk.** Sessions live entirely in memory.
 - **Full observability.** Every `tool_execution_end`, `text_end`, `thinking_end`,
   and error from the subagent's session is mirrored to the dashboard as a
@@ -49,6 +54,9 @@ Two persistent settings live at:
   "resultMaxChars": 16000,
   "detailsMaxChars": 20000,
   "entryFieldMaxChars": 2000,
+  "allowBackground": true,
+  "maxBackgroundPending": 8,
+  "backgroundTimeoutSec": 0,
   "inheritance": {
     "recentTurns": 6,
     "toolOutputWindow": 2,
@@ -68,6 +76,9 @@ Two persistent settings live at:
 | `resultMaxChars`           | Cap on the result text in the tool result pi saves to the parent session (default 16000). Head and tail are kept around a `[… N chars truncated …]` marker. `0` = unlimited. Re-read per spawn. |
 | `detailsMaxChars`          | Cap on the serialized `details.entries` in that saved tool result (default 20000). Head and tail entries are kept around one `[N timeline entries omitted]` entry; `details.entriesOmitted` = N. `0` = unlimited. |
 | `entryFieldMaxChars`       | Cap on each timeline entry's text / tool input / tool output in that saved tool result (default 2000). `0` = unlimited. |
+| `allowBackground`          | When `true` (default), `Agent` gains `run_in_background` and `timeout_s`, and the `AgentStatus` / `AgentMessages` / `AgentList` / `AgentCancel` tools are registered. When `false`, the tool surface is exactly the foreground-only one. Read once at activation: changes need `/reload`. |
+| `maxBackgroundPending`     | Cap on background subagents that are queued or running (default 8). A background spawn at the cap is rejected with the outstanding ids. Foreground calls never count. `0` = unlimited. Re-read per call. |
+| `backgroundTimeoutSec`     | Default run-time limit for background subagents, in seconds, counted from when they start running (queue time is free). On expiry the subagent is stopped (`stoppedBy: "timeout"`). `timeout_s` overrides it per call. `0` (default) = no limit. Re-read per call. |
 
 #### Why a concurrency cap
 
@@ -97,6 +108,18 @@ or extend each subagent. Tool, provider and `message_end` hooks still run.
   (`stopReason: "error"` after pi's own retries) or was aborted, or it has no
   text, the call fails (`subagents:failed`, `isError: true`). Text from an
   earlier turn is never returned as the result.
+- **Provider retries are pi's.** Each subagent session reads pi's own
+  `settings.retry` (`~/.pi/agent/settings.json`) and pi retries transient
+  provider errors (overload, 429, 5xx, dropped connections) inside the run,
+  with exponential backoff. This package adds no retry policy; it makes the
+  retries visible. Each scheduled retry adds a `retry` timeline entry, the
+  activity line reads `retrying (attempt N/M) in 4s…` during the backoff, and
+  `details.retries` counts the attempts, and each retry is published on
+  [`subagents:retry`](#subagentsretry). When a run fails after its last retry
+  sequence also failed, the error says so, e.g.
+  `429 rate_limit_error (after 2 retries)`. Errors pi classifies as permanent
+  (quota exhausted, 400, 404) fail at once without a `retry` entry. A stop
+  during a backoff cancels it immediately.
 - **Stop** is honored at every stage: while queued, while the child loader is
   built, and while the session is created. An early Stop sends no model request.
 - **Per-subagent stop.** `pi.events.emit("subagents:stop", { agentId })` stops
@@ -128,8 +151,9 @@ inheritContext=false, exposeInheritanceInTool=true
 
 Missing file or fields fall back to baked-in defaults. Settings are cached,
 and every spawn re-checks the file's mtime, so edits apply on the **next
-spawn** without a restart. The one exception is `exposeInheritanceInTool`: it
-shapes the tool schema, which is fixed at activation, so it needs `/reload`.
+spawn** without a restart. The exceptions are `exposeInheritanceInTool` and
+`allowBackground`: they shape the tool surface, which is fixed at activation,
+so they need `/reload`.
 Waiting calls also re-read `maxConcurrent` about every second.
 `invalidateSettingsCache()` forces a re-read programmatically.
 
@@ -138,6 +162,58 @@ Waiting calls also re-read `maxConcurrent` about every second.
 `recentTurns`, `toolOutputWindow`, and `maxChars` are never exposed to the
 LLM under any setting. They're operator concerns — fine-tune them globally
 by editing the config file; the next spawn uses the new values.
+
+## Background subagents
+
+With `allowBackground` on (the default), the parent can start subagents that
+run while it keeps working, then check on them later.
+
+```
+Agent({ subagent_type, description, prompt, run_in_background: true, timeout_s? })
+  → "Started background subagent bg-3fa91c (running). Background: 1 running, 0 queued, 0 finished-unread. …"
+
+AgentStatus({ ids: ["bg-3fa91c"], wait?: "none" | "any" | "all", timeout_s? })
+AgentMessages({ id: "bg-3fa91c", from?, limit?, kinds? })
+AgentList()
+AgentCancel({ ids: ["bg-3fa91c"] | "all", status?: "queued" | "running" })
+```
+
+- **Same run, not awaited.** A background subagent runs exactly like a
+  foreground one: same `subagents:*` events (with `details.background: true`),
+  same `maxConcurrent` slots, same queue info, same `subagents:stop`. The
+  `Agent` call returns at once with a short `bg-` id, its queue position and
+  the running / queued / finished-unread counts. Its result `details` carry
+  `{ background: true, id, status }` and **no `agentId`**, so the dashboard
+  does not mark the card finished early.
+- **Not tied to the parent turn.** Interrupting the parent turn does not stop
+  background work. `AgentCancel`, `subagents:stop`, the run-time limit and
+  session shutdown do.
+- **Ids.** Every tool accepts the short `bg-` id, the full `agentId`, or a
+  unique prefix of either.
+- **Nothing is delivered.** A finished result is stored in memory and read on
+  request (`AgentStatus`). No message, follow-up or steer is sent into the
+  parent. Results last for the rest of the session and do **not** survive
+  `/reload`, `/resume` or a restart.
+- **`AgentStatus`** returns current state, or waits for `"any"` / `"all"` ids
+  to finish. `timeout_s` caps the wait and never cancels anything; aborting
+  the call ends only the wait. Unknown ids report `not_found`.
+- **`AgentMessages`** pages a subagent's timeline, live or finished: the last
+  20 entries by default, or from `from` onward (pass the returned `next_from`
+  to read only new entries). `kinds` filters before paging.
+- **`AgentList`** lists every background subagent of the session with status,
+  age, tokens and whether its finished result is still unread.
+- **`AgentCancel`** stops through the same path as `subagents:stop`: a queued
+  subagent leaves the queue without using a slot, a running one is aborted.
+  They end `stopped` (not an error), with `stoppedBy: "tool"`, and their
+  partial timeline stays readable. `ids: "all", status: "queued"` clears a
+  forgotten queue. It does not wait for the stop to finish.
+- **Safeguards.** `maxBackgroundPending` caps outstanding background work.
+  Foreground calls always take the next free slot before any queued
+  background call (FIFO within each). `backgroundTimeoutSec` / `timeout_s`
+  bound run time. On `session_shutdown` every queued or running background
+  subagent is stopped (`stoppedBy: "shutdown"`).
+- **Children never manage subagents.** `Agent` and all four background tools
+  are removed from every child session.
 
 ## Upstream prompt caching — future work
 
@@ -170,11 +246,11 @@ The two existing subagent extensions for pi each have a tradeoff:
 | ---------------------------------- | ------------------ | ------------- | ------------- | ---------- |
 | `@tintinweb/pi-subagents`          | In-memory          | Clean ✓       | Summary only  | Yes        |
 | `pi-subagents` (Nico Bailon)       | Separate process   | Cluttered ✗   | Full ✓        | Yes        |
-| **`pi-dashboard-subagents` (this)**| **In-memory ✓**    | **Clean ✓**   | **Full ✓**    | No (by design) |
+| **`pi-dashboard-subagents` (this)**| **In-memory ✓**    | **Clean ✓**   | **Full ✓**    | Optional, pull-only |
 
-This extension drops background/async complexity entirely and focuses on one
-thing: foreground subagent runs with first-class observability for the
-pi-agent-dashboard inspector.
+This extension focuses on first-class observability for the pi-agent-dashboard
+inspector. Background runs are the same in-memory runs with the same timeline;
+results are pulled on request, never pushed into the parent.
 
 ## Install
 
@@ -532,6 +608,7 @@ dashboard) can consume all six:
 | `subagents:started`     | `subagent_started`       | Initial "running" emission, AND all progress ticks (re-uses channel; progress ticks omit `entries`, carry `entryCount`) |
 | `subagents:entry`       | — (not forwarded by core) | Once per timeline step, the moment it is appended (never throttled). Steps finishing a streamed text/thinking block carry `blockId` |
 | `subagents:delta`       | —                        | Append-only pieces of the streaming text/thinking block (see below) |
+| `subagents:retry`       | —                        | pi scheduled an auto-retry (`phase: "scheduled"`) or finished a retry sequence (`phase: "ended"`); see [`subagents:retry`](#subagentsretry) |
 | `subagents:completed`   | `subagent_completed`     | `await session.prompt(...)` resolves and the final assistant reply succeeded with text |
 | `subagents:failed`      | `subagent_failed`        | Any throw, abort, errored/empty final reply, or session error path |
 
@@ -539,7 +616,44 @@ Inbound control channel (listened to, never emitted):
 
 | Channel           | Payload       | Effect |
 | ----------------- | ------------- | ------ |
-| `subagents:stop`  | `{ agentId }` | Stops that queued or running subagent of this session → `subagents:completed` with `details.status: "stopped"` |
+| `subagents:stop`  | `{ agentId }` | Stops that queued or running subagent of this session → `subagents:completed` with `details.status: "stopped"`, `stoppedBy: "event"` |
+
+### Plugin hooks
+
+Other packages can observe, intercept and query subagents on `pi.events`.
+Intercept and query channels pass a **mutable payload that handlers fill
+synchronously** during `emit`; values set after `emit` returns are ignored,
+and a throwing handler is ignored as if absent.
+
+| Kind      | Channel                   | Payload                                                     | Contract |
+| --------- | ------------------------- | ----------------------------------------------------------- | -------- |
+| observe   | `subagents:*` lifecycle   | `details.background`, `details.stoppedBy`                   | Every lifecycle event says whether the run is background; stopped runs say who stopped them (`tool` / `event` / `timeout` / `shutdown`). |
+| observe   | `subagents:result_read`   | `{ id, agentId, via: "status" \| "messages" }`              | A stored background result (`AgentStatus`) or timeline page (`AgentMessages`) was returned. |
+| intercept | `subagents:before_spawn`  | `{ args, background, veto?, reason?, patch? }`              | Runs before anything is created, for foreground and background spawns. `veto: true` → the call returns an error containing `reason`. `patch` may override `prompt`, `model`, `description`. |
+| intercept | `subagents:before_store`  | `{ id?, agentId, background, status, result, patch? }`      | Runs on every terminal state before the result is emitted, bounded, stored or returned. A string `patch.result` replaces the result text (e.g. redaction). |
+| query     | `subagents:list`          | `{ filter?: { status? }, out? }`                            | The owning session fills `out` with the same rows as `AgentList`. |
+| query     | `subagents:get`           | `{ id, from?, limit?, kinds?, out? }`                       | The owning session fills `out` with `{ status, messages }` (as `AgentStatus` / `AgentMessages`). Unknown ids leave `out` unset. Never marks a result read. |
+| control   | `subagents:stop`          | `{ agentId }`                                               | See above. There is no separate cancel channel. |
+
+A query handler answers only when `out` is still unset, and only from its own
+session, so several sessions on one bus never overwrite each other. Typed
+helpers are exported so plugins need not hand-write channel names:
+
+```ts
+import {
+  onSubagentEvent, listBackgroundAgents, getBackgroundAgent, stopSubagent, SUBAGENT_CHANNELS,
+  type BeforeSpawnPayload,
+} from "@blackbelt-technology/pi-dashboard-subagents";
+
+pi.events.on(SUBAGENT_CHANNELS.beforeSpawn, (p) => {
+  const payload = p as BeforeSpawnPayload;
+  if (overBudget()) { payload.veto = true; payload.reason = "budget exceeded"; }
+});
+const off = onSubagentEvent(pi, "subagents:completed", (e) => log(e.id, e.result));
+const running = listBackgroundAgents(pi, { status: "running" });
+const one = getBackgroundAgent(pi, "bg-3fa91c", { limit: 10 });
+stopSubagent(pi, running[0].agentId);
+```
 
 While calls wait for a slot, every queue change (slot granted, waiter removed,
 limit changed) re-pushes a queued snapshot to each remaining waiter, batched to
@@ -622,6 +736,9 @@ The `details` payload (defined in `extensions/events.ts`) carries everything the
 | `activeSlots?` | `number`                        | Slots in use; only on queued snapshots                                   |
 | `maxConcurrent?` | `number`                      | Effective limit (`0` = unlimited); only on queued snapshots              |
 | `slotGrantedAt?` | `number`                      | Epoch ms the slot was granted; `durationMs` still counts from creation   |
+| `background?`  | `boolean`                       | `true` for a background run, `false` for foreground; set on every snapshot |
+| `stoppedBy?`   | `"tool" \| "event" \| "timeout" \| "shutdown"` | Who stopped the run; only when `status === "stopped"` |
+| `retries?`     | `number`                        | Auto-retry attempts pi scheduled in this run, summed over all retry sequences; absent until the first |
 
 ### `SubagentTimelineEntry` kinds
 
@@ -630,14 +747,41 @@ The `details` payload (defined in `extensions/events.ts`) carries everything the
 | { kind: "text";     text, ts }              // assistant text (text_end)
 | { kind: "thinking"; text, ts }              // assistant thinking (thinking_end)
 | { kind: "error";    text, ts }              // assistant error
+| { kind: "retry";    attempt, maxAttempts, delayMs, text, ts }  // pi scheduled an auto-retry (text = provider error)
 ```
 
 Only `_end`-flavored session events become entries — each entry is final / idempotent. Live activity is conveyed via `details.activity` instead.
+
+A `retry` entry is appended each time pi schedules an auto-retry of a failed
+provider call (`auto_retry_start`): `attempt` is the 1-based retry number,
+`maxAttempts` the budget from pi's `settings.retry.maxRetries`, `delayMs` the
+scheduled backoff and `text` the provider error. It is the only timeline record
+of the failed attempt; a retried attempt gets no `error` entry. Consumers that
+switch exhaustively on `kind` must handle it (added in the release after 0.6.0).
+
+### `subagents:retry`
+
+pi's auto-retry inside a subagent is also published on its own channel, so a
+listener can follow retries without filtering the timeline. Never throttled.
+
+```ts
+// SubagentRetryEvent
+{ v: 1, agentId, toolCallId, phase: "scheduled", attempt, maxAttempts, delayMs, error, retries }
+{ v: 1, agentId, toolCallId, phase: "ended",     attempt, success, finalError?, retries }
+```
+
+`scheduled` fires when a backoff starts; `ended` fires when the retry sequence
+finishes (`success: false` with `finalError` when it gave up or the retried
+call failed permanently). `retries` is the run's running total, the same
+number as `details.retries`. Subscribe with
+`onSubagentEvent(pi, "subagents:retry", handler)` or
+`pi.events.on(SUBAGENT_CHANNELS.retry, handler)`.
 
 ### Persistence model
 
 - **Subagent's conversation** — in-memory only, dies with the parent turn (uses `SessionManager.inMemory(cwd)`).
 - **Subagent's final result + timeline** — embedded in the `AgentToolResult<AgentDetails>` returned to the parent, size-bounded (see `resultMaxChars` / `detailsMaxChars`). Pi persists it inside the parent's `ToolResultMessage.details` in the parent session's JSONL. Survives `/resume`; a replayed timeline keeps head and tail steps around an omission marker.
+- **Background results** — held in memory by the session that spawned them, for the rest of that session. The background `Agent` call's own tool result holds only the `bg-` id, so a background subagent's result and timeline are **not** in the parent JSONL and do not survive `/reload`, `/resume` or a restart (`AgentStatus` then reports `not_found`).
 - **Live progress** — streamed only; not buffered server-side. A dashboard refresh while a subagent is still running loses the live card until the parent's tool result lands in JSONL (then state-replay re-hydrates from `details`). See the dashboard's `add-subagent-inspector` change for the consumer-side replay seam.
 
 ## License

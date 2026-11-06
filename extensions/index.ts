@@ -45,6 +45,7 @@ import {
   type AgentStatus,
   type InheritanceOptions,
   type SubagentDeltaEvent,
+  type SubagentRetryEvent,
   type SubagentTimelineEntry,
   type TokenUsage,
   buildDetails,
@@ -55,6 +56,7 @@ import {
   emitSubagentCompleted,
   emitSubagentCreated,
   emitSubagentDelta,
+  emitSubagentRetry,
   emitSubagentFailed,
   emitSubagentProgress,
   emitSubagentStarted,
@@ -65,10 +67,16 @@ import {
 import {
   type DashboardAgentSettings,
   type InheritanceCompressionSettings,
+  type ResultLimits,
   DEFAULT_SETTINGS,
+  getBackgroundTimeoutSec,
   getInheritanceCompression,
+  getMaxBackgroundPending,
+  getMaxConcurrent,
+  getResultLimits,
   getSettingsPath,
   invalidateSettingsCache,
+  isBackgroundAllowed,
   loadSettings,
   resolveIsolated,
   saveSettings,
@@ -98,6 +106,7 @@ export {
   type AgentStatus,
   type InheritanceOptions,
   type SubagentDeltaEvent,
+  type SubagentRetryEvent,
   type SubagentTimelineEntry,
   type TokenUsage,
   buildDetails,
@@ -108,6 +117,7 @@ export {
   emitSubagentCompleted,
   emitSubagentCreated,
   emitSubagentDelta,
+  emitSubagentRetry,
   emitSubagentFailed,
   emitSubagentProgress,
   emitSubagentStarted,
@@ -118,10 +128,16 @@ export {
 export {
   type DashboardAgentSettings,
   type InheritanceCompressionSettings,
+  type ResultLimits,
   DEFAULT_SETTINGS,
+  getBackgroundTimeoutSec,
   getInheritanceCompression,
+  getMaxBackgroundPending,
+  getMaxConcurrent,
+  getResultLimits,
   getSettingsPath,
   invalidateSettingsCache,
+  isBackgroundAllowed,
   loadSettings,
   resolveIsolated,
   saveSettings,
@@ -147,6 +163,47 @@ export {
   resolveAgentMdPath,
   resolveModelFromRef,
 };
+
+// Background subagents + plugin hooks on pi.events.
+// See change: add-background-subagents.
+export {
+  type BackgroundCounts,
+  type BackgroundRecord,
+  type StoredResult,
+  type StoppedBy,
+  BACKGROUND_ID_PREFIX,
+} from "./background.js";
+export {
+  type AgentCancelDetails,
+  type AgentStatusDetails,
+  type BackgroundAgentStatus,
+  type BackgroundAgentSummary,
+  type BackgroundMessagesPage,
+  type CancelOutcome,
+} from "./background-tools.js";
+export {
+  type BeforeSpawnPayload,
+  type BeforeStorePayload,
+  type GetQueryPayload,
+  type ListQueryPayload,
+  type ResultReadEvent,
+  type SpawnArgs,
+  type StopRequest,
+  type SubagentEventMap,
+  getBackgroundAgent,
+  listBackgroundAgents,
+  onSubagentEvent,
+  stopSubagent,
+  SUBAGENT_CHANNELS,
+} from "./hooks.js";
+export {
+  type BackgroundSpawnDetails,
+  type RunAgentOptions,
+  type SpawnLane,
+  type SpawnVetoDetails,
+  type StopSource,
+  SUBAGENT_MANAGEMENT_TOOLS,
+} from "./agent.js";
 
 // ─── Extension entry point (pi.ExtensionFactory) ────────────────────────
 //
