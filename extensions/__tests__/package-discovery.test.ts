@@ -338,3 +338,62 @@ describe("ensurePackageAgentIndex cache", () => {
     }
   });
 });
+
+// ── per-cwd LRU (change: add-subagent-orchestration, D10) ──────────────────
+
+describe("per-cwd index cache", () => {
+  const dirs: string[] = [];
+  const mk = (tag: string) => {
+    const d = mkdtempSync(join(tmpdir(), `pi-pkgdisc-${tag}-`));
+    dirs.push(d);
+    return d;
+  };
+  afterEach(() => {
+    for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true });
+  });
+
+  it("alternating sibling cwds keep their own entries (no rebuild)", () => {
+    const a = mk("a");
+    const b = mk("b");
+    const pA = makePackage("lruA", ["alpha.md"]);
+    mockState.configuredPackages = [{ source: "@a/a", scope: "user", filtered: false, installedPath: pA }];
+    const idxA = refreshPackageAgentIndex(a, agentDir);
+    const pB = makePackage("lruB", ["beta.md"]);
+    mockState.configuredPackages = [{ source: "@a/b", scope: "user", filtered: false, installedPath: pB }];
+    const idxB = ensurePackageAgentIndex(b, agentDir);
+    // Config changes again; neither cwd may rebuild.
+    mockState.configuredPackages = [];
+    expect(ensurePackageAgentIndex(a, agentDir)).toBe(idxA);
+    expect(ensurePackageAgentIndex(b, agentDir)).toBe(idxB);
+    expect(ensurePackageAgentIndex(a, agentDir).has("alpha")).toBe(true);
+  });
+
+  it("holds at most 8 cwds, evicting the least recently used", () => {
+    mockState.configuredPackages = [];
+    const cwds = Array.from({ length: 9 }, (_, i) => mk(`lru${i}`));
+    const first = refreshPackageAgentIndex(cwds[0]!, agentDir);
+    const second = ensurePackageAgentIndex(cwds[1]!, agentDir);
+    for (const c of cwds.slice(2, 8)) ensurePackageAgentIndex(c, agentDir);
+    ensurePackageAgentIndex(cwds[0]!, agentDir); // touch: cwds[1] is now LRU
+    ensurePackageAgentIndex(cwds[8]!, agentDir); // 9th → evicts cwds[1]
+    expect(ensurePackageAgentIndex(cwds[0]!, agentDir)).toBe(first);
+    const before = ensurePackageAgentIndex(cwds[2]!, agentDir);
+    expect(ensurePackageAgentIndex(cwds[2]!, agentDir)).toBe(before);
+    expect(ensurePackageAgentIndex(cwds[1]!, agentDir)).not.toBe(second); // evicted → rebuilt
+  });
+
+  it("refresh (resources_discover) drops every cached cwd", () => {
+    const a = mk("ra");
+    const b = mk("rb");
+    mockState.configuredPackages = [];
+    const idxA = refreshPackageAgentIndex(a, agentDir);
+    const idxB = ensurePackageAgentIndex(b, agentDir);
+    const p = makePackage("lruNew", ["fresh.md"]);
+    mockState.configuredPackages = [{ source: "@a/new", scope: "user", filtered: false, installedPath: p }];
+    refreshPackageAgentIndex(a, agentDir);
+    const nb = ensurePackageAgentIndex(b, agentDir);
+    expect(nb).not.toBe(idxB);
+    expect(nb.has("fresh")).toBe(true);
+    expect(ensurePackageAgentIndex(a, agentDir)).not.toBe(idxA);
+  });
+});

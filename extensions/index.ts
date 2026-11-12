@@ -65,18 +65,23 @@ import {
 } from "./events.js";
 
 import {
+  type CwdScope,
   type DashboardAgentSettings,
   type InheritanceCompressionSettings,
   type ResultLimits,
   DEFAULT_SETTINGS,
+  getBackgroundIdleTtlSec,
   getBackgroundTimeoutSec,
+  getCwdScope,
   getInheritanceCompression,
   getMaxBackgroundPending,
   getMaxConcurrent,
+  getMaxIdleBackground,
   getResultLimits,
   getSettingsPath,
   invalidateSettingsCache,
   isBackgroundAllowed,
+  isNotifyParentEnabled,
   loadSettings,
   resolveIsolated,
   saveSettings,
@@ -126,18 +131,23 @@ export {
 };
 
 export {
+  type CwdScope,
   type DashboardAgentSettings,
   type InheritanceCompressionSettings,
   type ResultLimits,
   DEFAULT_SETTINGS,
+  getBackgroundIdleTtlSec,
   getBackgroundTimeoutSec,
+  getCwdScope,
   getInheritanceCompression,
   getMaxBackgroundPending,
   getMaxConcurrent,
+  getMaxIdleBackground,
   getResultLimits,
   getSettingsPath,
   invalidateSettingsCache,
   isBackgroundAllowed,
+  isNotifyParentEnabled,
   loadSettings,
   resolveIsolated,
   saveSettings,
@@ -169,6 +179,7 @@ export {
 export {
   type BackgroundCounts,
   type BackgroundRecord,
+  type BackgroundStatus,
   type StoredResult,
   type StoppedBy,
   BACKGROUND_ID_PREFIX,
@@ -182,6 +193,16 @@ export {
   type CancelOutcome,
 } from "./background-tools.js";
 export {
+  type AnswerEvent,
+  type DisposedEvent,
+  type IdleEvent,
+  type MailDroppedEvent,
+  type MailEvent,
+  type PushEvent,
+  type QuestionEvent,
+  type SlotEvent,
+  type SteerEvent,
+  type WaitEvent,
   type BeforeSpawnPayload,
   type BeforeStorePayload,
   type GetQueryPayload,
@@ -196,6 +217,28 @@ export {
   stopSubagent,
   SUBAGENT_CHANNELS,
 } from "./hooks.js";
+// Orchestration: one AgentControl tool, mailbox / asks / steer, per-child cwd.
+// See change: add-subagent-orchestration.
+export {
+  AGENT_CONTROL_ACTIONS,
+  AGENT_CONTROL_TOOL_NAME,
+  type AgentControlAction,
+} from "./agent-control.js";
+export {
+  type MailEntry,
+  type OutcomeKind,
+  type ReplyResult,
+  type SteerMode,
+  type SteerResult,
+} from "./orchestration.js";
+export { type CwdRejectReason, type CwdResolution, resolveChildProjectTrust, resolveSubagentCwd } from "./cwd.js";
+export {
+  ASK_PARENT_TOOL_NAME,
+  type CwdRejectDetails,
+  type DisposeReason,
+  type IdleHandle,
+  type LiveSession,
+} from "./agent.js";
 export {
   type BackgroundSpawnDetails,
   type RunAgentOptions,

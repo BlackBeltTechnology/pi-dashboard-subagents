@@ -23,9 +23,15 @@ export const BACKGROUND_ID_PREFIX = "bg-";
 /** Statuses after which a record never changes again. */
 const TERMINAL: ReadonlySet<AgentStatus> = new Set(["completed", "aborted", "stopped", "error"]);
 
-export function isTerminalStatus(status: AgentStatus): boolean {
-  return TERMINAL.has(status);
+export function isTerminalStatus(status: BackgroundStatus): boolean {
+  return status !== "idle" && TERMINAL.has(status);
 }
+
+/**
+ * Record status: a run status, or `idle` = the last run finished and the
+ * session is kept alive for `AgentSteer`. See change: add-subagent-orchestration.
+ */
+export type BackgroundStatus = AgentStatus | "idle";
 
 /** Who caused a stop. See change: add-background-subagents (D7). */
 export type StoppedBy = "tool" | "event" | "timeout" | "shutdown";
@@ -51,8 +57,14 @@ export interface BackgroundRecord {
   readonly agentId: string;
   readonly subagentType: string;
   readonly description: string;
+  /** Resolved working directory of the subagent. See change: add-subagent-orchestration. */
+  readonly cwd?: string;
   readonly createdAt: number;
-  status: AgentStatus;
+  status: BackgroundStatus;
+  /** Current run number, 1-based; `AgentSteer` on an idle record starts the next. */
+  run: number;
+  /** Run whose result is stored in `result`. */
+  finishedRun?: number;
   /** Latest snapshot from the run's `onUpdate` (progress frames carry no entries). */
   latest?: AgentDetails;
   /** Live timeline, each entry field-cut on append. */
@@ -63,11 +75,14 @@ export interface BackgroundRecord {
   readAt?: number;
   /** Set when the stop was requested; copied into the stored result. */
   stoppedBy?: StoppedBy;
+  /** Set while the subagent is blocked in `ask_parent`. See change: add-subagent-orchestration. */
+  asking?: { questionId: string; question: string; askedAt: number };
 }
 
 export interface BackgroundCounts {
   running: number;
   queued: number;
+  idle: number;
   finishedUnread: number;
 }
 
@@ -92,15 +107,25 @@ export interface BackgroundRegistryOptions {
 
 export interface BackgroundRegistry {
   /** Register a new background subagent (status `queued`). */
-  create(init: { agentId: string; subagentType: string; description: string }): BackgroundRecord;
+  create(init: { agentId: string; subagentType: string; description: string; cwd?: string }): BackgroundRecord;
   /** `onUpdate` sink for the run: tracks status and the latest snapshot. */
   sink(record: BackgroundRecord): (update: { details?: AgentDetails }) => void;
   /** Mark the run as holding a slot. */
   markRunning(record: BackgroundRecord): void;
   /** Append one timeline step (field-cut). */
   appendEntry(record: BackgroundRecord, entry: SubagentTimelineEntry): void;
-  /** Store the terminal result. Idempotent: the first result wins. */
-  finish(record: BackgroundRecord, result: RunResultLike): void;
+  /**
+   * Store the current run's result; `idle` keeps the record alive (status
+   * `idle`) instead of terminal. Once per run: returns false when this run's
+   * result is already stored.
+   */
+  finish(record: BackgroundRecord, result: RunResultLike, opts?: { idle?: boolean }): boolean;
+  /** Start the next run of an idle record (`run` + 1). */
+  startRun(record: BackgroundRecord, status: "queued" | "running"): void;
+  /** Idle → its last run's status. False when not idle. */
+  dispose(record: BackgroundRecord): boolean;
+  /** Idle records, oldest first. */
+  idle(): BackgroundRecord[];
   /** Resolve a short id, full `agentId` or unique prefix of either. */
   lookup(idOrPrefix: string): BackgroundRecord | LookupMiss;
   /** Every record, oldest first. */
@@ -144,22 +169,27 @@ export function createBackgroundRegistry(opts: BackgroundRegistryOptions = {}): 
     return id;
   }
 
-  function setStatus(record: BackgroundRecord, status: AgentStatus): boolean {
-    if (record.result || record.status === status) return false;
-    if (isTerminalStatus(record.status)) return false;
+  /** The current run's result is stored (idle or terminal). */
+  const runDone = (record: BackgroundRecord): boolean => record.finishedRun === record.run;
+
+  function setStatus(record: BackgroundRecord, status: BackgroundStatus): boolean {
+    if (runDone(record) || record.status === status) return false;
+    if (record.status !== "idle" && isTerminalStatus(record.status)) return false;
     record.status = status;
     return true;
   }
 
   return {
-    create({ agentId, subagentType, description }) {
+    create({ agentId, subagentType, description, cwd }) {
       const record: BackgroundRecord = {
         id: newId(),
         agentId,
         subagentType,
         description,
+        ...(cwd !== undefined ? { cwd } : {}),
         createdAt: now(),
         status: "queued",
+        run: 1,
         entries: [],
       };
       byId.set(record.id, record);
@@ -171,7 +201,7 @@ export function createBackgroundRegistry(opts: BackgroundRegistryOptions = {}): 
     sink(record) {
       return (update) => {
         const details = update?.details;
-        if (!details || record.result) return;
+        if (!details || runDone(record)) return;
         record.latest = details;
         // Terminal states are stored by `finish`, which has the result text.
         if (details.status && !isTerminalStatus(details.status)) setStatus(record, details.status);
@@ -187,8 +217,8 @@ export function createBackgroundRegistry(opts: BackgroundRegistryOptions = {}): 
       record.entries.push(cut(entry));
     },
 
-    finish(record, res) {
-      if (record.result) return;
+    finish(record, res, opts) {
+      if (runDone(record)) return false;
       const d = res.details ?? {};
       const status: AgentStatus =
         d.status && isTerminalStatus(d.status) ? d.status : res.isError ? "error" : "completed";
@@ -207,9 +237,30 @@ export function createBackgroundRegistry(opts: BackgroundRegistryOptions = {}): 
         durationMs: typeof d.durationMs === "number" ? d.durationMs : now() - record.createdAt,
         finishedAt: now(),
       };
-      record.status = status;
+      record.finishedRun = record.run;
+      record.readAt = undefined;
+      record.status = opts?.idle ? "idle" : status;
       if (d.agentId) record.latest = { ...(record.latest ?? {}), ...(d as AgentDetails) };
       changed(record);
+      return true;
+    },
+
+    startRun(record, status) {
+      if (record.status !== "idle") return;
+      record.run += 1;
+      record.status = status;
+      changed(record);
+    },
+
+    dispose(record) {
+      if (record.status !== "idle" || !record.result) return false;
+      record.status = record.result.status;
+      changed(record);
+      return true;
+    },
+
+    idle() {
+      return [...byId.values()].filter((r) => r.status === "idle");
     },
 
     lookup(raw) {
@@ -233,10 +284,14 @@ export function createBackgroundRegistry(opts: BackgroundRegistryOptions = {}): 
     },
 
     counts() {
-      const c: BackgroundCounts = { running: 0, queued: 0, finishedUnread: 0 };
+      const c: BackgroundCounts = { running: 0, queued: 0, idle: 0, finishedUnread: 0 };
       for (const r of byId.values()) {
         if (r.status === "running") c.running++;
         else if (r.status === "queued") c.queued++;
+        else if (r.status === "idle") {
+          c.idle++;
+          if (r.readAt === undefined) c.finishedUnread++;
+        }
         else if (r.result && r.readAt === undefined) c.finishedUnread++;
       }
       return c;

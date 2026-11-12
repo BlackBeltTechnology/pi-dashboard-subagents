@@ -92,7 +92,30 @@ export interface DashboardAgentSettings {
    * call. Default: 0.
    */
   backgroundTimeoutSec: number;
+  /**
+   * Push mailbox entries (questions, outcomes) to the parent as one batched
+   * follow-up when no `AgentWait` is active. `false` keeps background
+   * results pull-only. Read per post. Default: true.
+   * See change: add-subagent-orchestration.
+   */
+  notifyParent: boolean;
+  /**
+   * Seconds a finished background subagent stays alive (`idle`) so
+   * `AgentSteer` can continue it. `0` = dispose at once. Default: 600.
+   */
+  backgroundIdleTtlSec: number;
+  /** Cap on idle background subagents; the oldest is evicted. Default: 4. */
+  maxIdleBackground: number;
+  /**
+   * Where `Agent.cwd` may point: `"repo"` = parent cwd subtree, parent git
+   * top-level or any worktree of the parent repo; `"any"` = any existing
+   * directory. Default: "repo".
+   */
+  cwdScope: CwdScope;
 }
+
+/** Allowed `Agent.cwd` scope. See change: add-subagent-orchestration. */
+export type CwdScope = "repo" | "any";
 
 /** The three result-size limits, as read by `getResultLimits()`. */
 export type ResultLimits = Pick<
@@ -115,6 +138,10 @@ export const DEFAULT_SETTINGS: DashboardAgentSettings = Object.freeze({
   allowBackground: true,
   maxBackgroundPending: 8,
   backgroundTimeoutSec: 0,
+  notifyParent: true,
+  backgroundIdleTtlSec: 600,
+  maxIdleBackground: 4,
+  cwdScope: "repo",
 }) as DashboardAgentSettings;
 
 // ─── Storage location ────────────────────────────────────────────────────
@@ -193,7 +220,16 @@ function mergeWithDefaults(partial: Partial<DashboardAgentSettings>): DashboardA
     allowBackground: coerceBoolean(partial.allowBackground, DEFAULT_SETTINGS.allowBackground),
     maxBackgroundPending: coerceLimit(partial.maxBackgroundPending, DEFAULT_SETTINGS.maxBackgroundPending),
     backgroundTimeoutSec: coerceLimit(partial.backgroundTimeoutSec, DEFAULT_SETTINGS.backgroundTimeoutSec),
+    notifyParent: coerceBoolean(partial.notifyParent, DEFAULT_SETTINGS.notifyParent),
+    backgroundIdleTtlSec: coerceLimit(partial.backgroundIdleTtlSec, DEFAULT_SETTINGS.backgroundIdleTtlSec),
+    maxIdleBackground: coerceLimit(partial.maxIdleBackground, DEFAULT_SETTINGS.maxIdleBackground),
+    cwdScope: coerceCwdScope(partial.cwdScope, DEFAULT_SETTINGS.cwdScope),
   };
+}
+
+/** Anything but `"repo"` / `"any"` falls back to `fallback`. */
+function coerceCwdScope(value: unknown, fallback: CwdScope): CwdScope {
+  return value === "repo" || value === "any" ? value : fallback;
 }
 
 /** Non-boolean values fall back to `fallback`. */
@@ -250,6 +286,13 @@ export function saveSettings(patch: Partial<DashboardAgentSettings>): DashboardA
       patch.backgroundTimeoutSec ?? current.backgroundTimeoutSec,
       current.backgroundTimeoutSec,
     ),
+    notifyParent: coerceBoolean(patch.notifyParent, current.notifyParent),
+    backgroundIdleTtlSec: coerceLimit(
+      patch.backgroundIdleTtlSec ?? current.backgroundIdleTtlSec,
+      current.backgroundIdleTtlSec,
+    ),
+    maxIdleBackground: coerceLimit(patch.maxIdleBackground ?? current.maxIdleBackground, current.maxIdleBackground),
+    cwdScope: coerceCwdScope(patch.cwdScope, current.cwdScope),
   };
   writeSettingsToDisk(next);
   cached = next;
@@ -355,6 +398,30 @@ export function getMaxBackgroundPending(): number {
 export function getBackgroundTimeoutSec(): number {
   refreshIfConfigChanged();
   return loadSettings().backgroundTimeoutSec;
+}
+
+/** Whether mailbox entries are pushed to the parent. Read per post. */
+export function isNotifyParentEnabled(): boolean {
+  refreshIfConfigChanged();
+  return loadSettings().notifyParent;
+}
+
+/** Idle keep-alive for finished background subagents, seconds (`0` = none). */
+export function getBackgroundIdleTtlSec(): number {
+  refreshIfConfigChanged();
+  return loadSettings().backgroundIdleTtlSec;
+}
+
+/** Cap on idle background subagents. */
+export function getMaxIdleBackground(): number {
+  refreshIfConfigChanged();
+  return loadSettings().maxIdleBackground;
+}
+
+/** Allowed `Agent.cwd` scope. Read per call. */
+export function getCwdScope(): CwdScope {
+  refreshIfConfigChanged();
+  return loadSettings().cwdScope;
 }
 
 function refreshIfConfigChanged(): void {

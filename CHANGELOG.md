@@ -6,6 +6,30 @@ All notable changes to this package are documented here. Format follows
 
 ## [Unreleased]
 
+### Added
+
+- **Orchestration of background subagents.** One parent tool, `AgentControl({ action, … })`, carries every background operation: `status`, `list`, `messages`, `cancel`, `wait`, `reply`, `steer`. See change: add-subagent-orchestration.
+  - **`ask_parent`** (background children only): the child asks and blocks until the parent replies. There is no timeout. While waiting the child releases its concurrency slot; on the reply it re-acquires one ahead of other background work.
+  - **`wait`** returns all pending questions and outcomes in one batch (default 300 s, never cancels anything).
+  - **`reply`** answers one question or a `replies[]` batch.
+  - **`steer`** (`id` or `ids[]`) redirects a running child (`steer` / `followUp`) or continues an idle one on the same history.
+  - Questions shown to the parent say the child is BLOCKED and include the exact `reply` call; `status` and `list` show a short form.
+- **Idle keep-alive.** A finished background run stays alive (`idle`, no slot held) so it can be continued. It is freed by `backgroundIdleTtlSec` (600), the `maxIdleBackground` cap (4, oldest first), `cancel` or shutdown.
+- **Push to the parent.** With `notifyParent` (default on), questions and outcomes reach the parent as one batched follow-up. It never interrupts a running turn and wakes the parent only when it is idle.
+- **Per-child working directory.** `Agent({ cwd })`, scoped by `cwdScope` (`"repo"` default: parent subtree, its git repository, or any of its worktrees; `"any"`). It is validated before anything is created and reported everywhere as `cwd`. The package-agent index is cached per cwd.
+- **Persistence.** Every background run end is appended to the parent session as a `subagents:run` custom entry. After a reload, `steer` and `reply` on such an id report `not_alive`.
+- **Events** (ids only, never text): `subagents:question`, `answer`, `slot`, `steer`, `idle`, `disposed`, `mail`, `mail_dropped`, `wait`, `push`. Lifecycle payloads carry `details.cwd`.
+
+### Changed
+
+- **BREAKING:** `AgentStatus`, `AgentMessages`, `AgentList` and `AgentCancel` are no longer registered. Use `AgentControl` with `action: "status" | "messages" | "list" | "cancel"` and the same parameters.
+- **BREAKING:** background results are now pushed to the parent (the "never pushed" rule is reversed). `notifyParent: false` restores pull-only behaviour, and `backgroundIdleTtlSec: 0` restores freeing the session at run end.
+- `status` with `wait` now defaults to `timeout_s: 300`.
+
+### Fixed
+
+- **Child sessions no longer bypass project trust.** pi assumes a trusted project when no trust decision is passed, so every child loaded its directory's project settings, extensions and `SYSTEM.md` unchecked. Trust is now resolved per child from pi's trust store and `defaultProjectTrust`, and never prompts.
+
 ## [0.7.0] - 2026-11-06
 
 ### Added

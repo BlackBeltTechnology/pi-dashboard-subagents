@@ -11,11 +11,17 @@ subagent inspector and pop out into a new tab.
 ## Scope
 
 - **Foreground by default.** An `Agent` call blocks the caller until completion.
-- **Optional background spawning.** `Agent({ run_in_background: true })` returns
-  a `bg-` id at once; `AgentStatus`, `AgentMessages`, `AgentList` and
-  `AgentCancel` check, read, list and stop it. Results are read on request and
-  never pushed into the parent. No steering of a running subagent. Turn the
-  whole feature off with `"allowBackground": false`.
+- **Optional background spawning and orchestration.** `Agent({ run_in_background: true })`
+  returns a `bg-` id at once. One extra tool, `AgentControl({ action, … })`,
+  manages background subagents. Its actions are `status`, `list`, `messages`,
+  `cancel`, `wait`, `reply` and `steer`. A background child can ask its parent
+  questions (`ask_parent`). The parent answers them, steers running children
+  and continues finished ones. Outcomes and questions are pushed to the parent,
+  or pulled with `wait`. Turn the whole feature off with `"allowBackground": false`.
+- **Per-child working directory.** `Agent({ cwd })` runs a subagent in another
+  directory, typically a git worktree. See [Working directory](#working-directory-cwd).
+- **Out of scope:** creating or removing worktrees, child↔child messaging, and
+  subagents surviving `/reload` or a restart.
 - **No new sessions on disk.** Sessions live entirely in memory.
 - **Full observability.** Every `tool_execution_end`, `text_end`, `thinking_end`,
   and error from the subagent's session is mirrored to the dashboard as a
@@ -57,6 +63,10 @@ Two persistent settings live at:
   "allowBackground": true,
   "maxBackgroundPending": 8,
   "backgroundTimeoutSec": 0,
+  "notifyParent": true,
+  "backgroundIdleTtlSec": 600,
+  "maxIdleBackground": 4,
+  "cwdScope": "repo",
   "inheritance": {
     "recentTurns": 6,
     "toolOutputWindow": 2,
@@ -76,9 +86,13 @@ Two persistent settings live at:
 | `resultMaxChars`           | Cap on the result text in the tool result pi saves to the parent session (default 16000). Head and tail are kept around a `[… N chars truncated …]` marker. `0` = unlimited. Re-read per spawn. |
 | `detailsMaxChars`          | Cap on the serialized `details.entries` in that saved tool result (default 20000). Head and tail entries are kept around one `[N timeline entries omitted]` entry; `details.entriesOmitted` = N. `0` = unlimited. |
 | `entryFieldMaxChars`       | Cap on each timeline entry's text / tool input / tool output in that saved tool result (default 2000). `0` = unlimited. |
-| `allowBackground`          | When `true` (default), `Agent` gains `run_in_background` and `timeout_s`, and the `AgentStatus` / `AgentMessages` / `AgentList` / `AgentCancel` tools are registered. When `false`, the tool surface is exactly the foreground-only one. Read once at activation: changes need `/reload`. |
-| `maxBackgroundPending`     | Cap on background subagents that are queued or running (default 8). A background spawn at the cap is rejected with the outstanding ids. Foreground calls never count. `0` = unlimited. Re-read per call. |
-| `backgroundTimeoutSec`     | Default run-time limit for background subagents, in seconds, counted from when they start running (queue time is free). On expiry the subagent is stopped (`stoppedBy: "timeout"`). `timeout_s` overrides it per call. `0` (default) = no limit. Re-read per call. |
+| `allowBackground`          | When `true` (default), `Agent` gains `run_in_background` and `timeout_s`, and the single `AgentControl` tool is registered. When `false`, the tool surface is exactly the foreground-only one. Read once at activation: changes need `/reload`. |
+| `maxBackgroundPending`     | Cap on background subagents that are queued or running (default 8). A background spawn at the cap is rejected with the outstanding ids. Foreground calls and idle subagents never count. `0` = unlimited. Re-read per call. |
+| `backgroundTimeoutSec`     | Default run-time limit for background subagents, in seconds, counted from when they start running (queue time is free). On expiry the subagent is stopped (`stoppedBy: "timeout"`). `timeout_s` overrides it per call. `0` (default) = no limit. Applies to every run of a steered subagent. Re-read per call. |
+| `notifyParent`             | When `true` (default), questions and run outcomes of background subagents are pushed to the parent as **one** batched follow-up (about 1 s window) whenever no `AgentControl` `wait` is active. The follow-up never interrupts a running turn and starts a turn only when the parent is idle. `false` = pull-only (`wait` / `status`), the pre-orchestration behaviour. Re-read per post. |
+| `backgroundIdleTtlSec`     | Seconds a finished background subagent stays alive (`idle`) so `steer` can continue it on the same history (default 600). `0` = free the session as soon as a run ends (pre-orchestration behaviour). |
+| `maxIdleBackground`        | Cap on idle background subagents (default 4); the oldest is freed first. |
+| `cwdScope`                 | Where `Agent.cwd` may point. `"repo"` (default): the parent cwd or below, the parent's git repository, or any worktree of it. `"any"`: any existing directory. Re-read per call. |
 
 #### Why a concurrency cap
 
@@ -166,54 +180,157 @@ by editing the config file; the next spawn uses the new values.
 ## Background subagents
 
 With `allowBackground` on (the default), the parent can start subagents that
-run while it keeps working, then check on them later.
+run while it keeps working, and coordinate them without reading their
+transcripts.
 
 ```
-Agent({ subagent_type, description, prompt, run_in_background: true, timeout_s? })
-  → "Started background subagent bg-3fa91c (running). Background: 1 running, 0 queued, 0 finished-unread. …"
+Agent({ subagent_type, description, prompt, run_in_background: true, timeout_s?, cwd? })
+  → "Started background subagent bg-3fa91c (running). Background: 1 running, 0 queued, 0 idle, 0 finished-unread. …"
 
-AgentStatus({ ids: ["bg-3fa91c"], wait?: "none" | "any" | "all", timeout_s? })
-AgentMessages({ id: "bg-3fa91c", from?, limit?, kinds? })
-AgentList()
-AgentCancel({ ids: ["bg-3fa91c"] | "all", status?: "queued" | "running" })
+AgentControl({ action: "status",   ids, wait?: "none" | "any" | "all", timeout_s? })
+AgentControl({ action: "list" })
+AgentControl({ action: "cancel",   ids | "all", status?: "queued" | "running" | "idle" })
+AgentControl({ action: "wait",     ids?, timeout_s? })
+AgentControl({ action: "reply",    id, question_id, answer })   // or { replies: [{ id, question_id, answer }, …] }
+AgentControl({ action: "steer",    id | ids, message, mode?: "steer" | "followUp" })
+AgentControl({ action: "messages", id, from?, limit?, kinds? })  // debug view
 ```
+
+The parent's whole tool surface is `Agent` + `AgentControl`. Every tool
+definition costs context on every turn, so all background operations are
+actions of one tool. The child side has exactly one extra tool, `ask_parent`.
+
+### Orchestration model: bus up, answer and steer down
+
+```
+child ──ask_parent (blocks)──► mailbox ◄── outcome (automatic, every run end)
+                                  │ drained by AgentControl wait, or pushed when the parent is not waiting
+parent ──AgentControl reply ──► resolves that child's ask_parent call (immediately)
+parent ──AgentControl steer ──► running: steer / followUp · idle: next run, same history
+```
+
+- **`ask_parent({ question })`** (background children only). The child blocks
+  until the parent replies. **There is no ask timeout.** The parent decides,
+  in whatever way it likes, and replies when ready. While asking, the child
+  **releases its concurrency slot**, so parallel askers never starve the queue.
+  On the reply it takes the next free slot ahead of ordinary background work
+  (foreground still goes first).
+- **Killing always works, including while asking.** `AgentControl` `cancel`,
+  a `subagents:stop` event (dashboard Stop button or any plugin), the run-time
+  limit and shutdown each settle the pending ask and stop the child. No slot
+  leaks.
+- **`wait`** blocks until questions or outcomes arrive, then returns **all**
+  pending entries in one batch (late arrivals within ~250 ms join).
+  `timeout_s` defaults to 300; a timeout returns nothing and cancels nothing.
+  Only one `wait` runs at a time.
+- **Questions carry their own reply instructions.** In `wait` results and
+  pushes, each question says the child is **BLOCKED**, and shows its age, cwd,
+  the full text and the exact call. When several are pending, the batch form
+  is shown too:
+
+  ```
+  ⏸ bg-a is BLOCKED until you answer (asked 12s ago, cwd /repo/.worktrees/auth)
+    q1: "JWT or session cookie?"
+    → reply now: AgentControl({ action: "reply", id: "bg-a", question_id: "q1", answer: "…" })
+  ```
+
+  `status` and `list` show a one-line short form:
+  `⏸asking q1 "JWT or session cookie?" (12s) → AgentControl(reply bg-a q1)`.
+- **`reply`** answers one question, or many with `replies[]`. Each reply
+  settles independently and gets its own result: `answered`, `not_pending`,
+  `not_found` or `not_alive`.
+- **`steer`** (a single `id`, or `ids[]` to broadcast a decision) returns a
+  result per id:
+  - running child: the message is queued (`steer` = after the current turn's
+    tool calls; `followUp` = when the run has no more tool calls);
+  - idle child: a new run on the same history, `started`, or `queued` when no
+    slot is free;
+  - otherwise `not_started`, `foreground`, `not_alive` or `not_found`.
+
+  **Only background subagents can be steered.** A foreground `Agent` call
+  blocks the parent until it returns, so the parent cannot act in between.
+- **Idle keep-alive.** When a background run ends, its session stays alive as
+  `idle` (slot released) so `steer` can continue it. It is freed after
+  `backgroundIdleTtlSec`, when idle children exceed `maxIdleBackground` (oldest
+  first), by `cancel`, or at shutdown. `status` with `wait` counts `idle` as
+  finished.
+- **Push.** With `notifyParent` on, entries posted while no `wait` is active
+  are batched (~1 s) into **one** follow-up message. It never interrupts a
+  running parent turn and wakes the parent only when it is idle. A pushed
+  entry is never returned again by `wait`. `notifyParent: false` keeps
+  everything pull-only.
+- **Don't coordinate by reading transcripts.** `messages` is a debug view.
+  Use `wait`, `status` and `steer`; a child's full timeline is in the
+  dashboard.
+
+### Mechanics
 
 - **Same run, not awaited.** A background subagent runs exactly like a
   foreground one: same `subagents:*` events (with `details.background: true`),
   same `maxConcurrent` slots, same queue info, same `subagents:stop`. The
   `Agent` call returns at once with a short `bg-` id, its queue position and
-  the running / queued / finished-unread counts. Its result `details` carry
-  `{ background: true, id, status }` and **no `agentId`**, so the dashboard
-  does not mark the card finished early.
+  the counts. Its result `details` carry `{ background: true, id, status }`
+  and **no `agentId`**, so the dashboard does not mark the card finished early.
 - **Not tied to the parent turn.** Interrupting the parent turn does not stop
-  background work. `AgentCancel`, `subagents:stop`, the run-time limit and
-  session shutdown do.
-- **Ids.** Every tool accepts the short `bg-` id, the full `agentId`, or a
+  background work. `cancel`, `subagents:stop`, the run-time limit and session
+  shutdown do.
+- **Ids.** Every action accepts the short `bg-` id, the full `agentId`, or a
   unique prefix of either.
-- **Nothing is delivered.** A finished result is stored in memory and read on
-  request (`AgentStatus`). No message, follow-up or steer is sent into the
-  parent. Results last for the rest of the session and do **not** survive
-  `/reload`, `/resume` or a restart.
-- **`AgentStatus`** returns current state, or waits for `"any"` / `"all"` ids
-  to finish. `timeout_s` caps the wait and never cancels anything; aborting
-  the call ends only the wait. Unknown ids report `not_found`.
-- **`AgentMessages`** pages a subagent's timeline, live or finished: the last
-  20 entries by default, or from `from` onward (pass the returned `next_from`
-  to read only new entries). `kinds` filters before paging.
-- **`AgentList`** lists every background subagent of the session with status,
-  age, tokens and whether its finished result is still unread.
-- **`AgentCancel`** stops through the same path as `subagents:stop`: a queued
-  subagent leaves the queue without using a slot, a running one is aborted.
-  They end `stopped` (not an error), with `stoppedBy: "tool"`, and their
-  partial timeline stays readable. `ids: "all", status: "queued"` clears a
-  forgotten queue. It does not wait for the stop to finish.
-- **Safeguards.** `maxBackgroundPending` caps outstanding background work.
-  Foreground calls always take the next free slot before any queued
-  background call (FIFO within each). `backgroundTimeoutSec` / `timeout_s`
-  bound run time. On `session_shutdown` every queued or running background
-  subagent is stopped (`stoppedBy: "shutdown"`).
-- **Children never manage subagents.** `Agent` and all four background tools
-  are removed from every child session.
+- **`status`** returns state, run, turns, cwd and the stored result, or waits
+  for `"any"` / `"all"` ids to finish their current run (`timeout_s` default
+  300 when waiting; it never cancels anything).
+- **`list`** shows every background subagent with status, run, age, tokens,
+  cwd and whether its finished result is unread. It ends with counts of
+  running / queued / idle / finished-unread.
+- **`cancel`** stops a queued or running subagent through the same path as
+  `subagents:stop`: it ends `stopped` (not an error, `stoppedBy: "tool"`) and
+  its partial timeline stays readable. An idle one is freed (`disposed`) and
+  keeps its last result.
+- **Safeguards.** `maxBackgroundPending` caps queued + running background
+  work. Foreground calls always take the next free slot first.
+  `backgroundTimeoutSec` / `timeout_s` bound each run.
+- **Children never manage subagents.** `Agent` and `AgentControl` are removed
+  from every child session.
+- **Migration from the four background tools.** `AgentStatus`,
+  `AgentMessages`, `AgentList` and `AgentCancel` are no longer registered. Use
+  `AgentControl` with `action: "status" | "messages" | "list" | "cancel"` and
+  the same parameters.
+
+## Working directory (`cwd`)
+
+`Agent({ …, cwd })` runs a subagent (foreground or background) in another
+directory: absolute, or relative to the parent's cwd. The usual target is a
+git worktree, so parallel editing agents don't overwrite each other's files.
+**Give each parallel editor its own worktree.**
+
+- **What follows the child's cwd:** its file tools and `bash`, `AGENTS.md`
+  context files (from that directory and its parents), `.pi/settings.json`,
+  `.pi/agents/<type>.md`, and project extensions.
+- **What stays the parent's:** `process.cwd()` and the environment (one
+  process), and the model runtime.
+- **Validation happens before anything is created.** The path is resolved
+  with symlinks followed, and must exist and be a directory. Otherwise
+  `Agent` returns an error (`cwd_not_found`, `cwd_not_dir`, `cwd_out_of_scope`)
+  and creates no record, event or slot.
+- **Scope (`cwdScope`).** `"repo"` (default) accepts the parent cwd or below,
+  the parent's git top-level, or any worktree sharing the parent's git common
+  directory, so sibling worktrees like `../wt-x` work. `"any"` accepts any
+  existing directory.
+- **Project trust is resolved per child and never prompts:**
+  1. nothing in the directory needs trust → trusted;
+  2. otherwise pi's stored decision for that folder (a trusted repo covers its
+     worktrees);
+  3. otherwise `defaultProjectTrust`: `"always"` → trusted, anything else →
+     untrusted.
+
+  An untrusted child gets no project settings, project extensions or `.pi/SYSTEM.md`.
+- **The cwd is fixed for the child's whole life** (later `steer` runs
+  included), and is reported in `status`, `list`, outcomes and every
+  `subagents:*` payload (`details.cwd`).
+- **Preparing the worktree is the parent's job.** Create it, install
+  dependencies, and later merge or remove it. A worktree nested inside the
+  repo (`repo/.worktrees/x`) loads both its own and the repo's `AGENTS.md`;
+  a sibling worktree loads only its own.
 
 ## Upstream prompt caching — future work
 
@@ -246,11 +363,12 @@ The two existing subagent extensions for pi each have a tradeoff:
 | ---------------------------------- | ------------------ | ------------- | ------------- | ---------- |
 | `@tintinweb/pi-subagents`          | In-memory          | Clean ✓       | Summary only  | Yes        |
 | `pi-subagents` (Nico Bailon)       | Separate process   | Cluttered ✗   | Full ✓        | Yes        |
-| **`pi-dashboard-subagents` (this)**| **In-memory ✓**    | **Clean ✓**   | **Full ✓**    | Optional, pull-only |
+| **`pi-dashboard-subagents` (this)**| **In-memory ✓**    | **Clean ✓**   | **Full ✓**    | Optional, ask / reply / steer |
 
 This extension focuses on first-class observability for the pi-agent-dashboard
-inspector. Background runs are the same in-memory runs with the same timeline;
-results are pulled on request, never pushed into the parent.
+inspector. Background runs are the same in-memory runs with the same timeline.
+Coordination uses small explicit channels, not transcripts: children ask, the
+parent replies and steers, and outcomes are pushed or pulled.
 
 ## Install
 
@@ -627,12 +745,22 @@ and a throwing handler is ignored as if absent.
 
 | Kind      | Channel                   | Payload                                                     | Contract |
 | --------- | ------------------------- | ----------------------------------------------------------- | -------- |
-| observe   | `subagents:*` lifecycle   | `details.background`, `details.stoppedBy`                   | Every lifecycle event says whether the run is background; stopped runs say who stopped them (`tool` / `event` / `timeout` / `shutdown`). |
-| observe   | `subagents:result_read`   | `{ id, agentId, via: "status" \| "messages" }`              | A stored background result (`AgentStatus`) or timeline page (`AgentMessages`) was returned. |
+| observe   | `subagents:*` lifecycle   | `details.background`, `details.stoppedBy`, `details.cwd`    | Every lifecycle event says whether the run is background and where it runs; stopped runs say who stopped them (`tool` / `event` / `timeout` / `shutdown`). |
+| observe   | `subagents:result_read`   | `{ id, agentId, via: "status" \| "messages" }`              | A stored background result (`AgentControl` `status`) or timeline page (`messages`) was returned. |
+| observe   | `subagents:question`      | `{ id, agentId, question_id, run }`                         | A background child called `ask_parent`. |
+| observe   | `subagents:answer`        | `{ id, agentId, question_id, via: "reply" \| "cancel" }`    | A pending ask settled. |
+| observe   | `subagents:slot`          | `{ id, agentId, action, queuePosition? }`                   | Slot hand-off around `ask_parent`: `released`, `reacquire_queued`, `reacquired`. |
+| observe   | `subagents:steer`         | `{ id, agentId, mode, result }`                             | One per id of an `AgentControl` `steer` (broadcasts fan out). |
+| observe   | `subagents:idle`          | `{ id, agentId, run }`                                      | A run ended and the session stays alive. |
+| observe   | `subagents:disposed`      | `{ id, agentId, reason: "ttl" \| "cap" \| "cancel" \| "shutdown" }` | An idle session was freed. |
+| observe   | `subagents:mail`          | `{ id, agentId, seq, kind, outcome? }`                      | A mailbox entry (`question` / `outcome`) was posted. |
+| observe   | `subagents:mail_dropped`  | `{ id, agentId, seq }`                                      | Mailbox overflow dropped an outcome (questions are never dropped). |
+| observe   | `subagents:wait`          | `{ phase: "start", ids? }` / `{ phase: "end", returned, timedOut }` | An `AgentControl` `wait` began / ended. |
+| observe   | `subagents:push`          | `{ seqs, count, triggerTurn }`                              | A batched update was sent to the parent. |
 | intercept | `subagents:before_spawn`  | `{ args, background, veto?, reason?, patch? }`              | Runs before anything is created, for foreground and background spawns. `veto: true` → the call returns an error containing `reason`. `patch` may override `prompt`, `model`, `description`. |
 | intercept | `subagents:before_store`  | `{ id?, agentId, background, status, result, patch? }`      | Runs on every terminal state before the result is emitted, bounded, stored or returned. A string `patch.result` replaces the result text (e.g. redaction). |
-| query     | `subagents:list`          | `{ filter?: { status? }, out? }`                            | The owning session fills `out` with the same rows as `AgentList`. |
-| query     | `subagents:get`           | `{ id, from?, limit?, kinds?, out? }`                       | The owning session fills `out` with `{ status, messages }` (as `AgentStatus` / `AgentMessages`). Unknown ids leave `out` unset. Never marks a result read. |
+| query     | `subagents:list`          | `{ filter?: { status? }, out? }`                            | The owning session fills `out` with the same rows as the `list` action. |
+| query     | `subagents:get`           | `{ id, from?, limit?, kinds?, out? }`                       | The owning session fills `out` with `{ status, messages }` (as the `status` / `messages` actions). Unknown ids leave `out` unset. Never marks a result read. |
 | control   | `subagents:stop`          | `{ agentId }`                                               | See above. There is no separate cancel channel. |
 
 A query handler answers only when `out` is still unset, and only from its own
@@ -781,7 +909,7 @@ number as `details.retries`. Subscribe with
 
 - **Subagent's conversation** — in-memory only, dies with the parent turn (uses `SessionManager.inMemory(cwd)`).
 - **Subagent's final result + timeline** — embedded in the `AgentToolResult<AgentDetails>` returned to the parent, size-bounded (see `resultMaxChars` / `detailsMaxChars`). Pi persists it inside the parent's `ToolResultMessage.details` in the parent session's JSONL. Survives `/resume`; a replayed timeline keeps head and tail steps around an omission marker.
-- **Background results** — held in memory by the session that spawned them, for the rest of that session. The background `Agent` call's own tool result holds only the `bg-` id, so a background subagent's result and timeline are **not** in the parent JSONL and do not survive `/reload`, `/resume` or a restart (`AgentStatus` then reports `not_found`).
+- **Background subagents** — sessions stay in memory in the parent process (idle ones until freed) and never get their own JSONL. Every run end is appended to the parent session as a `subagents:run` custom entry (`{ id, agentId, run, cwd, status, result, details }`), kept out of model context. Every interaction is a parent tool call or custom message: `AgentControl` calls, pushed `subagents:mail` messages. **The parent JSONL is the only durable record.** After `/reload`, `/resume` or a restart the sessions are gone: `steer` / `reply` on a persisted id report `not_alive`, and `status` reports `not_found`.
 - **Live progress** — streamed only; not buffered server-side. A dashboard refresh while a subagent is still running loses the live card until the parent's tool result lands in JSONL (then state-replay re-hydrates from `details`). See the dashboard's `add-subagent-inspector` change for the consumer-side replay seam.
 
 ## License

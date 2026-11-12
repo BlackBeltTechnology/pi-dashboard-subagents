@@ -16,13 +16,17 @@ import { join } from "node:path";
 
 import {
   DEFAULT_SETTINGS,
+  getBackgroundIdleTtlSec,
   getBackgroundTimeoutSec,
+  getCwdScope,
   getMaxBackgroundPending,
+  getMaxIdleBackground,
   getSettingsPath,
   getMaxConcurrent,
   getResultLimits,
   invalidateSettingsCache,
   isBackgroundAllowed,
+  isNotifyParentEnabled,
   loadSettings,
   resolveIsolated,
   saveSettings,
@@ -339,5 +343,53 @@ describe("background settings", () => {
     utimesSync(getSettingsPath(), t, t);
     expect(getMaxBackgroundPending()).toBe(2);
     expect(getBackgroundTimeoutSec()).toBe(30);
+  });
+});
+
+describe("orchestration settings (add-subagent-orchestration)", () => {
+  it("defaults: notifyParent true, backgroundIdleTtlSec 600, maxIdleBackground 4, cwdScope repo", () => {
+    expect(DEFAULT_SETTINGS.notifyParent).toBe(true);
+    expect(DEFAULT_SETTINGS.backgroundIdleTtlSec).toBe(600);
+    expect(DEFAULT_SETTINGS.maxIdleBackground).toBe(4);
+    expect(DEFAULT_SETTINGS.cwdScope).toBe("repo");
+    expect(isNotifyParentEnabled()).toBe(true);
+    expect(getBackgroundIdleTtlSec()).toBe(600);
+    expect(getMaxIdleBackground()).toBe(4);
+    expect(getCwdScope()).toBe("repo");
+  });
+
+  it("honours explicit values, including 0 TTL and any scope", () => {
+    saveSettings({ notifyParent: false, backgroundIdleTtlSec: 0, maxIdleBackground: 1, cwdScope: "any" });
+    invalidateSettingsCache();
+    const s = loadSettings();
+    expect(s.notifyParent).toBe(false);
+    expect(s.backgroundIdleTtlSec).toBe(0);
+    expect(s.maxIdleBackground).toBe(1);
+    expect(s.cwdScope).toBe("any");
+  });
+
+  it("coerces invalid values to the defaults", () => {
+    saveSettings({});
+    writeFileSync(
+      getSettingsPath(),
+      JSON.stringify({ notifyParent: "yes", backgroundIdleTtlSec: -1, maxIdleBackground: "x", cwdScope: "anywhere" }),
+    );
+    invalidateSettingsCache();
+    const s = loadSettings();
+    expect(s.notifyParent).toBe(true);
+    expect(s.backgroundIdleTtlSec).toBe(600);
+    expect(s.maxIdleBackground).toBe(4);
+    expect(s.cwdScope).toBe("repo");
+  });
+
+  it("is re-read when the config file changes", () => {
+    expect(getBackgroundIdleTtlSec()).toBe(600);
+    saveSettings({});
+    writeFileSync(getSettingsPath(), JSON.stringify({ backgroundIdleTtlSec: 5, cwdScope: "any", notifyParent: false }));
+    const t = new Date(Date.now() + 5_000);
+    utimesSync(getSettingsPath(), t, t);
+    expect(getBackgroundIdleTtlSec()).toBe(5);
+    expect(getCwdScope()).toBe("any");
+    expect(isNotifyParentEnabled()).toBe(false);
   });
 });

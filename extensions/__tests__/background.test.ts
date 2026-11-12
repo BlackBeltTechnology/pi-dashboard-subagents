@@ -133,7 +133,7 @@ describe("readAt and counts", () => {
     reg.create(init("q"));
     const done = reg.create(init("d"));
     reg.finish(done, { content: [{ type: "text", text: "ok" }], details: { status: "completed" } });
-    expect(reg.counts()).toEqual({ running: 1, queued: 1, finishedUnread: 1 });
+    expect(reg.counts()).toEqual({ running: 1, queued: 1, idle: 0, finishedUnread: 1 });
     expect(reg.outstanding().map((r) => r.agentId)).toEqual(["r", "q"]);
 
     // Reading a non-terminal record does not mark it.
@@ -145,7 +145,7 @@ describe("readAt and counts", () => {
     t = 90;
     reg.markRead(done);
     expect(done.readAt).toBe(50);
-    expect(reg.counts()).toEqual({ running: 1, queued: 1, finishedUnread: 0 });
+    expect(reg.counts()).toEqual({ running: 1, queued: 1, idle: 0, finishedUnread: 0 });
   });
 });
 
@@ -175,5 +175,78 @@ describe("isolation", () => {
     expect(b.lookup(ra.id)).toBe("not_found");
     expect(b.list()).toHaveLength(0);
     expect(b.create(init("other")).id).toBe("bg-111111");
+  });
+});
+
+// ── idle lifecycle (change: add-subagent-orchestration, D5) ─────────────────
+
+describe("idle runs", () => {
+  const ok = (text: string) => ({ content: [{ type: "text", text }], details: { status: "completed" as const } });
+  const mk = () => {
+    const reg = createBackgroundRegistry();
+    const r = reg.create({ agentId: "a1", subagentType: "t", description: "d" });
+    reg.markRunning(r);
+    return { reg, r };
+  };
+
+  it("finish({ idle }) stores the run result, sets idle, and starts at run 1", () => {
+    const { reg, r } = mk();
+    expect(r.run).toBe(1);
+    expect(reg.finish(r, ok("one"), { idle: true })).toBe(true);
+    expect(r.status).toBe("idle");
+    expect(r.result?.result).toBe("one");
+    expect(isTerminalStatus(r.status)).toBe(false);
+    expect(reg.idle()).toEqual([r]);
+    expect(reg.outstanding()).toEqual([]);
+  });
+
+  it("a second finish for the same run is ignored", () => {
+    const { reg, r } = mk();
+    reg.finish(r, ok("one"), { idle: true });
+    expect(reg.finish(r, ok("dup"))).toBe(false);
+    expect(r.result?.result).toBe("one");
+    expect(r.status).toBe("idle");
+  });
+
+  it("startRun → running run 2 → finish stores run 2 and resets readAt", () => {
+    const { reg, r } = mk();
+    reg.finish(r, ok("one"), { idle: true });
+    reg.markRead(r);
+    expect(r.readAt).toBeDefined();
+    reg.startRun(r, "running");
+    expect(r.run).toBe(2);
+    expect(r.status).toBe("running");
+    expect(reg.outstanding()).toEqual([r]);
+    // sink updates apply again during run 2
+    reg.sink(r)({ details: { status: "running", activity: "x" } as any });
+    expect(r.latest?.activity).toBe("x");
+    expect(reg.finish(r, ok("two"))).toBe(true);
+    expect(r.result?.result).toBe("two");
+    expect(r.status).toBe("completed");
+    expect(r.readAt).toBeUndefined();
+  });
+
+  it("startRun can enter queued, then markRunning", () => {
+    const { reg, r } = mk();
+    reg.finish(r, ok("one"), { idle: true });
+    reg.startRun(r, "queued");
+    expect(r.status).toBe("queued");
+    reg.markRunning(r);
+    expect(r.status).toBe("running");
+  });
+
+  it("dispose reverts an idle record to its last run's status", () => {
+    const { reg, r } = mk();
+    reg.finish(r, ok("one"), { idle: true });
+    expect(reg.dispose(r)).toBe(true);
+    expect(r.status).toBe("completed");
+    expect(reg.dispose(r)).toBe(false);
+    expect(reg.idle()).toEqual([]);
+  });
+
+  it("counts include idle", () => {
+    const { reg, r } = mk();
+    reg.finish(r, ok("one"), { idle: true });
+    expect(reg.counts()).toMatchObject({ idle: 1, running: 0, queued: 0 });
   });
 });

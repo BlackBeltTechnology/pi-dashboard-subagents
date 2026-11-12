@@ -43,6 +43,7 @@ beforeEach(() => {
   tmpAgentDir = mkdtempSync(join(tmpdir(), "pi-subagents-bg-agentdir-"));
   tmpCwd = mkdtempSync(join(tmpdir(), "pi-subagents-bg-cwd-"));
   invalidateSettingsCache();
+  writeConfig({});
 });
 
 afterEach(() => {
@@ -79,7 +80,25 @@ export function fakePi() {
     sendMessage: vi.fn(),
     sendUserMessage: vi.fn(),
   };
-  const tool = (name: string) => tools.find((t) => t.name === name);
+  // Old tool names map onto AgentControl actions (add-subagent-orchestration D0),
+  // so these behavioural assertions exercise the single tool.
+  const ACTIONS: Record<string, string> = {
+    AgentStatus: "status",
+    AgentMessages: "messages",
+    AgentList: "list",
+    AgentCancel: "cancel",
+  };
+  const tool = (name: string) => {
+    const action = ACTIONS[name];
+    if (!action) return tools.find((t) => t.name === name);
+    const control = tools.find((t) => t.name === "AgentControl");
+    return (
+      control && {
+        name,
+        execute: (id: string, params: any, ...rest: any[]) => control.execute(id, { action, ...params }, ...rest),
+      }
+    );
+  };
   const fire = async (event: string, payload: unknown = {}) => {
     for (const h of lifecycle.get(event) ?? []) await h(payload, {});
   };
@@ -92,7 +111,7 @@ interface FakeHandle {
   finish(final?: any): void;
 }
 
-const ALL_TOOLS = ["Read", "Agent", "AgentStatus", "AgentMessages", "AgentList", "AgentCancel"];
+const ALL_TOOLS = ["Read", "Agent", "AgentControl"];
 
 function makeFakeSession(): FakeHandle {
   let listener: ((e: any) => void) | undefined;
@@ -147,7 +166,9 @@ export function installSessions() {
 function writeConfig(patch: Record<string, unknown>): void {
   const dir = join(tmpAgentDir, "extensions", "pi-dashboard-subagents");
   mkdirSync(dir, { recursive: true });
-  writeFileSync(join(dir, "config.json"), JSON.stringify(patch), "utf-8");
+  // This suite pins the pre-orchestration contract: a finished background run
+  // is disposed at once and nothing is pushed (backgroundIdleTtlSec: 0, notifyParent: false). See change: add-subagent-orchestration.
+  writeFileSync(join(dir, "config.json"), JSON.stringify({ backgroundIdleTtlSec: 0, notifyParent: false, ...patch }), "utf-8");
   invalidateSettingsCache();
 }
 
@@ -319,8 +340,8 @@ describe("Agent with run_in_background: true", () => {
     await tick();
     await call(tool("Agent"), { run_in_background: true });
     const third = await call(tool("Agent"), { run_in_background: true });
-    expect(third.details.counts).toEqual({ running: 1, queued: 1, finishedUnread: 1 });
-    expect(third.content[0].text).toMatch(/1 running, 1 queued, 1 finished-unread/);
+    expect(third.details.counts).toEqual({ running: 1, queued: 1, idle: 0, finishedUnread: 1 });
+    expect(third.content[0].text).toMatch(/1 running, 1 queued, 0 idle, 1 finished-unread/);
     await tick();
     created[1].finish();
     await tick();
@@ -345,7 +366,7 @@ describe("maxBackgroundPending", () => {
     expect(rejected.isError).toBe(true);
     expect(rejected.content[0].text).toContain(bgId(a));
     expect(rejected.content[0].text).toContain(bgId(b));
-    expect(rejected.content[0].text).toMatch(/AgentStatus|AgentCancel/);
+    expect(rejected.content[0].text).toMatch(/AgentControl/);
     expect(ofChannel(emitted, "subagents:created")).toHaveLength(createdBefore);
     created.forEach((c) => c.finish());
     await tick();
@@ -662,8 +683,8 @@ describe("AgentList", () => {
       expect(typeof a.ageMs).toBe("number");
       expect(typeof a.tokens).toBe("string");
     }
-    expect(d.counts).toEqual({ running: 1, queued: 1, finishedUnread: 1 });
-    expect(res.content[0].text).toMatch(/1 running, 1 queued, 1 finished-unread/);
+    expect(d.counts).toEqual({ running: 1, queued: 1, idle: 0, finishedUnread: 1 });
+    expect(res.content[0].text).toMatch(/1 running, 1 queued, 0 idle, 1 finished-unread/);
 
     created[1].finish();
     await tick();

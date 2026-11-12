@@ -31,7 +31,7 @@ describe("real faux-provider entry stream", () => {
     process.env.PI_CODING_AGENT_DIR = agentDir;
     writeFileSync(
       join(agentDir, "extensions", "pi-dashboard-subagents", "config.json"),
-      JSON.stringify({ inheritContext: false, maxConcurrent: 0 }),
+      JSON.stringify({ inheritContext: false, maxConcurrent: 0, backgroundIdleTtlSec: 0 }),
     );
   });
 
@@ -96,7 +96,25 @@ describe("real faux-provider entry stream", () => {
     activate(pi);
     const ctx: any = { cwd, modelRegistry };
     const of = (channel: string) => log.filter((e) => e.channel === channel).map((e) => e.data);
-    const toolNamed = (name: string) => tools.find((t) => t.name === name);
+    // Old tool names map onto AgentControl actions (add-subagent-orchestration D0),
+    // so these behavioural assertions exercise the single tool.
+    const ACTIONS: Record<string, string> = {
+        AgentStatus: "status",
+        AgentMessages: "messages",
+        AgentList: "list",
+        AgentCancel: "cancel",
+    };
+    const toolNamed = (name: string) => {
+        const action = ACTIONS[name];
+        if (!action) return tools.find((t) => t.name === name);
+        const control = tools.find((t) => t.name === "AgentControl");
+        return (
+            control && {
+                name,
+                execute: (id: string, params: any, ...rest: any[]) => control.execute(id, { action, ...params }, ...rest),
+            }
+        );
+    };
     return { piAi, registration, modelRuntime, model, tool: tools[0], toolNamed, ctx, of, log, bus };
   }
 
@@ -454,4 +472,69 @@ describe("real faux-provider entry stream", () => {
       writeFileSync(configPath, JSON.stringify({ inheritContext: false, maxConcurrent: 0 }));
     }
   }, 30_000);
+  // Real pi end to end: ask_parent → wait → reply → idle → steer (run 2) → cancel.
+  // See change: add-subagent-orchestration.
+  it("orchestration on a real session: ask, reply, idle, steer continues on the same history", async () => {
+    const configPath = join(agentDir, "extensions", "pi-dashboard-subagents", "config.json");
+    writeFileSync(
+      configPath,
+      JSON.stringify({ inheritContext: false, maxConcurrent: 0, backgroundIdleTtlSec: 600, notifyParent: false }),
+    );
+    const { piAi, registration, modelRuntime, model, tool, toolNamed, ctx } = await setup();
+    const textOf = (m: any): string =>
+      typeof m.content === "string"
+        ? m.content
+        : (m.content ?? []).map((b: any) => b.text ?? (typeof b.content === "string" ? b.content : JSON.stringify(b.content ?? ""))).join("");
+    let run1SawAnswer = false;
+    let run2SawHistory = false;
+    try {
+      registration.setResponses([
+        piAi.fauxAssistantMessage([piAi.fauxToolCall("ask_parent", { question: "JWT or cookie?" }, { id: "tc-ask" })], {
+          stopReason: "toolUse",
+        }),
+        (c: any) => {
+          run1SawAnswer = c.messages.some((m: any) => m.role === "toolResult" && textOf(m).includes("use JWT"));
+          return piAi.fauxAssistantMessage("RUN1: using JWT");
+        },
+        (c: any) => {
+          const all = c.messages.map(textOf).join("|");
+          run2SawHistory = all.includes("RUN1: using JWT") && all.includes("now add tests");
+          return piAi.fauxAssistantMessage("RUN2: tests added");
+        },
+      ]);
+      const control = toolNamed("AgentControl");
+      const act = (params: Record<string, unknown>) => control.execute(`c-${Math.random()}`, params, undefined, undefined, ctx);
+      const spawned: any = await tool.execute(
+        "call-orch",
+        { subagent_type: "faux-agent", description: "orch e2e", prompt: "pick auth", model: "@entry-faux", run_in_background: true },
+        undefined,
+        undefined,
+        ctx,
+      );
+      const id = spawned.details.id;
+
+      const w: any = await act({ action: "wait", timeout_s: 20 });
+      expect(w.details.entries[0]).toMatchObject({ id, kind: "question", question_id: "q1", text: "JWT or cookie?" });
+      const r: any = await act({ action: "reply", id, question_id: "q1", answer: "use JWT" });
+      expect(r.details.results[0].result).toBe("answered");
+
+      const s1: any = await act({ action: "status", ids: [id], wait: "all", timeout_s: 20 });
+      expect(s1.details.agents[0]).toMatchObject({ status: "idle", run: 1, result: "RUN1: using JWT" });
+      expect(run1SawAnswer).toBe(true);
+
+      const st: any = await act({ action: "steer", id, message: "now add tests", mode: "followUp" });
+      expect(st.details.results[0].result).toBe("started");
+      const s2: any = await act({ action: "status", ids: [id], wait: "all", timeout_s: 20 });
+      expect(s2.details.agents[0]).toMatchObject({ status: "idle", run: 2, result: "RUN2: tests added" });
+      expect(run2SawHistory).toBe(true);
+      expect(registration.getPendingResponseCount()).toBe(0);
+
+      const c: any = await act({ action: "cancel", ids: [id] });
+      expect(c.details.results[0].outcome).toBe("disposed");
+    } finally {
+      modelRuntime.unregisterProvider(model.provider);
+      writeFileSync(configPath, JSON.stringify({ inheritContext: false, maxConcurrent: 0, backgroundIdleTtlSec: 0 }));
+    }
+  }, 30_000);
 });
+

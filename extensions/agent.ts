@@ -21,6 +21,8 @@ import { fileURLToPath } from "node:url";
 
 import { type TProperties, Type } from "@sinclair/typebox";
 
+import { type CwdRejectReason, resolveChildProjectTrust, resolveSubagentCwd } from "./cwd.js";
+
 import {
   type AgentSessionEvent,
   type AgentToolResult,
@@ -63,7 +65,11 @@ import {
 } from "./events.js";
 
 import {
+  getBackgroundIdleTtlSec,
   getBackgroundTimeoutSec,
+  getCwdScope,
+  getMaxIdleBackground,
+  isNotifyParentEnabled,
   getInheritanceCompression,
   getMaxBackgroundPending,
   getMaxConcurrent,
@@ -78,20 +84,16 @@ import {
   type BackgroundCounts,
   type BackgroundRecord,
   type BackgroundRegistry,
+  type BackgroundStatus,
   createBackgroundRegistry,
   type RunResultLike,
 } from "./background.js";
 
-import {
-  countsLine,
-  makeAgentCancelTool,
-  messagesPage,
-  statusOf,
-  summaryOf,
-  makeAgentListTool,
-  makeAgentMessagesTool,
-  makeAgentStatusTool,
-} from "./background-tools.js";
+import { countsLine, messagesPage, statusOf, summaryOf } from "./background-tools.js";
+
+import { AGENT_CONTROL_TOOL_NAME, makeAgentControlTool } from "./agent-control.js";
+
+import { createOrchestrator, type Orchestrator } from "./orchestration.js";
 
 import { type GetQueryPayload, type ListQueryPayload, onGuarded, runBeforeSpawn, runBeforeStore, SUBAGENT_CHANNELS } from "./hooks.js";
 
@@ -104,13 +106,36 @@ const AGENT_TOOL_NAME = "Agent";
  * a subagent can neither spawn nor manage subagents.
  * See change: add-background-subagents (D12).
  */
-export const SUBAGENT_MANAGEMENT_TOOLS: readonly string[] = [
-  AGENT_TOOL_NAME,
-  "AgentStatus",
-  "AgentMessages",
-  "AgentList",
-  "AgentCancel",
-];
+export const SUBAGENT_MANAGEMENT_TOOLS: readonly string[] = [AGENT_TOOL_NAME, AGENT_CONTROL_TOOL_NAME];
+
+/** Child-side tool of background subagents. See change: add-subagent-orchestration (D9). */
+export const ASK_PARENT_TOOL_NAME = "ask_parent";
+
+/** Resolve with `p`, or reject with `SpawnAbortedError` once any signal aborts. */
+function untilAborted<T>(p: Promise<T>, signals: Array<AbortSignal | undefined>): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const live = signals.filter((x): x is AbortSignal => x !== undefined);
+    const onAbort = (): void => {
+      cleanup();
+      reject(new SpawnAbortedError("aborted while waiting for the parent"));
+    };
+    const cleanup = (): void => {
+      for (const sig of live) sig.removeEventListener("abort", onAbort);
+    };
+    if (live.some((x) => x.aborted)) return onAbort();
+    for (const sig of live) sig.addEventListener("abort", onAbort, { once: true });
+    p.then(
+      (v) => {
+        cleanup();
+        resolve(v);
+      },
+      (e: unknown) => {
+        cleanup();
+        reject(e);
+      },
+    );
+  });
+}
 
 // ─── Extension directory (for the bundled-agents tier) ─────────────────
 //
@@ -320,32 +345,38 @@ export function buildPackageAgentIndex(cwd: string, agentDir: string): PackageAg
   return index;
 }
 
-// Module-level cache, keyed by the cwd it was built for. Rebuilt on a cwd
-// change (in-process session switch) or a `resources_discover` reload.
-let packageAgentIndex: PackageAgentIndex | undefined;
-let indexedCwd: string | undefined;
+// Module-level cache keyed by cwd: sibling subagents in different worktrees
+// keep their own entries. Bounded LRU (Map insertion order = recency).
+// `resources_discover` drops every entry (packages may have changed).
+// See change: add-subagent-orchestration (D10).
+const PACKAGE_INDEX_CACHE_MAX = 8;
+const packageAgentIndexes = new Map<string, PackageAgentIndex>();
 
-/**
- * Rebuild the cached package-agent index unconditionally for `cwd` and return
- * it. Called from the `resources_discover` handler (startup + reload).
- */
-export function refreshPackageAgentIndex(cwd: string, agentDir: string): PackageAgentIndex {
-  packageAgentIndex = buildPackageAgentIndex(cwd, agentDir);
-  indexedCwd = cwd;
-  return packageAgentIndex;
+function cacheIndex(cwd: string, index: PackageAgentIndex): PackageAgentIndex {
+  packageAgentIndexes.delete(cwd);
+  packageAgentIndexes.set(cwd, index);
+  while (packageAgentIndexes.size > PACKAGE_INDEX_CACHE_MAX) {
+    packageAgentIndexes.delete(packageAgentIndexes.keys().next().value!);
+  }
+  return index;
 }
 
 /**
- * Return the cached package-agent index, building it lazily when unbuilt or
- * when `cwd` has changed since the last build (so an in-process cwd switch
- * rebuilds rather than serving stale results). Used as the first-spawn
- * fallback for hosts that never fire `resources_discover`.
+ * Drop every cached index and rebuild the one for `cwd`. Called from the
+ * `resources_discover` handler (startup + reload).
+ */
+export function refreshPackageAgentIndex(cwd: string, agentDir: string): PackageAgentIndex {
+  packageAgentIndexes.clear();
+  return cacheIndex(cwd, buildPackageAgentIndex(cwd, agentDir));
+}
+
+/**
+ * Return the cached package-agent index for `cwd`, building it lazily when
+ * absent. Used per spawn with the subagent's resolved cwd.
  */
 export function ensurePackageAgentIndex(cwd: string, agentDir: string): PackageAgentIndex {
-  if (!packageAgentIndex || cwd !== indexedCwd) {
-    return refreshPackageAgentIndex(cwd, agentDir);
-  }
-  return packageAgentIndex;
+  const hit = packageAgentIndexes.get(cwd);
+  return cacheIndex(cwd, hit ?? buildPackageAgentIndex(cwd, agentDir));
 }
 
 // ─── Agent .md frontmatter parsing ─────────────────────────────────────
@@ -524,10 +555,12 @@ export function createProgressEmitter(
  * Skills, prompt templates and themes are not read by a headless child, so
  * they are skipped — same tool surface, ~350 MB less RSS at n=7.
  */
-async function createChildLoader(cwd: string): Promise<DefaultResourceLoader> {
+async function createChildLoader(cwd: string, settingsManager: SettingsManager): Promise<DefaultResourceLoader> {
   const loader = new DefaultResourceLoader({
     cwd,
     agentDir: getAgentDir(),
+    // Trust decided per child (D3): without this pi assumes a trusted project.
+    settingsManager,
     noSkills: true,
     noPromptTemplates: true,
     noThemes: true,
@@ -664,10 +697,11 @@ export interface QueueInfo {
 }
 
 /**
- * Dispatch lane. Foreground waiters always go before background ones; FIFO
- * within each lane. See change: add-background-subagents.
+ * Dispatch lane. Foreground waiters go first, then `resume` (a background
+ * subagent re-acquiring after `ask_parent` was answered, design D12), then
+ * background; FIFO within each lane. See change: add-background-subagents.
  */
-export type SpawnLane = "foreground" | "background";
+export type SpawnLane = "foreground" | "resume" | "background";
 
 interface SpawnWaiter {
   lane: SpawnLane;
@@ -690,8 +724,11 @@ function enqueueWaiter(waiter: SpawnWaiter): number {
     spawnWaiters.push(waiter);
     return spawnWaiters.length - 1;
   }
-  const firstBg = spawnWaiters.findIndex((w) => w.lane === "background");
-  const at = firstBg === -1 ? spawnWaiters.length : firstBg;
+  // foreground: ahead of every non-foreground waiter; resume: ahead of background.
+  const firstBehind = spawnWaiters.findIndex((w) =>
+    waiter.lane === "foreground" ? w.lane !== "foreground" : w.lane === "background",
+  );
+  const at = firstBehind === -1 ? spawnWaiters.length : firstBehind;
   spawnWaiters.splice(at, 0, waiter);
   return at;
 }
@@ -812,7 +849,7 @@ function acquireSpawnSlot(
 // session's bus can only reach subagents that session created.
 // See change: manage-subagent-spawn-queue.
 
-export type AgentPhase = "queued" | "running" | "terminal";
+export type AgentPhase = "queued" | "running" | "idle" | "terminal";
 
 /** Result of one stop request (also what is logged). */
 export interface StopOutcome {
@@ -841,6 +878,8 @@ export interface AgentControlRegistry {
   stop(agentId: unknown, by?: StopSource): StopOutcome;
   /** Number of registered (non-finished) runs. */
   size(): number;
+  /** Whether `agentId` is a registered run of this activation. */
+  has(agentId: string): boolean;
 }
 
 export function createAgentControlRegistry(): AgentControlRegistry {
@@ -868,6 +907,9 @@ export function createAgentControlRegistry(): AgentControlRegistry {
     },
     size() {
       return controls.size;
+    },
+    has(agentId) {
+      return controls.has(agentId);
     },
   };
 }
@@ -1380,7 +1422,16 @@ export function buildAgentParametersSchema(exposeIsolated: boolean, allowBackgro
   };
   // One concrete property map: TypeBox cannot infer a union of conditional
   // shapes, and the tool's `execute` reads params as `AgentToolArgs` anyway.
-  const properties: TProperties = { ...base };
+  const properties: TProperties = {
+    ...base,
+    // Per-child working directory. See change: add-subagent-orchestration (D2).
+    cwd: Type.Optional(
+      Type.String({
+        description:
+          "Optional working directory for the subagent (absolute, or relative to yours), e.g. a git worktree. Its tools, AGENTS.md, .pi settings and agent definitions follow it. Give each parallel editing agent its own worktree; preparing the worktree (create, install deps) is your job. Default: your cwd.",
+      }),
+    ),
+  };
   if (exposeIsolated) {
     properties.isolated = Type.Optional(
       Type.Boolean({
@@ -1395,7 +1446,7 @@ export function buildAgentParametersSchema(exposeIsolated: boolean, allowBackgro
     properties.run_in_background = Type.Optional(
       Type.Boolean({
         description:
-          "When true, return at once with a `bg-` id while the subagent runs on. Read it later with AgentStatus / AgentMessages, list with AgentList, stop with AgentCancel. Nothing is sent back automatically.",
+          "When true, return at once with a `bg-` id while the subagent runs on. Manage it with AgentControl (status, wait, reply, steer, cancel). Only background subagents can be steered or ask you questions.",
       }),
     );
     properties.timeout_s = Type.Optional(
@@ -1426,6 +1477,8 @@ interface AgentToolArgs {
   run_in_background?: boolean;
   /** Background run-time limit in seconds; `0` = none. */
   timeout_s?: number;
+  /** Working directory; resolved + scope-checked before any spawn work. */
+  cwd?: string;
 }
 
 /** `details` of an `Agent` call a `subagents:before_spawn` handler vetoed. */
@@ -1435,12 +1488,19 @@ export interface SpawnVetoDetails {
   background: boolean;
 }
 
+/** `details` of an `Agent` call whose `cwd` was rejected. See change: add-subagent-orchestration. */
+export interface CwdRejectDetails {
+  rejected: true;
+  reason: CwdRejectReason;
+  background: boolean;
+}
+
 /** `details` of a background `Agent` call: no `agentId`, so the dashboard does not finalize the card. */
 export interface BackgroundSpawnDetails {
   background: true;
   /** Short `bg-` id; absent when the spawn was rejected. */
   id?: string;
-  status: AgentStatus | "rejected";
+  status: BackgroundStatus | "rejected";
   queuePosition?: number;
   counts: BackgroundCounts;
   /** Outstanding ids, set only on a pending-cap rejection. */
@@ -1452,6 +1512,7 @@ function makeAgentTool(
   exposeIsolated: boolean,
   controls?: AgentControlRegistry,
   background?: BackgroundRegistry,
+  orchestrator?: Orchestrator,
 ) {
   return defineTool({
     name: AGENT_TOOL_NAME,
@@ -1459,7 +1520,7 @@ function makeAgentTool(
     description: [
       "Spawn a foreground subagent in-memory with a focused task.",
       background
-        ? "Runs synchronously and returns when the subagent finishes, unless `run_in_background` is true: then it returns a `bg-` id at once (check later with AgentStatus)."
+        ? "Runs synchronously and returns when the subagent finishes, unless `run_in_background` is true: then it returns a `bg-` id at once (manage it with AgentControl)."
         : "Runs synchronously; returns when the subagent finishes.",
       "Two modes: (1) curated — when `subagent_type` matches a project/user/bundled `.md`, that file's frontmatter supplies model/tools/prompt defaults; (2) inline — any label works without a `.md`; pass `model` to pick @role / provider/model / bare id at call time.",
       "Subagent's full timeline (tool calls, reasoning, assistant text) is",
@@ -1478,6 +1539,17 @@ function makeAgentTool(
       // because its keys depend on activation settings.
       const raw = rawParams as unknown as AgentToolArgs;
       const wantsBackground = background !== undefined && raw.run_in_background === true;
+      // `cwd` is model input: resolve + scope-check before any hook, record,
+      // event or slot. See change: add-subagent-orchestration (D2).
+      const where = resolveSubagentCwd(ctx.cwd, raw.cwd, getCwdScope());
+      if (!where.ok) {
+        const rejected: AgentToolResultWithError<CwdRejectDetails> = {
+          content: [{ type: "text", text: `Subagent not spawned (${where.reason}): ${where.message}` }],
+          details: { rejected: true, reason: where.reason, background: wantsBackground },
+          isError: true,
+        };
+        return rejected as unknown as AgentToolResult<AgentDetails>;
+      }
       // Plugins may veto or patch any spawn before a record, event or slot
       // exists. See change: add-background-subagents (D10).
       const hook = runBeforeSpawn(pi, raw, wantsBackground);
@@ -1492,9 +1564,9 @@ function makeAgentTool(
       }
       const params: AgentToolArgs = { ...raw, ...hook.args };
       if (background && wantsBackground) {
-        return spawnInBackground(pi, background, controls, params, ctx, toolCallId) as unknown as AgentToolResult<AgentDetails>;
+        return spawnInBackground(pi, background, controls, params, ctx, toolCallId, where.cwd, orchestrator) as unknown as AgentToolResult<AgentDetails>;
       }
-      return runAgentTool(ctx.cwd, params, signal, onUpdate, ctx, pi, toolCallId, controls) as Promise<
+      return runAgentTool(where.cwd, params, signal, onUpdate, ctx, pi, toolCallId, controls) as Promise<
         AgentToolResult<AgentDetails>
       >;
     },
@@ -1520,6 +1592,8 @@ function spawnInBackground(
   params: AgentToolArgs,
   ctx: ExtensionContext,
   toolCallId: string,
+  cwd: string,
+  orchestrator?: Orchestrator,
 ): AgentToolResultWithError<BackgroundSpawnDetails> {
   const cap = getMaxBackgroundPending();
   const outstanding = registry.outstanding();
@@ -1531,7 +1605,7 @@ function spawnInBackground(
           type: "text",
           text:
             `Background limit reached: ${outstanding.length} of ${cap} background subagents are still queued or running ` +
-            `(${ids.join(", ")}). Wait for them with AgentStatus({ ids, wait: "any" }) or stop some with AgentCancel.`,
+            `(${ids.join(", ")}). Wait for them with AgentControl({ action: "status", ids, wait: "any" }) or stop some with AgentControl({ action: "cancel", ids }).`,
         },
       ],
       details: { background: true, status: "rejected", counts: registry.counts(), outstanding: ids },
@@ -1542,9 +1616,9 @@ function spawnInBackground(
   let record: BackgroundRecord | undefined;
   let sink: ((update: { details?: AgentDetails }) => void) | undefined;
   // No parent signal: interrupting the parent turn must not stop background
-  // work. AgentCancel, subagents:stop, the timeout and shutdown do (D1).
+  // work. AgentControl cancel, subagents:stop, the timeout and shutdown do (D1).
   const run = runAgentTool(
-    ctx.cwd,
+    cwd,
     params,
     undefined,
     (update) => sink?.(update as { details?: AgentDetails }),
@@ -1557,7 +1631,12 @@ function spawnInBackground(
       timeoutMs: effectiveTimeoutSec(params.timeout_s) * 1000,
       backgroundId: () => record?.id,
       onAgentId: (agentId) => {
-        record = registry.create({ agentId, subagentType: params.subagent_type, description: params.description });
+        record = registry.create({
+          agentId,
+          subagentType: params.subagent_type,
+          description: params.description,
+          cwd,
+        });
         sink = registry.sink(record);
       },
       onEntry: (entry) => {
@@ -1566,16 +1645,43 @@ function spawnInBackground(
       onRunning: () => {
         if (record) registry.markRunning(record);
       },
+      // Idle keep-alive between runs (design D5).
+      keepAlive: () => orchestrator !== undefined && getBackgroundIdleTtlSec() > 0 && getMaxIdleBackground() > 0,
+      onIdle: (res, handle) => {
+        if (record) orchestrator?.runEnded(record, res as RunResultLike, handle);
+      },
+      onIdleDisposed: (reason) => {
+        if (record) orchestrator?.idleDisposed(record, reason);
+      },
+      ...(orchestrator
+        ? {
+            ask: (question: string) => {
+              const rec = record!;
+              const { questionId, answer } = orchestrator.ask(rec, question);
+              return { questionId, answer, cancel: () => orchestrator.cancelAsks(rec) };
+            },
+            onSlot: (action, queuePosition) => {
+              if (record) orchestrator.slot(record, action, queuePosition);
+            },
+            onSession: (live) => {
+              if (record) orchestrator.attachSession(record, live);
+            },
+          }
+        : {}),
     },
   );
   // `runAgentTool` registers the record and announces the run synchronously
   // (it first awaits at the spawn slot), so `record` is set here.
   const rec = record!;
+  const ended = (res: RunResultLike): void => {
+    if (orchestrator) orchestrator.runEnded(rec, res);
+    else registry.finish(rec, res);
+  };
   run.then(
-    (res) => registry.finish(rec, res as RunResultLike),
+    (res) => ended(res as RunResultLike),
     (err: unknown) => {
       const message = err instanceof Error ? err.message : String(err);
-      registry.finish(rec, {
+      ended({
         content: [{ type: "text", text: `Subagent failed: ${message}` }],
         details: { status: "error", error: message },
         isError: true,
@@ -1597,7 +1703,7 @@ function spawnInBackground(
         text:
           `Started background subagent ${rec.id} (${where}). ` +
           `Background: ${countsLine(counts)}. ` +
-          `Check it with AgentStatus({ ids: ["${rec.id}"] }) (wait: "all" to block until done); nothing is sent back automatically.`,
+          `Coordinate with AgentControl: wait (questions + outcomes), reply, steer, status({ ids: ["${rec.id}"] }), cancel.`,
       },
     ],
     details: {
@@ -1639,6 +1745,42 @@ export interface RunAgentOptions {
   timeoutMs?: number;
   /** Short `bg-` id, reported on `subagents:before_store`. */
   backgroundId?: () => string | undefined;
+  /**
+   * Background: whether a run that ended without a stop keeps its session
+   * alive (`idle`) for `AgentSteer`. Read at each run end.
+   * See change: add-subagent-orchestration (D5).
+   */
+  keepAlive?: () => boolean;
+  /** A run ended and the session is parked idle; `handle` continues or frees it. */
+  onIdle?: (result: AgentToolResultWithError<AgentDetails>, handle: IdleHandle) => void;
+  /** The idle session was freed. Runs before `runAgentTool` resolves. */
+  onIdleDisposed?: (reason: DisposeReason) => void;
+  /**
+   * Background: gives the child an `ask_parent` tool. Posts the question and
+   * returns the pending answer (never times out) plus a cancel for stops.
+   */
+  ask?: (question: string) => { questionId: string; answer: Promise<string>; cancel: () => void };
+  /** Slot hand-off around `ask_parent` (design D12). */
+  onSlot?: (action: "released" | "reacquire_queued" | "reacquired", queuePosition?: number) => void;
+  /** The live session, for `steer` / `followUp` while running. */
+  onSession?: (live: LiveSession) => void;
+}
+
+/** Steering surface of a running background subagent. */
+export interface LiveSession {
+  steer(message: string): Promise<unknown>;
+  followUp(message: string): Promise<unknown>;
+}
+
+/** Why an idle background subagent was freed. See change: add-subagent-orchestration. */
+export type DisposeReason = "ttl" | "cap" | "cancel" | "shutdown";
+
+/** Control over a background subagent parked `idle` between runs. */
+export interface IdleHandle {
+  /** Start the next run on the same history; `queued` when no slot is free. */
+  continueWith(message: string): "started" | "queued";
+  /** Free the session. Idempotent. */
+  dispose(reason: DisposeReason): void;
 }
 
 /** Warned-once latch for {@link getParentModelRuntime}. */
@@ -1679,7 +1821,7 @@ export async function runAgentTool(
 ): Promise<AgentToolResultWithError<AgentDetails>> {
   const agentId = randomUUID();
   /** Call-creation time; `durationMs` counts from here (queue time included). */
-  const startedAt = Date.now();
+  let startedAt = Date.now();
   const background = runOpts.background === true;
   runOpts.onAgentId?.(agentId);
 
@@ -1699,7 +1841,14 @@ export async function runAgentTool(
   };
   if (signal?.aborted) onParentAbort();
   else signal?.addEventListener("abort", onParentAbort, { once: true });
+  /** Set while a finished background run is parked `idle` (design D5). */
+  let idleHandle: IdleHandle | undefined;
   const requestStop = (by: StopSource): boolean => {
+    if (phase === "idle") {
+      // Stopping an idle subagent frees its session; its last result stands.
+      idleHandle?.dispose(by === "shutdown" ? "shutdown" : "cancel");
+      return true;
+    }
     if (endReason || phase === "terminal") return false;
     endReason = { stop: phase, by };
     ctrl.abort();
@@ -1846,6 +1995,7 @@ export async function runAgentTool(
       slotGrantedAt,
       background,
       retries,
+      cwd,
     });
   }
 
@@ -1930,6 +2080,55 @@ export async function runAgentTool(
   function endedByAbort(): AgentToolResultWithError<AgentDetails> {
     if (endReason && endReason !== "parent") return stopWith(endReason.stop, endReason.by);
     return failWith("aborted", "aborted by parent", "Subagent aborted by parent.");
+  }
+
+  /**
+   * The child's `ask_parent` tool (design D9 + D12): post the question, give
+   * the slot back while waiting (no timeout), re-acquire it with priority on
+   * the answer. Any stop settles the ask.
+   */
+  function makeAskParentTool() {
+    return defineTool({
+      name: ASK_PARENT_TOOL_NAME,
+      label: ASK_PARENT_TOOL_NAME,
+      description:
+        "Ask your parent agent a question when you need a decision you cannot make yourself. Blocks until the parent answers (no timeout). " +
+        "Ask only when truly blocked; otherwise decide, state your assumption, and continue.",
+      parameters: Type.Object({ question: Type.String({ description: "One clear question with the options you see." }) }),
+      async execute(
+        _toolCallId: string,
+        rawParams: { question: string },
+        toolSignal: AbortSignal | undefined,
+      ): Promise<AgentToolResultWithError<{ question_id?: string }>> {
+        const question = typeof rawParams.question === "string" ? rawParams.question.trim() : "";
+        if (!question) {
+          return { content: [{ type: "text" as const, text: "ask_parent: question is required." }], details: {}, isError: true };
+        }
+        const pending = runOpts.ask!(question);
+        releaseSlot?.();
+        releaseSlot = undefined;
+        runOpts.onSlot?.("released");
+        let answer: string;
+        try {
+          answer = await untilAborted(pending.answer, [ctrl.signal, toolSignal]);
+        } catch (err) {
+          pending.cancel();
+          throw err;
+        }
+        let queued = false;
+        releaseSlot = await acquireSpawnSlot(
+          ctrl.signal,
+          (info) => {
+            if (queued) return;
+            queued = true;
+            runOpts.onSlot?.("reacquire_queued", info.queuePosition);
+          },
+          "resume",
+        );
+        runOpts.onSlot?.("reacquired");
+        return { content: [{ type: "text" as const, text: answer }], details: { question_id: pending.questionId } };
+      },
+    });
   }
 
   // ── Concurrency gate ──
@@ -2056,10 +2255,17 @@ export async function runAgentTool(
 
     // ── Construct in-memory subagent session ──
     const sessionManager = SessionManager.inMemory(cwd);
-    const resourceLoader = await createChildLoader(cwd);
+    // Project trust is resolved for the child's own cwd and never prompts;
+    // untrusted → no project settings / extensions / SYSTEM.md. See change:
+    // add-subagent-orchestration (D3).
+    const settingsManager = SettingsManager.create(cwd, getAgentDir(), {
+      projectTrusted: resolveChildProjectTrust(cwd, getAgentDir()),
+    });
+    const resourceLoader = await createChildLoader(cwd, settingsManager);
     // pi's session.abort() is a no-op before a run starts, so a Stop pressed
     // during construction must be checked here, not relayed.
     throwIfAborted(ctrl.signal);
+    const askTool = runOpts.ask ? makeAskParentTool() : undefined;
     const parentRuntime = getParentModelRuntime(ctx);
     const effectiveThinking: ThinkingLevelString | undefined =
       resolvedThinkingLevel ??
@@ -2068,6 +2274,9 @@ export async function runAgentTool(
     const createResult = await createAgentSession({
       cwd,
       sessionManager,
+      settingsManager,
+      // Background children may ask the parent (design D9).
+      ...(askTool ? { customTools: [askTool] } : {}),
       // Lean, per-child loader — full extension isolation, no skills/prompt
       // templates/themes (design Decision 1). Without this the SDK builds a
       // full DefaultResourceLoader per child, in the parent's event loop.
@@ -2105,7 +2314,17 @@ export async function runAgentTool(
     const activeTools = agentConfig?.tools
       ? availableTools.filter((n) => agentConfig.tools!.includes(n))
       : availableTools;
+    // `ask_parent` survives a frontmatter allowlist: it is how a background
+    // child reaches its parent, not a capability the .md opts into.
+    if (askTool && !activeTools.includes(ASK_PARENT_TOOL_NAME)) activeTools.push(ASK_PARENT_TOOL_NAME);
     session.setActiveToolsByName(activeTools);
+    if (background) {
+      const live = session;
+      runOpts.onSession?.({
+        steer: (m) => live.steer(m),
+        followUp: (m) => live.followUp(m),
+      });
+    }
 
     // ── Subscribe to events and accumulate the timeline ──
     //
@@ -2250,50 +2469,114 @@ export async function runAgentTool(
     if (ctrl.signal.aborted) onAbort();
     else ctrl.signal.addEventListener("abort", onAbort, { once: true });
 
-    // ── Announce running ──
-    const startDetails = snapshotDetails("running");
-    emitSubagentStarted(pi, {
-      agentId,
-      type: args.subagent_type,
-      description: args.description,
-      details: startDetails,
-    });
-
-    // ── Run the subagent turn(s) ──
-    await session.prompt(effectivePrompt);
-
-    // ── Aborted (parent) or stopped (`subagents:stop`)? ──
-    if (endReason) {
-      blockDeltas.dispose();
-      progress.flush();
-      return endedByAbort();
+    /** Outcome of the run that just ended: the final assistant message decides. */
+    function runOutcome(): AgentToolResultWithError<AgentDetails> {
+      // Only an errored final reply can be the end of a failed retry sequence.
+      const failure = withRetrySuffix(
+        finalReplyFailure(lastAssistant),
+        lastAssistant?.stopReason === "error" ? lastRetrySequence : undefined,
+      );
+      if (failure) return failWith("error", failure, `Subagent failed: ${failure}`);
+      const finalText = storeText("completed", lastAssistant!.text);
+      const completedDetails = snapshotDetails("completed");
+      emitSubagentCompleted(pi, {
+        agentId,
+        result: finalText,
+        durationMs: Date.now() - startedAt,
+        tokens: usage.totals(),
+        toolUses,
+        details: completedDetails,
+      });
+      pushTerminalUpdate(completedDetails);
+      const bounded = boundToolResult(finalText, completedDetails, limits);
+      return {
+        content: [{ type: "text", text: bounded.text }],
+        details: bounded.details,
+      };
     }
 
-    // ── Outcome: the final assistant message decides ──
-    blockDeltas.dispose();
-    progress.flush();
-    // Only an errored final reply can be the end of a failed retry sequence.
-    const failure = withRetrySuffix(
-      finalReplyFailure(lastAssistant),
-      lastAssistant?.stopReason === "error" ? lastRetrySequence : undefined,
-    );
-    if (failure) return failWith("error", failure, `Subagent failed: ${failure}`);
-    const finalText = storeText("completed", lastAssistant!.text);
-    const completedDetails = snapshotDetails("completed");
-    emitSubagentCompleted(pi, {
-      agentId,
-      result: finalText,
-      durationMs: Date.now() - startedAt,
-      tokens: usage.totals(),
-      toolUses,
-      details: completedDetails,
-    });
-    pushTerminalUpdate(completedDetails);
-    const bounded = boundToolResult(finalText, completedDetails, limits);
-    return {
-      content: [{ type: "text", text: bounded.text }],
-      details: bounded.details,
-    };
+    /**
+     * Park a finished background run as `idle` (design D5): release the slot,
+     * hand the caller a handle, and wait. Resolves with the next prompt
+     * (slot re-acquired) or undefined once disposed.
+     */
+    async function parkIdle(result: AgentToolResultWithError<AgentDetails>): Promise<string | undefined> {
+      releaseSlot?.();
+      releaseSlot = undefined;
+      if (runTimer) clearTimeout(runTimer);
+      runTimer = undefined;
+      phase = "idle";
+      lastAssistant = undefined;
+      const next = await new Promise<{ message: string; slot: Promise<() => void> } | undefined>((resolve) => {
+        idleHandle = {
+          continueWith(message) {
+            let queued = false;
+            const slot = acquireSpawnSlot(
+              ctrl.signal,
+              (info) => {
+                queued = true;
+                queueInfo = info;
+              },
+              "background",
+            );
+            slot.catch(() => {}); // handled at the await below
+            phase = "queued";
+            idleHandle = undefined;
+            resolve({ message, slot });
+            return queued ? "queued" : "started";
+          },
+          dispose(reason) {
+            if (!idleHandle) return;
+            idleHandle = undefined;
+            resolve(undefined);
+            runOpts.onIdleDisposed?.(reason);
+          },
+        };
+        runOpts.onIdle?.(result, idleHandle);
+      });
+      if (!next) return undefined;
+      releaseSlot = await next.slot; // rejects (SpawnAbortedError) on a stop while re-queued
+      phase = "running";
+      startedAt = Date.now();
+      slotGrantedAt = startedAt;
+      queueInfo = undefined;
+      runOpts.onRunning?.();
+      if (runOpts.timeoutMs && runOpts.timeoutMs > 0) {
+        runTimer = setTimeout(() => requestStop("timeout"), runOpts.timeoutMs);
+      }
+      return next.message;
+    }
+
+    let prompt = effectivePrompt;
+    for (;;) {
+      // ── Announce running ──
+      const startDetails = snapshotDetails("running");
+      emitSubagentStarted(pi, {
+        agentId,
+        type: args.subagent_type,
+        description: args.description,
+        details: startDetails,
+      });
+
+      // ── Run the subagent turn(s) ──
+      await session.prompt(prompt);
+
+      // ── Aborted (parent) or stopped (`subagents:stop`)? ──
+      if (endReason) {
+        blockDeltas.dispose();
+        progress.flush();
+        return endedByAbort();
+      }
+
+      blockDeltas.close();
+      progress.flush();
+      const result = runOutcome();
+      // Foreground runs, and background runs with keep-alive off, end here.
+      if (!background || !runOpts.keepAlive?.()) return result;
+      const nextPrompt = await parkIdle(result);
+      if (nextPrompt === undefined) return result; // disposed: ttl, cap, cancel or shutdown
+      prompt = nextPrompt;
+    }
   } catch (err) {
     blockDeltas.dispose();
     progress.flush();
@@ -2398,18 +2681,34 @@ export default function activate(pi: ExtensionAPI): void {
         cutEntry: (e) => cutEntry(e, getResultLimits().entryFieldMaxChars),
       })
     : undefined;
-  pi.registerTool(makeAgentTool(pi, exposeIsolated, controls, background));
-  if (background) {
-    pi.registerTool(makeAgentStatusTool(pi, background));
-    pi.registerTool(makeAgentMessagesTool(pi, background));
-    pi.registerTool(makeAgentListTool(background));
+  const orchestrator = background
+    ? createOrchestrator({
+        pi,
+        registry: background,
+        idleTtlSec: getBackgroundIdleTtlSec,
+        maxIdle: getMaxIdleBackground,
+        notifyParent: isNotifyParentEnabled,
+      })
+    : undefined;
+  pi.registerTool(makeAgentTool(pi, exposeIsolated, controls, background, orchestrator));
+  if (background && orchestrator) {
+    // One tool for every background action (design D0).
     pi.registerTool(
-      makeAgentCancelTool(background, (agentId, by) => controls.stop(agentId, by).outcome === "stopped"),
+      makeAgentControlTool({
+        pi,
+        registry: background,
+        stopAgent: (agentId, by) => controls.stop(agentId, by).outcome === "stopped",
+        disposeIdle: (record) => orchestrator.dispose(record, "cancel"),
+        orchestrator,
+        isForeground: (id) => controls.has(id) && typeof background.lookup(id) === "string",
+      }),
     );
     // Stop every outstanding background subagent when the session ends (D9).
     // Idempotent: a second call finds nothing outstanding to stop.
     pi.on("session_shutdown", () => {
+      orchestrator.shutdown(); // no push afterwards; settles pending asks
       for (const r of background.outstanding()) controls.stop(r.agentId, "shutdown");
+      orchestrator.disposeAll("shutdown");
       return undefined;
     });
 

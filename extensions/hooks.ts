@@ -35,6 +35,17 @@ export const SUBAGENT_CHANNELS = {
   list: "subagents:list",
   get: "subagents:get",
   stop: "subagents:stop",
+  // Orchestration observe events (ids only, never text). See change: add-subagent-orchestration.
+  question: "subagents:question",
+  answer: "subagents:answer",
+  slot: "subagents:slot",
+  steer: "subagents:steer",
+  idle: "subagents:idle",
+  disposed: "subagents:disposed",
+  mail: "subagents:mail",
+  mailDropped: "subagents:mail_dropped",
+  wait: "subagents:wait",
+  push: "subagents:push",
 } as const;
 
 // ─── Payload types ───────────────────────────────────────────────────────
@@ -96,6 +107,75 @@ export interface StopRequest {
   agentId: string;
 }
 
+// ─── Orchestration observe events (add-subagent-orchestration, D11) ───────
+// Ids, kinds, counters and results only: never question / answer / steer /
+// summary text.
+
+/** `subagents:question`: a background subagent called `ask_parent`. */
+export interface QuestionEvent {
+  id: string;
+  agentId: string;
+  question_id: string;
+  run: number;
+}
+/** `subagents:answer`: a pending ask settled. */
+export interface AnswerEvent {
+  id: string;
+  agentId: string;
+  question_id: string;
+  via: "reply" | "cancel";
+}
+/** `subagents:slot`: concurrency slot hand-off around `ask_parent`. */
+export interface SlotEvent {
+  id: string;
+  agentId: string;
+  action: "released" | "reacquire_queued" | "reacquired";
+  queuePosition?: number;
+}
+/** `subagents:steer`: one id of an `AgentControl` steer. */
+export interface SteerEvent {
+  id: string;
+  agentId: string;
+  mode: "steer" | "followUp";
+  result: "queued" | "started" | "not_started" | "not_alive" | "not_found" | "foreground";
+}
+/** `subagents:idle`: a run ended and the session stays alive. */
+export interface IdleEvent {
+  id: string;
+  agentId: string;
+  run: number;
+}
+/** `subagents:disposed`: an idle session was freed. */
+export interface DisposedEvent {
+  id: string;
+  agentId: string;
+  reason: "ttl" | "cap" | "cancel" | "shutdown";
+}
+/** `subagents:mail`: a mailbox entry was posted. */
+export interface MailEvent {
+  id: string;
+  agentId: string;
+  seq: number;
+  kind: "question" | "outcome";
+  outcome?: "done" | "failed" | "stopped";
+}
+/** `subagents:mail_dropped`: overflow dropped an outcome entry. */
+export interface MailDroppedEvent {
+  id: string;
+  agentId: string;
+  seq: number;
+}
+/** `subagents:wait`: an `AgentControl` wait began / ended. */
+export type WaitEvent =
+  | { phase: "start"; ids?: string[] }
+  | { phase: "end"; returned: number; timedOut: boolean };
+/** `subagents:push`: a batched update was sent to the parent. */
+export interface PushEvent {
+  seqs: number[];
+  count: number;
+  triggerTurn: boolean;
+}
+
 /** Payload shape per observable channel, for {@link onSubagentEvent}. */
 export interface SubagentEventMap {
   "subagents:created": { id: string; type: string; description: string; details: import("./events.js").AgentDetails };
@@ -124,6 +204,16 @@ export interface SubagentEventMap {
   "subagents:list": ListQueryPayload;
   "subagents:get": GetQueryPayload;
   "subagents:stop": StopRequest;
+  "subagents:question": QuestionEvent;
+  "subagents:answer": AnswerEvent;
+  "subagents:slot": SlotEvent;
+  "subagents:steer": SteerEvent;
+  "subagents:idle": IdleEvent;
+  "subagents:disposed": DisposedEvent;
+  "subagents:mail": MailEvent;
+  "subagents:mail_dropped": MailDroppedEvent;
+  "subagents:wait": WaitEvent;
+  "subagents:push": PushEvent;
 }
 
 // ─── Bus access ──────────────────────────────────────────────────────────

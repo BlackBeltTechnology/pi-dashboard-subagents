@@ -158,6 +158,11 @@ export interface AgentDetails {
    * surface-subagent-retries.
    */
   retries?: number;
+  /**
+   * The subagent's resolved working directory. See change:
+   * add-subagent-orchestration.
+   */
+  cwd?: string;
 }
 
 export interface TokenUsage {
@@ -703,6 +708,7 @@ export function buildDetails(snapshot: {
   background?: boolean;
   stoppedBy?: AgentDetails["stoppedBy"];
   retries?: number;
+  cwd?: string;
 }): AgentDetails {
   return {
     agentId: snapshot.agentId,
@@ -736,5 +742,6 @@ export function buildDetails(snapshot: {
     ...(snapshot.background !== undefined ? { background: snapshot.background } : {}),
     ...(snapshot.stoppedBy !== undefined ? { stoppedBy: snapshot.stoppedBy } : {}),
     ...(snapshot.retries !== undefined && snapshot.retries > 0 ? { retries: snapshot.retries } : {}),
+    ...(snapshot.cwd !== undefined ? { cwd: snapshot.cwd } : {}),
   };
 }

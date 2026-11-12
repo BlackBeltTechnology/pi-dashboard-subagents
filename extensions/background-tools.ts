@@ -1,6 +1,9 @@
 /**
- * LLM tools over the per-activation background registry:
- * `AgentStatus`, `AgentMessages`, `AgentList` and `AgentCancel`.
+ * Handlers over the per-activation background registry for the `status`,
+ * `messages`, `list` and `cancel` actions of `AgentControl` (formerly four
+ * separate tools; see change: add-subagent-orchestration, D0). The
+ * `makeAgent*Tool` factories build the handlers; they are no longer
+ * registered on their own.
  *
  * Registered only when `allowBackground` is on at activation. Every response
  * is bounded by the configured result limits, and reading a finished result
@@ -11,12 +14,13 @@ import { Type } from "@sinclair/typebox";
 
 import { type AgentToolUpdateCallback, defineTool, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
-import { type AgentStatus, formatRetryDelay, type SubagentTimelineEntry } from "./events.js";
+import { formatRetryDelay, type SubagentTimelineEntry } from "./events.js";
 import { getResultLimits } from "./settings.js";
 import {
   type BackgroundCounts,
   type BackgroundRecord,
   type BackgroundRegistry,
+  type BackgroundStatus,
   isTerminalStatus,
   type StoredResult,
 } from "./background.js";
@@ -27,9 +31,17 @@ import {
 export interface BackgroundAgentStatus {
   id: string;
   agentId?: string;
-  status: AgentStatus | "not_found" | "ambiguous";
+  status: BackgroundStatus | "not_found" | "ambiguous";
   subagent_type?: string;
   description?: string;
+  /** Resolved working directory. See change: add-subagent-orchestration. */
+  cwd?: string;
+  /** Current run number (1-based; `AgentSteer` starts the next). */
+  run?: number;
+  /** Assistant turns so far, across runs. */
+  turns?: number;
+  /** Short ask form while blocked in `ask_parent`. */
+  asking?: string;
   activity?: string;
   queuePosition?: number;
   tokens?: string;
@@ -47,7 +59,11 @@ export interface BackgroundAgentSummary {
   agentId: string;
   subagent_type: string;
   description: string;
-  status: AgentStatus;
+  status: BackgroundStatus;
+  cwd?: string;
+  run: number;
+  /** Short ask form while blocked in `ask_parent`. */
+  asking?: string;
   ageMs: number;
   tokens: string;
   /** Finished, and its result was never returned to a reader. */
@@ -57,7 +73,7 @@ export interface BackgroundAgentSummary {
 export interface BackgroundMessagesPage {
   id: string;
   agentId: string;
-  status: AgentStatus;
+  status: BackgroundStatus;
   total: number;
   from: number;
   next_from: number;
@@ -65,7 +81,7 @@ export interface BackgroundMessagesPage {
 }
 
 export function countsLine(c: BackgroundCounts): string {
-  return `${c.running} running, ${c.queued} queued, ${c.finishedUnread} finished-unread`;
+  return `${c.running} running, ${c.queued} queued, ${c.idle} idle, ${c.finishedUnread} finished-unread`;
 }
 
 export function statusOf(record: BackgroundRecord): BackgroundAgentStatus {
@@ -77,7 +93,11 @@ export function statusOf(record: BackgroundRecord): BackgroundAgentStatus {
     status: record.status,
     subagent_type: record.subagentType,
     description: record.description,
-    ...(latest?.activity && !r ? { activity: latest.activity } : {}),
+    ...(record.cwd !== undefined ? { cwd: record.cwd } : {}),
+    run: record.run,
+    ...(latest?.turnCount !== undefined ? { turns: latest.turnCount } : {}),
+    ...(record.asking ? { asking: askLineOf(record) } : {}),
+    ...(latest?.activity && record.status === "running" ? { activity: latest.activity } : {}),
     ...(record.status === "queued" && latest?.queuePosition !== undefined
       ? { queuePosition: latest.queuePosition }
       : {}),
@@ -96,6 +116,9 @@ export function summaryOf(record: BackgroundRecord, now = Date.now()): Backgroun
     subagent_type: record.subagentType,
     description: record.description,
     status: record.status,
+    ...(record.cwd !== undefined ? { cwd: record.cwd } : {}),
+    run: record.run,
+    ...(record.asking ? { asking: askLineOf(record, now) } : {}),
     ageMs: now - record.createdAt,
     tokens: record.latest?.tokens ?? "0",
     unread: record.result !== undefined && record.readAt === undefined,
@@ -140,6 +163,21 @@ function clampInt(v: unknown, min: number, max: number, fallback: number): numbe
   return Math.min(max, Math.max(min, Math.floor(v)));
 }
 
+/** Question length in the short ask line. */
+const ASK_LINE_QUESTION_CHARS = 120;
+
+/**
+ * Short one-line ask form for status/list (design D14), or undefined when the
+ * subagent is not blocked in `ask_parent`.
+ */
+export function askLineOf(record: BackgroundRecord, now = Date.now()): string | undefined {
+  const a = record.asking;
+  if (!a) return undefined;
+  const q = a.question.length <= ASK_LINE_QUESTION_CHARS ? a.question : `${a.question.slice(0, ASK_LINE_QUESTION_CHARS - 1)}…`;
+  const age = Math.round((now - a.askedAt) / 1000);
+  return `⏸asking ${a.questionId} "${q}" (${age}s) → AgentControl(reply ${record.id} ${a.questionId})`;
+}
+
 // ─── Bounding ─────────────────────────────────────────────────────────────
 
 /** Cut `text` to `max` chars (0 = unlimited), keeping head and tail. */
@@ -168,6 +206,10 @@ function statusBlock(s: BackgroundAgentStatus): string {
     `${s.id}: ${s.status}`,
     s.subagent_type ? `(${s.subagent_type}${s.description ? ` — ${s.description}` : ""})` : "",
     s.queuePosition !== undefined ? `queued #${s.queuePosition}` : "",
+    s.run !== undefined ? `run ${s.run}` : "",
+    s.turns !== undefined ? `turn ${s.turns}` : "",
+    s.cwd ? `cwd ${s.cwd}` : "",
+    s.asking ?? "",
     s.activity ? `▸ ${s.activity}` : "",
     s.stoppedBy ? `stopped by ${s.stoppedBy}` : "",
     s.tokens ? `${s.tokens} tokens` : "",
@@ -217,6 +259,9 @@ function waitFor(
     }
   });
 }
+
+/** Default `status` wait cap, seconds. See change: add-subagent-orchestration. */
+export const DEFAULT_STATUS_WAIT_S = 300;
 
 // ─── result_read ──────────────────────────────────────────────────────────
 
@@ -286,12 +331,20 @@ export function makeAgentStatusTool(pi: ExtensionAPI, registry: BackgroundRegist
         (x): x is string => typeof x === "string" && x.trim() !== "",
       );
       const wait = params.wait === "any" || params.wait === "all" ? params.wait : "none";
-      const timeoutS = typeof params.timeout_s === "number" && params.timeout_s > 0 ? params.timeout_s : undefined;
+      // A parent wait never blocks forever: 300 s default (design D7).
+      const timeoutS =
+        typeof params.timeout_s === "number" && params.timeout_s > 0
+          ? params.timeout_s
+          : wait !== "none"
+            ? DEFAULT_STATUS_WAIT_S
+            : undefined;
 
       const records = ids
         .map((id) => registry.lookup(id))
         .filter((r): r is BackgroundRecord => typeof r !== "string");
-      const terminal = (r: BackgroundRecord) => isTerminalStatus(r.status) && r.result !== undefined;
+      // Idle = the current run finished; counts as done (D5).
+      const terminal = (r: BackgroundRecord) =>
+        (r.status === "idle" || isTerminalStatus(r.status)) && r.result !== undefined;
       let timedOut = false;
       let interrupted = false;
       if (wait !== "none" && records.length > 0) {
@@ -384,7 +437,7 @@ export function makeAgentListTool(registry: BackgroundRegistry) {
       const counts = registry.counts();
       const lines = agents.map(
         (a) =>
-          `${a.id}  ${a.status}${a.unread ? " (unread)" : ""}  ${a.subagent_type} — ${a.description}  ${Math.round(a.ageMs / 1000)}s  ${a.tokens} tokens`,
+          `${a.id}  ${a.status}${a.unread ? " (unread)" : ""}  run ${a.run}  ${a.subagent_type} — ${a.description}  ${Math.round(a.ageMs / 1000)}s  ${a.tokens} tokens${a.cwd ? `  cwd ${a.cwd}` : ""}${a.asking ? `  ${a.asking}` : ""}`,
       );
       const text = agents.length
         ? `${lines.join("\n")}\n\nBackground: ${countsLine(counts)}.`
@@ -399,7 +452,7 @@ export function makeAgentListTool(registry: BackgroundRegistry) {
 
 // ─── AgentCancel ──────────────────────────────────────────────────────────
 
-export type CancelOutcome = "stopped" | "already_finished" | "not_found" | "ambiguous";
+export type CancelOutcome = "stopped" | "disposed" | "already_finished" | "not_found" | "ambiguous";
 
 export interface AgentCancelDetails {
   results: Array<{ id: string; outcome: CancelOutcome }>;
@@ -412,19 +465,23 @@ export interface AgentCancelDetails {
  */
 export type StopAgent = (agentId: string, by: "tool" | "event" | "timeout" | "shutdown") => boolean;
 
-export function makeAgentCancelTool(registry: BackgroundRegistry, stopAgent: StopAgent) {
+/** Free an idle subagent's session; false when it is not idle. See change: add-subagent-orchestration. */
+export type DisposeIdle = (record: BackgroundRecord) => boolean;
+
+export function makeAgentCancelTool(registry: BackgroundRegistry, stopAgent: StopAgent, disposeIdle?: DisposeIdle) {
   return defineTool({
     name: "AgentCancel",
     label: "AgentCancel",
     description:
-      'Stop background subagents by id, or all of them with ids: "all" (optionally only those with status "queued" or "running"). ' +
-      "A queued one is removed before it starts; a running one is aborted. Stopped subagents end as `stopped` (not an error) and their partial timeline stays readable. Does not wait for the stop to finish.",
+      'Stop background subagents by id, or all of them with ids: "all" (optionally only those with status "queued", "running" or "idle"). ' +
+      "A queued one is removed before it starts; a running one is aborted, also while it waits in ask_parent. Stopped subagents end as `stopped` (not an error) and their partial timeline stays readable. " +
+      "An idle one is freed (`disposed`); its last result stays readable. Does not wait for the stop to finish.",
     parameters: Type.Object({
       ids: Type.Union([Type.Array(Type.String(), { minItems: 1 }), Type.Literal("all")], {
         description: 'Background subagent ids, or "all".',
       }),
       status: Type.Optional(
-        Type.Union([Type.Literal("queued"), Type.Literal("running")], {
+        Type.Union([Type.Literal("queued"), Type.Literal("running"), Type.Literal("idle")], {
           description: "Only stop subagents currently in this state.",
         }),
       ),
@@ -432,7 +489,8 @@ export function makeAgentCancelTool(registry: BackgroundRegistry, stopAgent: Sto
 
     async execute(_toolCallId: string, rawParams: Record<string, unknown>): Promise<ToolResult<AgentCancelDetails>> {
       const params = rawParams as { ids?: unknown; status?: unknown };
-      const only = params.status === "queued" || params.status === "running" ? params.status : undefined;
+      const only =
+        params.status === "queued" || params.status === "running" || params.status === "idle" ? params.status : undefined;
       const matches = (r: BackgroundRecord) => !only || r.status === only;
       let targets: Array<{ id: string; record?: BackgroundRecord; miss?: CancelOutcome }>;
       if (params.ids === "all") {
@@ -452,6 +510,9 @@ export function makeAgentCancelTool(registry: BackgroundRegistry, stopAgent: Sto
 
       const results = targets.map(({ id, record, miss }) => {
         if (!record) return { id, outcome: miss! };
+        if (record.status === "idle" && matches(record)) {
+          return { id, outcome: disposeIdle?.(record) ? ("disposed" as const) : ("already_finished" as const) };
+        }
         if (isTerminalStatus(record.status) || !matches(record)) {
           return { id, outcome: isTerminalStatus(record.status) ? ("already_finished" as const) : ("not_found" as const) };
         }

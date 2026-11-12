@@ -44,6 +44,7 @@ beforeEach(() => {
   tmpAgentDir = mkdtempSync(join(tmpdir(), "pi-subagents-hooks-agentdir-"));
   tmpCwd = mkdtempSync(join(tmpdir(), "pi-subagents-hooks-cwd-"));
   invalidateSettingsCache();
+  writeConfig({});
 });
 
 afterEach(() => {
@@ -74,7 +75,15 @@ function makeBus() {
 function fakePi(bus = makeBus()) {
   const tools: any[] = [];
   const pi: any = { events: bus, registerTool: (t: any) => tools.push(t), on: () => {} };
-  return { pi, bus, emitted: bus.emitted, tool: (n: string) => tools.find((t) => t.name === n) };
+  // Old tool names map onto AgentControl actions (add-subagent-orchestration D0).
+  const ACTIONS: Record<string, string> = { AgentStatus: "status", AgentMessages: "messages", AgentList: "list", AgentCancel: "cancel" };
+  const tool = (n: string) => {
+    const action = ACTIONS[n];
+    if (!action) return tools.find((t) => t.name === n);
+    const control = tools.find((t) => t.name === "AgentControl");
+    return control && { name: n, execute: (id: string, p: any, ...rest: any[]) => control.execute(id, { action, ...p }, ...rest) };
+  };
+  return { pi, bus, emitted: bus.emitted, tool };
 }
 
 function installSessions() {
@@ -110,7 +119,9 @@ function installSessions() {
 function writeConfig(patch: Record<string, unknown>): void {
   const dir = join(tmpAgentDir, "extensions", "pi-dashboard-subagents");
   mkdirSync(dir, { recursive: true });
-  writeFileSync(join(dir, "config.json"), JSON.stringify(patch), "utf-8");
+  // This suite pins the pre-orchestration contract: a finished background run
+  // is disposed at once and nothing is pushed (backgroundIdleTtlSec: 0, notifyParent: false). See change: add-subagent-orchestration.
+  writeFileSync(join(dir, "config.json"), JSON.stringify({ backgroundIdleTtlSec: 0, notifyParent: false, ...patch }), "utf-8");
   invalidateSettingsCache();
 }
 
@@ -429,5 +440,23 @@ describe("exported helpers", () => {
     expect(getBackgroundAgent(pi, "bg-x")).toBeUndefined();
     expect(() => stopSubagent(pi, "x")).not.toThrow();
     expect(onSubagentEvent(pi, "subagents:created", () => {})).toBeTypeOf("function");
+  });
+});
+
+describe("orchestration channels are part of the typed surface (add-subagent-orchestration)", () => {
+  it("SUBAGENT_CHANNELS names every orchestration event", async () => {
+    const { SUBAGENT_CHANNELS } = await import("../index.js");
+    expect(SUBAGENT_CHANNELS).toMatchObject({
+      question: "subagents:question",
+      answer: "subagents:answer",
+      slot: "subagents:slot",
+      steer: "subagents:steer",
+      idle: "subagents:idle",
+      disposed: "subagents:disposed",
+      mail: "subagents:mail",
+      mailDropped: "subagents:mail_dropped",
+      wait: "subagents:wait",
+      push: "subagents:push",
+    });
   });
 });
