@@ -6,6 +6,8 @@ All notable changes to this package are documented here. Format follows
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-11-12
+
 ### Added
 
 - **Orchestration of background subagents.** One parent tool, `AgentControl({ action, … })`, carries every background operation: `status`, `list`, `messages`, `cancel`, `wait`, `reply`, `steer`. See change: add-subagent-orchestration.
