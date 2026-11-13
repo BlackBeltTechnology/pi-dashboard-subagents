@@ -6,6 +6,8 @@ All notable changes to this package are documented here. Format follows
 
 ## [Unreleased]
 
+## [0.8.1] - 2026-11-13
+
 ### Changed
 
 - **BREAKING: `AgentControl` `status` is folded into `wait`.** One action reports on and waits for background subagents: `wait {ids?, until?: "none" | "any" | "all", timeout_s?}`. `none` = snapshot, `any` (default) = first result or question, `all` = every covered child finished its run. Calling `status` returns an error with the migration (`status {ids}` → `wait {ids, until: "none"}`, `wait: "any"|"all"` → `until`). `details.agents` keeps the former per-agent shape. See change: agent-control-unified-wait.
