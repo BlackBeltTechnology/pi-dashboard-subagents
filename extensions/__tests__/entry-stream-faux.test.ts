@@ -14,6 +14,14 @@ import { join } from "node:path";
 
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
+/** `AgentStatus {ids, wait?}` → `wait {ids, until}` (see change: agent-control-unified-wait). */
+const asAction = (action: string, p: any) => {
+  if (action !== "status") return { action, ...p };
+  const { wait, ...rest } = p ?? {};
+  return { action: "wait", until: wait ?? "none", ...rest };
+};
+
+
 describe("real faux-provider entry stream", () => {
   let root: string;
   let cwd: string;
@@ -111,7 +119,7 @@ describe("real faux-provider entry stream", () => {
         return (
             control && {
                 name,
-                execute: (id: string, params: any, ...rest: any[]) => control.execute(id, { action, ...params }, ...rest),
+                execute: (id: string, params: any, ...rest: any[]) => control.execute(id, asAction(action, params), ...rest),
             }
         );
     };
@@ -518,13 +526,13 @@ describe("real faux-provider entry stream", () => {
       const r: any = await act({ action: "reply", id, question_id: "q1", answer: "use JWT" });
       expect(r.details.results[0].result).toBe("answered");
 
-      const s1: any = await act({ action: "status", ids: [id], wait: "all", timeout_s: 20 });
+      const s1: any = await act({ action: "wait", ids: [id], until: "all", timeout_s: 20 });
       expect(s1.details.agents[0]).toMatchObject({ status: "idle", run: 1, result: "RUN1: using JWT" });
       expect(run1SawAnswer).toBe(true);
 
       const st: any = await act({ action: "steer", id, message: "now add tests", mode: "followUp" });
       expect(st.details.results[0].result).toBe("started");
-      const s2: any = await act({ action: "status", ids: [id], wait: "all", timeout_s: 20 });
+      const s2: any = await act({ action: "wait", ids: [id], until: "all", timeout_s: 20 });
       expect(s2.details.agents[0]).toMatchObject({ status: "idle", run: 2, result: "RUN2: tests added" });
       expect(run2SawHistory).toBe(true);
       expect(registration.getPendingResponseCount()).toBe(0);

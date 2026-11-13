@@ -59,60 +59,6 @@ The call SHALL register the subagent and return without awaiting it. The text re
 - **THEN** its result `details` SHALL NOT contain `agentId`
 - **AND** SHALL contain `background: true` and the short `id`
 
-### Requirement: The `status` action SHALL report and optionally wait for background subagents
-
-`AgentControl({ action: "status", ids, wait?, timeout_s? })` SHALL accept ids (short id, full `agentId` or unique prefix). `wait: "none"` (default) returns current state; `"any"` returns once one has finished its current run (terminal or `idle`); `"all"` once all have. When waiting, `timeout_s` SHALL default to 300; expiry returns current state without cancelling. Aborting ends only the wait. Each id SHALL get a liveness line. Output SHALL be bounded by `resultMaxChars`.
-
-#### Scenario: Snapshot without waiting
-
-- **GIVEN** a running background subagent `bg-a`
-- **WHEN** `AgentControl({ action: "status", ids: ["bg-a"] })` is called
-- **THEN** it SHALL return immediately with `status: running`
-
-#### Scenario: Wait for all
-
-- **GIVEN** background subagents `bg-a` and `bg-b` running
-- **WHEN** `AgentControl({ action: "status", ids: ["bg-a","bg-b"], wait: "all" })` is called
-- **THEN** it SHALL resolve only after both have finished their current run, returning both results
-
-#### Scenario: Wait for any
-
-- **WHEN** `AgentControl({ action: "status", ids: ["bg-a","bg-b"], wait: "any" })` is called and `bg-b` finishes first
-- **THEN** it SHALL return `bg-b`'s result and `bg-a`'s current status
-
-#### Scenario: Idle counts as finished
-
-- **GIVEN** `bg-a` finished run 1 and is `idle`
-- **WHEN** `AgentControl({ action: "status", ids: ["bg-a"], wait: "all" })` is called
-- **THEN** it SHALL return immediately with run 1's result and `status: idle`
-
-#### Scenario: Default wait timeout
-
-- **WHEN** `AgentControl({ action: "status", ids: ["bg-a"], wait: "all" })` is called without `timeout_s` and `bg-a` runs longer than 300 s
-- **THEN** it SHALL return after 300 s with `bg-a`'s current status, and `bg-a` SHALL keep running
-
-#### Scenario: Wait timeout does not cancel
-
-- **WHEN** `AgentControl({ action: "status", ids: ["bg-a"], wait: "all", timeout_s: 5 })` passes 5 s with `bg-a` still running
-- **THEN** it SHALL return `bg-a` with `status: running`
-- **AND** `bg-a` SHALL keep running
-
-#### Scenario: Interrupting the wait leaves the subagent running
-
-- **WHEN** the call's signal aborts during a wait
-- **THEN** the call SHALL end and the waited subagents SHALL keep running
-
-#### Scenario: Liveness line while asking
-
-- **GIVEN** `bg-a` is blocked in `ask_parent` with question `q1`
-- **WHEN** `AgentControl({ action: "status", ids: ["bg-a"] })` is called
-- **THEN** its line SHALL show status, run, turn, cwd, `asking q1`, the shortened question and the short reply hint
-
-#### Scenario: Unknown id
-
-- **WHEN** an id matches no record
-- **THEN** that id SHALL be reported `not_found` without failing the other ids
-
 ### Requirement: The `messages` action SHALL return a paged, bounded view of a subagent's timeline
 
 `AgentControl({ action: "messages", id, from?, limit?, kinds? })` SHALL work on queued, running, idle and finished background subagents. Without `from` it SHALL return the last `limit` (default 20) entries, with `total` and `next_from`. `kinds` SHALL filter before paging. Each entry field SHALL be cut to `entryFieldMaxChars` and the response bounded by `resultMaxChars`. The tool description SHALL mark this action as debug-only, and point orchestration to `wait`, `status` and `steer`.
@@ -152,7 +98,7 @@ The call SHALL register the subagent and return without awaiting it. The text re
 
 ### Requirement: The `cancel` action SHALL stop background subagents through the shared stop path
 
-`AgentControl({ action: "cancel", ids, status? })` SHALL accept an id list or `"all"`, optionally filtered by `status` (`queued`|`running`|`idle`). Queued and running ones SHALL stop as with `subagents:stop` (`stopped`, `stoppedBy: "tool"`), settling any pending `ask_parent`. Idle ones SHALL be disposed, keeping their last result. Each id SHALL return `stopped`, `disposed`, `already_finished` or `not_found`, without waiting; partial timelines SHALL stay readable.
+`AgentControl({ action: "cancel", ids, status? })` SHALL accept an id list or `"all"`, optionally filtered by `status` (`queued`|`running`|`idle`). Queued and running ones SHALL stop as with `subagents:stop` (`stopped`, `stoppedBy: "tool"`), settling any pending `ask_parent`. Idle ones SHALL be disposed, keeping their last result. Each id SHALL return `stopped`, `disposed`, `already_finished` or `not_found`, without waiting; partial timelines SHALL stay readable. After the outcomes, the return SHALL include the progress line of every touched child that still has a record.
 
 #### Scenario: Cancel a running subagent
 
@@ -160,6 +106,12 @@ The call SHALL register the subagent and return without awaiting it. The text re
 - **THEN** the outcome SHALL be `stopped`
 - **AND** the subagent SHALL emit `subagents:completed` with `details.status: "stopped"`, `stopReason: "running"`, `stoppedBy: "tool"`
 - **AND** the `messages` action SHALL still return its entries
+
+#### Scenario: Progress line in the return
+
+- **GIVEN** `bg-a` is running with 1.2k tokens
+- **WHEN** `AgentControl({ action: "cancel", ids: ["bg-a"] })` is called
+- **THEN** the return SHALL include `bg-a`'s progress line with `1.2k tokens`
 
 #### Scenario: Bulk-cancel the queue
 
@@ -235,7 +187,7 @@ On `session_shutdown`, every queued or running background subagent of the activa
 
 ### Requirement: Background subagents SHALL be managed through one `AgentControl` tool
 
-Every parent-side background operation SHALL be an `action` of one tool, `AgentControl`: `status`, `list`, `messages`, `cancel`, `wait`, `reply` and `steer`. Each action SHALL accept only its own parameters. An unknown action, or missing required parameters, SHALL return an error result naming the valid actions. The tools `AgentStatus`, `AgentMessages`, `AgentList` and `AgentCancel` SHALL NOT be registered.
+Every parent-side background operation SHALL be an `action` of one tool, `AgentControl`: `wait`, `list`, `messages`, `cancel`, `reply` and `steer`. Each action SHALL accept only its own parameters. An unknown action, or missing required parameters, SHALL return an error result naming the valid actions. The tools `AgentStatus`, `AgentMessages`, `AgentList` and `AgentCancel` SHALL NOT be registered, and there SHALL be no `status` action.
 
 #### Scenario: One tool for every action
 
@@ -245,7 +197,12 @@ Every parent-side background operation SHALL be an `action` of one tool, `AgentC
 #### Scenario: Unknown action
 
 - **WHEN** `AgentControl({ action: "explode" })` is called
-- **THEN** it SHALL return an error result listing `status`, `list`, `messages`, `cancel`, `wait`, `reply` and `steer`
+- **THEN** it SHALL return an error result listing `wait`, `list`, `messages`, `cancel`, `reply` and `steer`
+
+#### Scenario: Former status action
+
+- **WHEN** `AgentControl({ action: "status", ids: ["bg-a"] })` is called
+- **THEN** it SHALL return an error result naming the valid actions and pointing to `wait` with `until: "none"`
 
 #### Scenario: Missing parameters
 
@@ -254,10 +211,10 @@ Every parent-side background operation SHALL be an `action` of one tool, `AgentC
 
 ### Requirement: Finished background results SHALL be stored and readable
 
-At the end of every run, the extension SHALL store status, result text or error, token usage, duration, run number and the timeline, readable for the rest of the session. Delivery into the parent is governed by the `subagent-orchestration` push requirement and the `notifyParent` setting.
+At the end of every run, the extension SHALL store status, result text or error, token usage, turns, duration, run number and the timeline, readable for the rest of the session through `wait` with explicit `ids`. Delivery into the parent is governed by the `subagent-orchestration` push requirement and the `notifyParent` setting.
 
 #### Scenario: Result available later
 
 - **GIVEN** a background subagent completed while the parent was idle
-- **WHEN** the LLM later calls `AgentControl({ action: "status", ids })` with its id
-- **THEN** the stored result text SHALL be returned
+- **WHEN** the LLM later calls `AgentControl({ action: "wait", ids, until: "none" })` with its id
+- **THEN** the stored result text SHALL be returned, together with its turns and tokens

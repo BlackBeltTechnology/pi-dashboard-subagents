@@ -18,3 +18,9 @@ Agent tool registration + spawn loop + agent-`.md` resolution. Default export `a
 - Exports: `ASK_PARENT_TOOL_NAME`, `CwdRejectDetails`, `DisposeReason`, `IdleHandle`, `LiveSession`.
 
 See change: add-subagent-orchestration.
+
+## agent-control-unified-wait
+
+- `maxBackgroundPending` rejection hint points at `AgentControl({ action: "wait", ids, until: "any" })` (former `status` action removed).
+
+See change: agent-control-unified-wait.

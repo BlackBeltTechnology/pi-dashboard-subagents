@@ -15,6 +15,14 @@ import activate from "../agent.js";
 import { invalidateSettingsCache } from "../settings.js";
 import { createAgentSession, SettingsManager } from "@earendil-works/pi-coding-agent";
 
+/** `AgentStatus {ids, wait?}` → `wait {ids, until}` (see change: agent-control-unified-wait). */
+const asAction = (action: string, p: any) => {
+  if (action !== "status") return { action, ...p };
+  const { wait, ...rest } = p ?? {};
+  return { action: "wait", until: wait ?? "none", ...rest };
+};
+
+
 let tmpAgentDir: string;
 let tmpCwd: string;
 
@@ -103,7 +111,7 @@ function fakePi() {
     const control = tools.find((t) => t.name === "AgentControl");
     return control && {
       name,
-      execute: (id: string, params: any, ...rest: any[]) => control.execute(id, { action, ...params }, ...rest),
+      execute: (id: string, params: any, ...rest: any[]) => control.execute(id, asAction(action, params), ...rest),
     };
   };
   const fire = async (event: string, payload: unknown = {}) => {
@@ -471,11 +479,10 @@ describe("AgentControl (D0)", () => {
     const p = tools[1].parameters;
     expect(p.required).toEqual(["action"]);
     expect(p.properties.action.enum ?? p.properties.action.anyOf?.map((x: any) => x.const)).toEqual([
-      "status",
+      "wait",
       "list",
       "messages",
       "cancel",
-      "wait",
       "reply",
       "steer",
     ]);
@@ -486,7 +493,7 @@ describe("AgentControl (D0)", () => {
     activate(pi);
     const res = await exec(tools[1], { action: "explode" });
     expect(res.isError).toBe(true);
-    expect(text(res)).toMatch(/status, list, messages, cancel, wait, reply, steer/);
+    expect(text(res)).toMatch(/wait, list, messages, cancel, reply, steer/);
   });
 
   it("missing parameters → error naming them", async () => {
@@ -758,10 +765,10 @@ describe("steer (8)", () => {
     created[0]!.finish();
     await tick();
     const w = await exec(tool("AgentWait"), {});
-    expect(w.details.entries.map((e: any) => [e.kind, e.run])).toEqual([
-      ["outcome", 1],
-      ["outcome", 2],
-    ]);
+    // Run 1's outcome was consumed by the snapshot above (one read point,
+    // see change: agent-control-unified-wait), so only run 2 is pending.
+    expect(mid.details.agents[0].result).toBeDefined();
+    expect(w.details.entries.map((e: any) => [e.kind, e.run])).toEqual([["outcome", 2]]);
     const end = await exec(tool("AgentStatus"), { ids: [id] });
     expect(end.details.agents[0]).toMatchObject({ status: "idle", run: 2, result: "done 2" });
   });

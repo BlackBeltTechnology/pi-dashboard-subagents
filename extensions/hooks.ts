@@ -80,11 +80,15 @@ export interface BeforeStorePayload {
   patch?: { result?: string };
 }
 
-/** `subagents:result_read`: a stored background result was returned to a reader. */
+/**
+ * `subagents:result_read`: a stored background result was returned to a reader
+ * (`wait`), delivered by a push, or its timeline read (`messages`).
+ * See change: agent-control-unified-wait.
+ */
 export interface ResultReadEvent {
   id: string;
   agentId: string;
-  via: "status" | "messages";
+  via: "wait" | "push" | "messages";
 }
 
 /** `subagents:list` query. */
@@ -159,7 +163,11 @@ export interface MailEvent {
   kind: "question" | "outcome";
   outcome?: "done" | "failed" | "stopped";
 }
-/** `subagents:mail_dropped`: overflow dropped an outcome entry. */
+/**
+ * @deprecated Never emitted: pending entries are a registry view and are never
+ * dropped. Kept so plugin type imports keep compiling. See change:
+ * agent-control-unified-wait.
+ */
 export interface MailDroppedEvent {
   id: string;
   agentId: string;

@@ -20,6 +20,14 @@ import {
 import { invalidateSettingsCache } from "../settings.js";
 import { createAgentSession } from "@earendil-works/pi-coding-agent";
 
+/** `AgentStatus {ids, wait?}` → `wait {ids, until}` (see change: agent-control-unified-wait). */
+const asAction = (action: string, p: any) => {
+  if (action !== "status") return { action, ...p };
+  const { wait, ...rest } = p ?? {};
+  return { action: "wait", until: wait ?? "none", ...rest };
+};
+
+
 let tmpAgentDir: string;
 let tmpCwd: string;
 
@@ -81,7 +89,7 @@ function fakePi(bus = makeBus()) {
     const action = ACTIONS[n];
     if (!action) return tools.find((t) => t.name === n);
     const control = tools.find((t) => t.name === "AgentControl");
-    return control && { name: n, execute: (id: string, p: any, ...rest: any[]) => control.execute(id, { action, ...p }, ...rest) };
+    return control && { name: n, execute: (id: string, p: any, ...rest: any[]) => control.execute(id, asAction(action, p), ...rest) };
   };
   return { pi, bus, emitted: bus.emitted, tool };
 }
@@ -307,7 +315,7 @@ describe("observation events", () => {
     await tick();
     await tool("AgentStatus").execute("tc", { ids: [id] }, undefined, undefined, ctx());
     expect(of(emitted, "subagents:result_read")).toEqual([
-      { id, agentId: of(emitted, "subagents:created")[0].id, via: "status" },
+      { id, agentId: of(emitted, "subagents:created")[0].id, via: "wait" },
     ]);
   });
 });

@@ -129,7 +129,7 @@ describe("idle pool", () => {
 // ── 6. Mailbox, wait, push ──────────────────────────────────────────────────
 
 describe("mailbox + outcomes", () => {
-  it("every run end posts one outcome entry (done / failed / stopped) with a bounded summary", () => {
+  it("every run end makes one outcome pending (done / failed / stopped) with a bounded summary", () => {
     const { orch, registry, of } = setup();
     const mk = () => {
       const r = registry.create({ agentId: `a${Math.random()}`, subagentType: "t", description: "d", cwd: "/w" });
@@ -151,22 +151,63 @@ describe("mailbox + outcomes", () => {
     expect(entries[0]!.text.length).toBeLessThanOrEqual(500);
     expect(entries[0]!).toMatchObject({ run: 1, cwd: "/w" });
     expect(of("subagents:mail").map((m) => m.kind)).toEqual(["outcome", "outcome", "outcome"]);
+    expect(of("subagents:mail").map((m) => m.seq)).toEqual(entries.map((e) => e.seq));
     expect(JSON.stringify(of("subagents:mail"))).not.toContain("boom");
   });
 
-  it("overflow drops the oldest outcome, never a question", () => {
-    const { orch, registry, of } = setup({ notifyParent: () => false, maxMailbox: 3 });
-    const r = registry.create({ agentId: "q", subagentType: "t", description: "d" });
-    registry.markRunning(r);
-    orch.ask(r, "keep me?");
-    for (let i = 0; i < 3; i++) {
+  it("never drops entries and never emits mail_dropped", () => {
+    const { orch, registry, of } = setup({ notifyParent: () => false });
+    for (let i = 0; i < 150; i++) {
       const o = registry.create({ agentId: `o${i}`, subagentType: "t", description: "d" });
       registry.markRunning(o);
       orch.runEnded(o, { content: [{ type: "text", text: `r${i}` }], details: { status: "completed" } });
     }
-    const kinds = orch.pending().map((e) => e.kind);
-    expect(kinds).toEqual(["question", "outcome", "outcome"]);
-    expect(of("subagents:mail_dropped")).toHaveLength(1);
+    expect(orch.pending()).toHaveLength(150);
+    expect(of("subagents:mail_dropped")).toEqual([]);
+  });
+
+  it("pending is a view over the registry: reading the result consumes the outcome", () => {
+    const { orch, registry } = setup({ notifyParent: () => false });
+    const r = registry.create({ agentId: "x", subagentType: "t", description: "d" });
+    registry.markRunning(r);
+    orch.runEnded(r, { content: [{ type: "text", text: "ok" }], details: { status: "completed" } });
+    expect(orch.pending()).toHaveLength(1);
+    registry.markRead(r);
+    expect(orch.pending()).toEqual([]);
+  });
+
+  it("a continued run's outcome is pending again", () => {
+    const { orch, idleAgent } = setup({ notifyParent: () => false });
+    const { r, handle } = idleAgent();
+    orch.consume(orch.pending(), "wait");
+    expect(orch.pending()).toEqual([]);
+    orch.continueRun(r, "next");
+    orch.runEnded(r, { content: [{ type: "text", text: "run 2" }], details: { status: "completed" } }, handle);
+    expect(orch.pending().map((e) => [e.id, e.run, e.text])).toEqual([[r.id, 2, "run 2"]]);
+  });
+
+  it("a question stays pending until delivered; delivery stamps asking.deliveredAt", () => {
+    const { orch, registry, of } = setup({ notifyParent: () => false });
+    const r = registry.create({ agentId: "q", subagentType: "t", description: "d" });
+    registry.markRunning(r);
+    orch.ask(r, "which?");
+    expect(r.asking?.deliveredAt).toBeUndefined();
+    const entries = orch.pending();
+    expect(entries.map((e) => e.kind)).toEqual(["question"]);
+    orch.consume(entries, "wait");
+    expect(r.asking?.deliveredAt).toBeDefined();
+    expect(orch.pending()).toEqual([]);
+    expect(of("subagents:result_read")).toEqual([]); // questions are not results
+  });
+
+  it("consume emits result_read with via for outcomes", () => {
+    const { orch, registry, of } = setup({ notifyParent: () => false });
+    const r = registry.create({ agentId: "x", subagentType: "t", description: "d" });
+    registry.markRunning(r);
+    orch.runEnded(r, { content: [{ type: "text", text: "ok" }], details: { status: "completed" } });
+    orch.consume(orch.pending(), "wait");
+    expect(of("subagents:result_read")).toEqual([{ id: r.id, agentId: r.agentId, via: "wait" }]);
+    expect(r.readAt).toBeDefined();
   });
 });
 
@@ -177,28 +218,83 @@ describe("wait", () => {
     s.orch.runEnded(r, { content: [{ type: "text", text }], details: { status: "completed" } });
     return r;
   };
+  /** A child that is still running (keeps a wait blocking). */
+  const running = (s: ReturnType<typeof setup>) => {
+    const r = s.registry.create({ agentId: `live${Math.random()}`, subagentType: "t", description: "d" });
+    s.registry.markRunning(r);
+    return r;
+  };
 
-  it("returns all pending entries immediately and marks them delivered", async () => {
+  it("returns all pending entries immediately and consumes them", async () => {
     const s = setup({ notifyParent: () => false });
     post(s);
     post(s);
     const res = await s.orch.wait({});
     expect(res.entries).toHaveLength(2);
     expect(s.orch.pending()).toEqual([]);
+    running(s);
     const again = s.orch.wait({ timeoutMs: 1000 });
     vi.advanceTimersByTime(1000);
     expect((await again).entries).toEqual([]);
     expect((await again).timedOut).toBe(true);
   });
 
+  it("returns at once with nothingToWait when no subagent is queued, running or pending", async () => {
+    const s = setup({ notifyParent: () => false });
+    post(s);
+    await s.orch.wait({});
+    const res = await s.orch.wait({ timeoutMs: 3_000_000 });
+    expect(res).toMatchObject({ entries: [], timedOut: false, interrupted: false, nothingToWait: true });
+  });
+
+  it("returns at once when ids resolve to no record, reporting the misses", async () => {
+    const s = setup({ notifyParent: () => false });
+    running(s);
+    const res = await s.orch.wait({ ids: ["bg-nope"], timeoutMs: 3_000_000 });
+    expect(res).toMatchObject({ nothingToWait: true, misses: [{ id: "bg-nope", status: "not_found" }] });
+  });
+
+  it("ends when the last covered child stops without a pending entry", async () => {
+    const s = setup({ notifyParent: () => false });
+    const r = running(s);
+    const p = s.orch.wait({ ids: [r.id], timeoutMs: 3_000_000 });
+    // finished and read elsewhere: no pending entry ever appears
+    s.registry.finish(r, { content: [], details: { status: "stopped" } as any });
+    s.registry.markRead(r);
+    vi.advanceTimersByTime(1000);
+    expect(await p).toMatchObject({ timedOut: false, nothingToWait: true });
+  });
+
   it("wakes on a new entry after a short coalescing window and batches late arrivals", async () => {
     const s = setup({ notifyParent: () => false });
+    running(s);
     const p = s.orch.wait({});
     post(s);
     vi.advanceTimersByTime(100);
     post(s);
     vi.advanceTimersByTime(250);
     expect((await p).entries).toHaveLength(2);
+  });
+
+  it("wakes on a question", async () => {
+    const s = setup({ notifyParent: () => false });
+    const r = running(s);
+    const p = s.orch.wait({ timeoutMs: 60_000 });
+    s.orch.ask(r, "which?");
+    vi.advanceTimersByTime(250);
+    const res = await p;
+    expect(res.entries.map((e) => e.kind)).toEqual(["question"]);
+  });
+
+  it("returns at once while a covered child is asking, even when its question was delivered", async () => {
+    const s = setup({ notifyParent: () => false });
+    const a = running(s);
+    const b = running(s);
+    s.orch.ask(a, "which?");
+    s.orch.consume(s.orch.pending(), "push");
+    const res = await s.orch.wait({ until: "all", timeoutMs: 60_000 });
+    expect(res.timedOut).toBe(false);
+    expect(res.records.map((r) => r.id).sort()).toEqual([a.id, b.id].sort());
   });
 
   it("filters by ids and leaves other entries pending", async () => {
@@ -210,8 +306,40 @@ describe("wait", () => {
     expect(s.orch.pending()).toHaveLength(1);
   });
 
+  it("until none returns a snapshot at once", async () => {
+    const s = setup({ notifyParent: () => false });
+    const r = running(s);
+    const res = await s.orch.wait({ ids: [r.id], until: "none" });
+    expect(res.records.map((x) => x.status)).toEqual(["running"]);
+    expect(res.timedOut).toBe(false);
+  });
+
+  it("explicit ids cover a finished, already-read child", async () => {
+    const s = setup({ notifyParent: () => false });
+    const r = post(s);
+    s.registry.markRead(r);
+    const res = await s.orch.wait({ ids: [r.id], until: "none" });
+    expect(res.records.map((x) => x.id)).toEqual([r.id]);
+  });
+
+  it("until all waits for every covered child; idle counts as finished", async () => {
+    const s = setup({ notifyParent: () => false });
+    const { r: idle } = s.idleAgent();
+    const r = running(s);
+    const p = s.orch.wait({ ids: [idle.id, r.id], until: "all", timeoutMs: 60_000 });
+    let done = false;
+    void p.then(() => (done = true));
+    await Promise.resolve();
+    expect(done).toBe(false);
+    s.orch.runEnded(r, { content: [{ type: "text", text: "ok" }], details: { status: "completed" } });
+    vi.advanceTimersByTime(250);
+    const res = await p;
+    expect(res.entries.map((e) => e.id).sort()).toEqual([idle.id, r.id].sort());
+  });
+
   it("defaults to a 300 s timeout and never cancels anything", async () => {
     const s = setup({ notifyParent: () => false });
+    const r = running(s);
     const p = s.orch.wait({});
     vi.advanceTimersByTime(299_999);
     let done = false;
@@ -220,10 +348,12 @@ describe("wait", () => {
     expect(done).toBe(false);
     vi.advanceTimersByTime(1);
     expect((await p).timedOut).toBe(true);
+    expect(r.status).toBe("running");
   });
 
   it("abort ends only the wait; a second concurrent wait is rejected", async () => {
     const s = setup({ notifyParent: () => false });
+    running(s);
     const ac = new AbortController();
     const p = s.orch.wait({ signal: ac.signal });
     await expect(s.orch.wait({})).rejects.toThrow(/wait_in_progress/);
@@ -242,6 +372,14 @@ describe("wait", () => {
       { phase: "start" },
       { phase: "end", returned: 1, timedOut: false },
     ]);
+  });
+
+  it("render shows turns and tokens on outcome lines", () => {
+    const s = setup({ notifyParent: () => false });
+    const r = running(s);
+    s.registry.sink(r)({ details: { status: "running", tokens: "1.2k", turnCount: 3 } as any });
+    s.orch.runEnded(r, { content: [{ type: "text", text: "ok" }], details: { status: "completed" } });
+    expect(s.orch.render(s.orch.pending())).toMatch(/3 turns · 1\.2k tokens/);
   });
 });
 
@@ -267,12 +405,15 @@ describe("push", () => {
     expect(opts).toEqual({ deliverAs: "followUp", triggerTurn: true });
     expect(s.orch.pending()).toEqual([]);
     expect(s.of("subagents:push")).toEqual([expect.objectContaining({ count: 2, triggerTurn: true })]);
+    expect(s.of("subagents:result_read").map((e) => e.via)).toEqual(["push", "push"]);
   });
 
   it("no push while a wait is active; leftovers flush after the wait ends", async () => {
     const s = setup();
+    const live = s.registry.create({ agentId: "live", subagentType: "t", description: "d" });
+    s.registry.markRunning(live);
     const a = post(s);
-    const p = s.orch.wait({ ids: ["nobody"], timeoutMs: 5_000 });
+    const p = s.orch.wait({ ids: [live.id], timeoutMs: 5_000 });
     vi.advanceTimersByTime(2_000);
     expect(s.pi.sendMessage).not.toHaveBeenCalled();
     vi.advanceTimersByTime(3_000);

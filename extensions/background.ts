@@ -76,7 +76,13 @@ export interface BackgroundRecord {
   /** Set when the stop was requested; copied into the stored result. */
   stoppedBy?: StoppedBy;
   /** Set while the subagent is blocked in `ask_parent`. See change: add-subagent-orchestration. */
-  asking?: { questionId: string; question: string; askedAt: number };
+  asking?: {
+    questionId: string;
+    question: string;
+    askedAt: number;
+    /** Set once the question was shown to the parent (wait or push). See change: agent-control-unified-wait. */
+    deliveredAt?: number;
+  };
 }
 
 export interface BackgroundCounts {

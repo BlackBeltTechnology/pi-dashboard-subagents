@@ -13,6 +13,14 @@ import activate, { buildAgentParametersSchema } from "../agent.js";
 import { invalidateSettingsCache } from "../settings.js";
 import { createAgentSession } from "@earendil-works/pi-coding-agent";
 
+/** `AgentStatus {ids, wait?}` → `wait {ids, until}` (see change: agent-control-unified-wait). */
+const asAction = (action: string, p: any) => {
+  if (action !== "status") return { action, ...p };
+  const { wait, ...rest } = p ?? {};
+  return { action: "wait", until: wait ?? "none", ...rest };
+};
+
+
 let tmpAgentDir: string;
 let tmpCwd: string;
 
@@ -95,7 +103,7 @@ export function fakePi() {
     return (
       control && {
         name,
-        execute: (id: string, params: any, ...rest: any[]) => control.execute(id, { action, ...params }, ...rest),
+        execute: (id: string, params: any, ...rest: any[]) => control.execute(id, asAction(action, params), ...rest),
       }
     );
   };
@@ -464,7 +472,7 @@ describe("AgentStatus", () => {
     expect(parse(res).agents[0]).toMatchObject({ id: ids[0], status: "completed", result: "the answer" });
     expect(res.content[0].text).toContain("the answer");
     expect(ofChannel(emitted, "subagents:result_read")).toEqual([
-      expect.objectContaining({ id: ids[0], via: "status" }),
+      expect.objectContaining({ id: ids[0], via: "wait" }),
     ]);
     const list = await statusCall(tool("AgentList"), {});
     expect(parse(list).counts.finishedUnread).toBe(0);

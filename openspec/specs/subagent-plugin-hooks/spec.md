@@ -21,12 +21,17 @@ Every `subagents:*` lifecycle event's `details` SHALL carry `background: boolean
 
 ### Requirement: The extension SHALL emit `subagents:result_read`
 
-`subagents:result_read` SHALL fire when `AgentStatus` returns a terminal result or `AgentMessages` returns entries, with `{ id, agentId, via }` where `via` is `status` or `messages`.
+`subagents:result_read` SHALL fire when a run result is consumed or shown, with `{ id, agentId, via }`. `via` SHALL be `wait` when an `AgentControl` `wait` returns the result, `push` when a push delivers its outcome, and `messages` when the `messages` action returns entries. `via: "status"` SHALL NOT be emitted.
 
 #### Scenario: Result read
 
-- **WHEN** `AgentStatus` returns `bg-a`'s completed result
-- **THEN** `subagents:result_read` SHALL fire with `via: "status"`
+- **WHEN** `wait` returns `bg-a`'s completed result
+- **THEN** `subagents:result_read` SHALL fire with `via: "wait"`
+
+#### Scenario: Result read through push
+
+- **WHEN** a push delivers `bg-a`'s outcome
+- **THEN** `subagents:result_read` SHALL fire with `via: "push"`
 
 ### Requirement: `subagents:before_spawn` SHALL let a plugin veto or patch any spawn
 
@@ -53,7 +58,7 @@ On every terminal state, before bounding, storing or returning the result, the e
 
 - **GIVEN** a handler sets `patch = { result: "[redacted]" }`
 - **WHEN** a background subagent completes
-- **THEN** `AgentStatus` SHALL return `[redacted]` as its result
+- **THEN** `wait` SHALL return `[redacted]` as its result
 
 ### Requirement: Intercept handlers SHALL be synchronous and fault-isolated
 
@@ -91,7 +96,7 @@ The package entry SHALL export payload types for every hook channel and helpers 
 
 ### Requirement: Every orchestration action SHALL emit an observe event
 
-The extension SHALL emit one event per affected subagent for each orchestration action. Batch and broadcast calls fan out to per-id events. Channels: `question`, `answer` (`via` is `reply` or `cancel`), `slot` (`released`, `reacquire_queued`, `reacquired`), `steer`, `idle`, `disposed` (with reason), `mail`, `mail_dropped`, `wait` (`start` / `end`) and `push`, all under `subagents:`.
+The extension SHALL emit one event per affected subagent for each orchestration action. Batch and broadcast calls fan out to per-id events. Channels: `question`, `answer` (`via` is `reply` or `cancel`), `slot` (`released`, `reacquire_queued`, `reacquired`), `steer`, `idle`, `disposed` (with reason), `mail` (an entry became pending), `wait` (`start` / `end`) and `push`, all under `subagents:`. `mail_dropped` SHALL NOT be emitted, since pending entries are never dropped; its payload type stays exported.
 
 #### Scenario: Ask and reply observed
 
@@ -105,7 +110,7 @@ The extension SHALL emit one event per affected subagent for each orchestration 
 
 #### Scenario: Wait and push observed
 
-- **WHEN** a `wait` call starts and returns 2 entries, and later a push sends 1 entry
+- **WHEN** a `wait` call starts and returns 2 pending entries, and later a push sends 1 entry
 - **THEN** `subagents:wait` SHALL be emitted with `phase: "start"` and then `phase: "end", returned: 2`
 - **AND** `subagents:push` SHALL be emitted with `count: 1`
 

@@ -1605,7 +1605,7 @@ function spawnInBackground(
           type: "text",
           text:
             `Background limit reached: ${outstanding.length} of ${cap} background subagents are still queued or running ` +
-            `(${ids.join(", ")}). Wait for them with AgentControl({ action: "status", ids, wait: "any" }) or stop some with AgentControl({ action: "cancel", ids }).`,
+            `(${ids.join(", ")}). Wait for them with AgentControl({ action: "wait", ids, until: "any" }) or stop some with AgentControl({ action: "cancel", ids }).`,
         },
       ],
       details: { background: true, status: "rejected", counts: registry.counts(), outstanding: ids },

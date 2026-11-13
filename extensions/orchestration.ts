@@ -5,13 +5,15 @@
  * module-level):
  *   - the idle pool: finished background runs whose session stays alive for
  *     `steer`, freed by TTL, the idle cap, cancel or shutdown (D5);
- *   - the mailbox: `question` (from `ask_parent`) and `outcome` (every run
- *     end) entries, drained by the `wait` action or pushed to the parent as
- *     one batched follow-up (D7);
+ *   - the mailbox: a view over the registry, not a store. Pending = every
+ *     unread run result (`outcome`) and every undelivered `ask_parent`
+ *     question. The `wait` action and the batched push consume through one
+ *     path (`consume`), so nothing is delivered twice (see change:
+ *     agent-control-unified-wait, D2–D4);
  *   - pending asks: `ask_parent` blocks until `reply` (no timeout); stops
  *     settle it (D9);
  *   - the text the parent sees: full question form with reply instructions,
- *     short ask line for status/list (D14).
+ *     short ask line for progress lines and list (D14).
  *
  * Children stay in-memory; the parent JSONL is the only durable record
  * (each run end is persisted with `appendEntry`, D8).
@@ -21,15 +23,21 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 import type { DisposeReason, IdleHandle, LiveSession } from "./agent.js";
-import { askLineOf } from "./background-tools.js";
-import type { BackgroundRecord, BackgroundRegistry, RunResultLike } from "./background.js";
+import { askLineOf, emitResultRead } from "./background-tools.js";
+import {
+  type BackgroundRecord,
+  type BackgroundRegistry,
+  isTerminalStatus,
+  type LookupMiss,
+  type RunResultLike,
+} from "./background.js";
 
-/** Max undelivered mailbox entries; overflow drops the oldest outcome. */
-export const MAILBOX_MAX = 100;
 /** Outcome summary length in mailbox entries and pushes. */
 export const OUTCOME_SUMMARY_CHARS = 500;
 /** Default `wait` timeout. */
 export const DEFAULT_WAIT_MS = 300_000;
+/** Cap on a `wait` timeout. See change: agent-control-unified-wait (D7). */
+export const MAX_WAIT_MS = 600_000;
 /** Late arrivals joining a woken `wait`. */
 const WAIT_COALESCE_MS = 250;
 /** Push batching window. */
@@ -52,10 +60,20 @@ export interface MailEntry {
   ts: number;
 }
 
+/** `wait` return condition. See change: agent-control-unified-wait (D4). */
+export type WaitUntil = "none" | "any" | "all";
+
 export interface WaitResult {
+  /** Pending entries returned (and consumed). */
   entries: MailEntry[];
+  /** Children the call covered (explicit ids, or every live / asking / pending one). */
+  records: BackgroundRecord[];
+  /** Requested ids that resolved to no record. */
+  misses: Array<{ id: string; status: LookupMiss }>;
   timedOut: boolean;
   interrupted: boolean;
+  /** No covered child was queued, running or asking and nothing was pending. */
+  nothingToWait: boolean;
 }
 
 export type ReplyResult = "answered" | "not_pending" | "not_found" | "not_alive";
@@ -72,8 +90,6 @@ export interface OrchestratorOptions {
   maxIdle: () => number;
   /** Whether mailbox entries are pushed to the parent. Read per post. */
   notifyParent: () => boolean;
-  /** Mailbox bound (tests). */
-  maxMailbox?: number;
 }
 
 export interface Orchestrator {
@@ -97,10 +113,17 @@ export interface Orchestrator {
   reply(id: string, questionId: string, answer: string): ReplyResult;
   /** Settle (reject) every pending ask of `record`. */
   cancelAsks(record: BackgroundRecord): void;
-  /** Undelivered mailbox entries, oldest first. */
+  /** Pending entries (unread outcomes + undelivered questions), oldest first. */
   pending(): MailEntry[];
-  /** Block until entries for `ids` (or any) arrive; drains them. One at a time. */
-  wait(opts: { ids?: readonly string[]; timeoutMs?: number; signal?: AbortSignal }): Promise<WaitResult>;
+  /** Mark entries read / delivered; emits `subagents:result_read` for outcomes. */
+  consume(entries: readonly MailEntry[], via: "wait" | "push"): void;
+  /** Block per `until` over `ids` (or every live / pending child); consumes what it returns. One at a time. */
+  wait(opts: {
+    ids?: readonly string[];
+    until?: WaitUntil;
+    timeoutMs?: number;
+    signal?: AbortSignal;
+  }): Promise<WaitResult>;
   /** Parent-facing text for entries: full question form + outcomes (D14). */
   render(entries: readonly MailEntry[]): string;
   /** Short one-line ask form for status/list, or undefined when not asking. */
@@ -136,18 +159,17 @@ function outcomeOf(record: BackgroundRecord): OutcomeKind {
 
 export function createOrchestrator(opts: OrchestratorOptions): Orchestrator {
   const { pi, registry } = opts;
-  const maxMailbox = opts.maxMailbox ?? MAILBOX_MAX;
   /** Idle handles by record id, in park order (oldest first). */
   const idle = new Map<string, { record: BackgroundRecord; handle: IdleHandle; timer?: ReturnType<typeof setTimeout> }>();
-  /** Undelivered entries, oldest first. */
-  let mailbox: MailEntry[] = [];
+  /** Seq of each pending entry, by entry key (`o:<id>:<run>` / `q:<questionId>`). */
+  const seqs = new Map<string, number>();
   let seq = 0;
   let questionSeq = 0;
   const asks = new Map<
     string,
     { record: BackgroundRecord; resolve: (a: string) => void; reject: (e: Error) => void }
   >();
-  let waiter: { matches: (e: MailEntry) => boolean; wake: () => void } | undefined;
+  let waiter: { check: () => void } | undefined;
   let pushTimer: ReturnType<typeof setTimeout> | undefined;
   let shut = false;
   /** Live sessions of background subagents that may still run. */
@@ -172,42 +194,61 @@ export function createOrchestrator(opts: OrchestratorOptions): Orchestrator {
     }
   }
 
-  // ── mailbox ──
+  // ── mailbox (a view over the registry) ──
 
-  function removeQuestion(questionId: string): void {
-    mailbox = mailbox.filter((e) => e.questionId !== questionId);
-  }
+  const outcomeKey = (id: string, run: number) => `o:${id}:${run}`;
+  const questionKey = (questionId: string) => `q:${questionId}`;
 
-  function post(entry: Omit<MailEntry, "seq" | "ts">): void {
-    const full: MailEntry = { ...entry, seq: ++seq, ts: Date.now() };
-    mailbox.push(full);
-    emit(pi, "subagents:mail", {
-      id: full.id,
-      agentId: full.agentId,
-      seq: full.seq,
-      kind: full.kind,
-      ...(full.outcome ? { outcome: full.outcome } : {}),
-    });
-    while (mailbox.length > maxMailbox) {
-      const idx = mailbox.findIndex((e) => e.kind === "outcome");
-      if (idx === -1) break; // questions are never dropped
-      const [dropped] = mailbox.splice(idx, 1);
-      emit(pi, "subagents:mail_dropped", { id: dropped!.id, agentId: dropped!.agentId, seq: dropped!.seq });
+  /** Pending entries of one record: its unread result and undelivered question. */
+  function entriesOf(r: BackgroundRecord): MailEntry[] {
+    const out: MailEntry[] = [];
+    const cwd = r.cwd !== undefined ? { cwd: r.cwd } : {};
+    if (r.result && r.readAt === undefined && r.finishedRun !== undefined) {
+      out.push({
+        seq: seqs.get(outcomeKey(r.id, r.finishedRun)) ?? 0,
+        id: r.id,
+        agentId: r.agentId,
+        kind: "outcome",
+        outcome: outcomeOf(r),
+        text: cut(r.result.result, OUTCOME_SUMMARY_CHARS),
+        run: r.finishedRun,
+        ...cwd,
+        ts: r.result.finishedAt,
+      });
     }
-    if (waiter?.matches(full)) waiter.wake();
-    else schedulePush();
+    if (r.asking && r.asking.deliveredAt === undefined) {
+      out.push({
+        seq: seqs.get(questionKey(r.asking.questionId)) ?? 0,
+        id: r.id,
+        agentId: r.agentId,
+        kind: "question",
+        questionId: r.asking.questionId,
+        text: r.asking.question,
+        run: r.run,
+        ...cwd,
+        ts: r.asking.askedAt,
+      });
+    }
+    return out;
   }
 
-  function take(matches: (e: MailEntry) => boolean): MailEntry[] {
-    const out = mailbox.filter(matches);
-    mailbox = mailbox.filter((e) => !matches(e));
-    return out;
+  function pendingOf(records: readonly BackgroundRecord[]): MailEntry[] {
+    return records.flatMap(entriesOf).sort((x, y) => x.seq - y.seq);
+  }
+
+  /** An entry just became pending: number it, announce it, wake the waiter or schedule a push. */
+  function announce(record: BackgroundRecord, key: string, kind: MailEntry["kind"], outcome?: OutcomeKind): void {
+    const n = ++seq;
+    seqs.set(key, n);
+    emit(pi, "subagents:mail", { id: record.id, agentId: record.agentId, seq: n, kind, ...(outcome ? { outcome } : {}) });
+    if (waiter) waiter.check();
+    else schedulePush();
   }
 
   // ── push ──
 
   function schedulePush(): void {
-    if (shut || waiter || pushTimer || mailbox.length === 0 || !opts.notifyParent()) return;
+    if (shut || waiter || pushTimer || !opts.notifyParent() || self.pending().length === 0) return;
     pushTimer = setTimeout(flushPush, PUSH_BATCH_MS);
     (pushTimer as { unref?: () => void }).unref?.();
   }
@@ -215,25 +256,22 @@ export function createOrchestrator(opts: OrchestratorOptions): Orchestrator {
   function flushPush(): void {
     pushTimer = undefined;
     if (shut || waiter || !opts.notifyParent()) return;
-    const entries = take(() => true);
+    const entries = self.pending();
     if (entries.length === 0) return;
-    const seqs = entries.map((e) => e.seq);
+    const seqList = entries.map((e) => e.seq);
+    const content = `Background subagent updates:\n\n${self.render(entries)}`;
+    self.consume(entries, "push");
     try {
       // followUp never interrupts a streaming parent; triggerTurn only
       // starts a turn when the parent is idle (pi semantics).
       pi.sendMessage(
-        {
-          customType: "subagents:mail",
-          content: `Background subagent updates:\n\n${self.render(entries)}`,
-          display: true,
-          details: { seqs },
-        },
+        { customType: "subagents:mail", content, display: true, details: { seqs: seqList } },
         { deliverAs: "followUp", triggerTurn: true },
       );
     } catch (err) {
       console.warn("[pi-dashboard-subagents] push to parent failed:", err instanceof Error ? err.message : err);
     }
-    emit(pi, "subagents:push", { seqs, count: entries.length, triggerTurn: true });
+    emit(pi, "subagents:push", { seqs: seqList, count: entries.length, triggerTurn: true });
   }
 
   // ── persistence ──
@@ -259,15 +297,7 @@ export function createOrchestrator(opts: OrchestratorOptions): Orchestrator {
       if (!registry.finish(record, result, { idle: handle !== undefined })) return;
       if (!handle) live.delete(record.id);
       persistRun(record, result);
-      post({
-        id: record.id,
-        agentId: record.agentId,
-        kind: "outcome",
-        outcome: outcomeOf(record),
-        text: cut(record.result?.result ?? "", OUTCOME_SUMMARY_CHARS),
-        run: record.run,
-        ...(record.cwd !== undefined ? { cwd: record.cwd } : {}),
-      });
+      announce(record, outcomeKey(record.id, record.run), "outcome", outcomeOf(record));
       if (!handle) return;
       const ttlSec = opts.idleTtlSec();
       const timer =
@@ -320,15 +350,7 @@ export function createOrchestrator(opts: OrchestratorOptions): Orchestrator {
       answer.catch(() => {}); // the caller awaits; never an unhandled rejection
       record.asking = { questionId, question, askedAt: Date.now() };
       emit(pi, "subagents:question", { id: record.id, agentId: record.agentId, question_id: questionId, run: record.run });
-      post({
-        id: record.id,
-        agentId: record.agentId,
-        kind: "question",
-        questionId,
-        text: question,
-        run: record.run,
-        ...(record.cwd !== undefined ? { cwd: record.cwd } : {}),
-      });
+      announce(record, questionKey(questionId), "question");
       return { questionId, answer };
     },
 
@@ -342,7 +364,7 @@ export function createOrchestrator(opts: OrchestratorOptions): Orchestrator {
       }
       asks.delete(questionId);
       if (hit.asking?.questionId === questionId) hit.asking = undefined;
-      removeQuestion(questionId);
+      seqs.delete(questionKey(questionId));
       emit(pi, "subagents:answer", { id: hit.id, agentId: hit.agentId, question_id: questionId, via: "reply" });
       ask.resolve(answer);
       return "answered";
@@ -352,7 +374,7 @@ export function createOrchestrator(opts: OrchestratorOptions): Orchestrator {
       for (const [questionId, ask] of [...asks]) {
         if (ask.record !== record) continue;
         asks.delete(questionId);
-        removeQuestion(questionId);
+        seqs.delete(questionKey(questionId));
         emit(pi, "subagents:answer", {
           id: record.id,
           agentId: record.agentId,
@@ -365,54 +387,94 @@ export function createOrchestrator(opts: OrchestratorOptions): Orchestrator {
     },
 
     pending() {
-      return mailbox.slice();
+      return pendingOf(registry.list());
     },
 
-    wait({ ids, timeoutMs = DEFAULT_WAIT_MS, signal }) {
+    consume(entries, via) {
+      for (const e of entries) {
+        const rec = registry.lookup(e.id);
+        if (typeof rec === "string") continue;
+        if (e.kind === "outcome") {
+          seqs.delete(outcomeKey(e.id, e.run));
+          if (rec.result && rec.readAt === undefined) {
+            registry.markRead(rec);
+            emitResultRead(pi, rec, via);
+          }
+        } else if (e.questionId) {
+          seqs.delete(questionKey(e.questionId));
+          if (rec.asking?.questionId === e.questionId) rec.asking.deliveredAt = Date.now();
+        }
+      }
+    },
+
+    wait({ ids, until = "any", timeoutMs = DEFAULT_WAIT_MS, signal }) {
       if (waiter) return Promise.reject(new Error("wait_in_progress: another AgentControl wait is already blocking"));
-      let matches: (e: MailEntry) => boolean = () => true;
+      const misses: WaitResult["misses"] = [];
+      let fixed: BackgroundRecord[] | undefined;
       if (ids && ids.length > 0) {
-        const wanted = new Set<string>();
+        fixed = [];
         for (const id of ids) {
           const hit = registry.lookup(id);
-          if (typeof hit !== "string") wanted.add(hit.id);
+          if (typeof hit === "string") misses.push({ id, status: hit });
+          else if (!fixed.includes(hit)) fixed.push(hit);
         }
-        matches = (e) => wanted.has(e.id);
       }
+      const isLive = (r: BackgroundRecord) => r.status === "queued" || r.status === "running";
+      const covered = (): BackgroundRecord[] =>
+        fixed ?? registry.list().filter((r) => isLive(r) || r.asking !== undefined || entriesOf(r).length > 0);
+      /** now = return immediately; soon = after the coalesce window; block = keep waiting (D4). */
+      const verdict = (): "now" | "soon" | "block" => {
+        if (until === "none" || (fixed && fixed.length === 0)) return "now";
+        const cov = covered();
+        if (cov.some((r) => r.asking !== undefined)) return "soon";
+        const pend = cov.some((r) => entriesOf(r).length > 0);
+        if (until === "any" && pend) return "soon";
+        if (until === "all" && cov.length > 0 && cov.every((r) => r.status === "idle" || isTerminalStatus(r.status))) {
+          return "soon";
+        }
+        if (!cov.some(isLive) && !pend) return "now";
+        return "block";
+      };
       emit(pi, "subagents:wait", { phase: "start", ...(ids && ids.length > 0 ? { ids: [...ids] } : {}) });
       return new Promise<WaitResult>((resolve) => {
         // Timers live in one holder: early-return paths call `finish` before
         // they are armed.
         const timers: { main?: ReturnType<typeof setTimeout>; coalesce?: ReturnType<typeof setTimeout> } = {};
+        let unsubscribe: () => void = () => {};
+        let settled = false;
         const finish = (timedOut: boolean, interrupted: boolean): void => {
+          if (settled) return;
+          settled = true;
           if (timers.main) clearTimeout(timers.main);
           if (timers.coalesce) clearTimeout(timers.coalesce);
+          unsubscribe();
           signal?.removeEventListener("abort", onAbort);
           waiter = undefined;
-          const entries = interrupted ? [] : take(matches);
+          const records = covered();
+          const entries = interrupted ? [] : pendingOf(records);
+          self.consume(entries, "wait");
+          const nothingToWait =
+            !timedOut && !interrupted && entries.length === 0 && !records.some((r) => isLive(r) || r.asking !== undefined);
           emit(pi, "subagents:wait", { phase: "end", returned: entries.length, timedOut });
-          resolve({ entries, timedOut, interrupted });
+          resolve({ entries, records, misses, timedOut, interrupted, nothingToWait });
           schedulePush(); // leftovers for other children
         };
         const onAbort = (): void => finish(false, true);
-        if (signal?.aborted) {
-          waiter = { matches, wake: () => {} };
-          return finish(false, true);
-        }
-        if (mailbox.some(matches)) {
-          waiter = { matches, wake: () => {} };
-          return finish(false, false);
-        }
-        waiter = {
-          matches,
-          wake: () => {
-            if (!timers.coalesce) timers.coalesce = setTimeout(() => finish(false, false), WAIT_COALESCE_MS);
-          },
+        const check = (): void => {
+          const v = verdict();
+          if (v === "now") finish(false, false);
+          else if (v === "soon" && !timers.coalesce) {
+            timers.coalesce = setTimeout(() => finish(false, false), WAIT_COALESCE_MS);
+          }
         };
+        waiter = { check };
+        if (signal?.aborted) return finish(false, true);
+        if (verdict() !== "block") return finish(false, false);
         if (pushTimer) {
           clearTimeout(pushTimer);
           pushTimer = undefined;
         }
+        unsubscribe = registry.subscribe(check);
         signal?.addEventListener("abort", onAbort, { once: true });
         timers.main = setTimeout(() => finish(true, false), timeoutMs);
       });
@@ -434,8 +496,12 @@ export function createOrchestrator(opts: OrchestratorOptions): Orchestrator {
         } else {
           const rec = registry.lookup(e.id);
           const isIdle = typeof rec !== "string" && rec.status === "idle";
+          const latest = typeof rec !== "string" ? rec.latest : undefined;
+          const usage =
+            (latest?.turnCount !== undefined ? ` · ${latest.turnCount} turns` : "") +
+            (latest?.tokens ? ` · ${latest.tokens} tokens` : "");
           lines.push(
-            `${e.outcome === "done" ? "✓" : e.outcome === "stopped" ? "■" : "✗"} ${e.id} ${e.outcome} (run ${e.run}${where}): ${e.text}` +
+            `${e.outcome === "done" ? "✓" : e.outcome === "stopped" ? "■" : "✗"} ${e.id} ${e.outcome} (run ${e.run}${usage}${where}): ${e.text}` +
               (isIdle
                 ? `\n  → continue it: AgentControl({ action: "steer", id: "${e.id}", message: "…", mode: "followUp" })`
                 : ""),

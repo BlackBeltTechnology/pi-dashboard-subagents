@@ -1,7 +1,8 @@
 /**
- * Handlers over the per-activation background registry for the `status`,
- * `messages`, `list` and `cancel` actions of `AgentControl` (formerly four
- * separate tools; see change: add-subagent-orchestration, D0). The
+ * Handlers over the per-activation background registry for the `messages`,
+ * `list` and `cancel` actions of `AgentControl` (formerly separate tools; see
+ * change: add-subagent-orchestration, D0), plus the shared `progressLine`
+ * (see change: agent-control-unified-wait). The
  * `makeAgent*Tool` factories build the handlers; they are no longer
  * registered on their own.
  *
@@ -12,7 +13,7 @@
  */
 import { Type } from "@sinclair/typebox";
 
-import { type AgentToolUpdateCallback, defineTool, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { defineTool, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 import { formatRetryDelay, type SubagentTimelineEntry } from "./events.js";
 import { getResultLimits } from "./settings.js";
@@ -125,16 +126,6 @@ export function summaryOf(record: BackgroundRecord, now = Date.now()): Backgroun
   };
 }
 
-/** Resolve one id into a record or a `not_found` / `ambiguous` status row. */
-export function resolveStatus(
-  registry: BackgroundRegistry,
-  id: string,
-): { record: BackgroundRecord } | { miss: BackgroundAgentStatus } {
-  const hit = registry.lookup(id);
-  if (typeof hit === "string") return { miss: { id: String(id), status: hit } };
-  return { record: hit };
-}
-
 /** Paged, kind-filtered view of a record's timeline (design D6). */
 export function messagesPage(
   record: BackgroundRecord,
@@ -201,71 +192,58 @@ function entryLine(e: SubagentTimelineEntry, index: number): string {
   }
 }
 
-function statusBlock(s: BackgroundAgentStatus): string {
-  const head = [
+/** Last assistant text shown in a progress line, chars. */
+const LAST_TEXT_CHARS = 200;
+
+/** Tail of the latest `text` timeline entry, whitespace-collapsed, or undefined. */
+function lastTextTail(record: BackgroundRecord): string | undefined {
+  for (let i = record.entries.length - 1; i >= 0; i--) {
+    const e = record.entries[i]!;
+    if (e.kind !== "text") continue;
+    const t = e.text.replace(/\s+/g, " ").trim();
+    if (!t) return undefined;
+    return t.length <= LAST_TEXT_CHARS ? t : `…${t.slice(t.length - (LAST_TEXT_CHARS - 1))}`;
+  }
+  return undefined;
+}
+
+/**
+ * One-line progress view of a subagent: id, status, type, run, turn, cwd,
+ * short ask form, activity, tokens and (while running) the tail of its latest
+ * assistant text. Shared by `wait` (updates and blocks), `steer`, `reply`,
+ * `cancel`. See change: agent-control-unified-wait (D5).
+ */
+export function progressLine(record: BackgroundRecord, now = Date.now()): string {
+  const s = statusOf(record);
+  const ask = askLineOf(record, now);
+  const tail = record.status === "running" ? lastTextTail(record) : undefined;
+  return [
     `${s.id}: ${s.status}`,
     s.subagent_type ? `(${s.subagent_type}${s.description ? ` — ${s.description}` : ""})` : "",
     s.queuePosition !== undefined ? `queued #${s.queuePosition}` : "",
     s.run !== undefined ? `run ${s.run}` : "",
     s.turns !== undefined ? `turn ${s.turns}` : "",
     s.cwd ? `cwd ${s.cwd}` : "",
-    s.asking ?? "",
+    ask ?? "",
     s.activity ? `▸ ${s.activity}` : "",
     s.stoppedBy ? `stopped by ${s.stoppedBy}` : "",
     s.tokens ? `${s.tokens} tokens` : "",
+    tail ? `“${tail}”` : "",
   ]
     .filter(Boolean)
     .join(" ");
-  if (s.status === "not_found") return `${s.id}: not_found (no such background subagent in this session; results do not survive /reload)`;
-  if (s.status === "ambiguous") return `${s.id}: ambiguous (matches several subagents; use a longer id)`;
-  if (s.result === undefined) return head;
-  return `${head}\n${s.error && !s.result ? `error: ${s.error}` : s.result}`;
 }
 
-// ─── Waiting ──────────────────────────────────────────────────────────────
-
-/**
- * Resolve when `done()` is true, the timeout elapses or `signal` aborts.
- * Re-checks on every registry change. Never cancels any subagent.
- */
-function waitFor(
-  registry: BackgroundRegistry,
-  done: () => boolean,
-  timeoutMs: number | undefined,
-  signal: AbortSignal | undefined,
-  onChange?: () => void,
-): Promise<{ timedOut: boolean; interrupted: boolean }> {
-  return new Promise((resolve) => {
-    if (done()) return resolve({ timedOut: false, interrupted: false });
-    if (signal?.aborted) return resolve({ timedOut: false, interrupted: true });
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    let settled = false;
-    const finish = (r: { timedOut: boolean; interrupted: boolean }) => {
-      if (settled) return;
-      settled = true;
-      unsubscribe();
-      if (timer) clearTimeout(timer);
-      signal?.removeEventListener("abort", onAbort);
-      resolve(r);
-    };
-    const onAbort = () => finish({ timedOut: false, interrupted: true });
-    const unsubscribe = registry.subscribe(() => {
-      if (done()) finish({ timedOut: false, interrupted: false });
-      else onChange?.();
-    });
-    signal?.addEventListener("abort", onAbort, { once: true });
-    if (timeoutMs !== undefined && timeoutMs > 0) {
-      timer = setTimeout(() => finish({ timedOut: true, interrupted: false }), timeoutMs);
-    }
-  });
+/** Text for an id that resolves to no record. */
+export function missLine(id: string, miss: "not_found" | "ambiguous" | "not_alive"): string {
+  if (miss === "ambiguous") return `${id}: ambiguous (matches several subagents; use a longer id)`;
+  if (miss === "not_alive") return `${id}: not_alive (no live session: freed, or the session was reloaded)`;
+  return `${id}: not_found (no such background subagent in this session; results do not survive /reload)`;
 }
-
-/** Default `status` wait cap, seconds. See change: add-subagent-orchestration. */
-export const DEFAULT_STATUS_WAIT_S = 300;
 
 // ─── result_read ──────────────────────────────────────────────────────────
 
-export function emitResultRead(pi: ExtensionAPI, record: BackgroundRecord, via: "status" | "messages"): void {
+export function emitResultRead(pi: ExtensionAPI, record: BackgroundRecord, via: "wait" | "push" | "messages"): void {
   try {
     pi.events?.emit("subagents:result_read", { id: record.id, agentId: record.agentId, via });
   } catch {
@@ -277,106 +255,15 @@ export function emitResultRead(pi: ExtensionAPI, record: BackgroundRecord, via: 
 
 type ToolResult<D> = { content: Array<{ type: "text"; text: string }>; details: D; isError?: boolean };
 
+/**
+ * @deprecated The `status` action was folded into `wait`; kept so plugin type
+ * imports keep compiling. See change: agent-control-unified-wait.
+ */
 export interface AgentStatusDetails {
   agents: BackgroundAgentStatus[];
   counts: BackgroundCounts;
   timedOut?: boolean;
   interrupted?: boolean;
-}
-
-/** Build the `AgentStatus` report for `ids`, marking terminal results read. */
-export function readStatuses(
-  pi: ExtensionAPI,
-  registry: BackgroundRegistry,
-  ids: readonly string[],
-  markRead: boolean,
-): BackgroundAgentStatus[] {
-  return ids.map((id) => {
-    const r = resolveStatus(registry, id);
-    if ("miss" in r) return r.miss;
-    if (markRead && r.record.result) {
-      registry.markRead(r.record);
-      emitResultRead(pi, r.record, "status");
-    }
-    return statusOf(r.record);
-  });
-}
-
-export function makeAgentStatusTool(pi: ExtensionAPI, registry: BackgroundRegistry) {
-  return defineTool({
-    name: "AgentStatus",
-    label: "AgentStatus",
-    description:
-      "Report the status (and stored result, once finished) of background subagents by id (`bg-…`, full agentId, or unique prefix). " +
-      'wait: "none" (default) returns at once; "any" returns when at least one is finished; "all" when all are. ' +
-      "timeout_s caps the wait and never cancels anything.",
-    parameters: Type.Object({
-      ids: Type.Array(Type.String(), { minItems: 1, description: "Background subagent ids." }),
-      wait: Type.Optional(
-        Type.Union([Type.Literal("none"), Type.Literal("any"), Type.Literal("all")], {
-          description: 'How long to block: "none" (default), "any" or "all".',
-        }),
-      ),
-      timeout_s: Type.Optional(Type.Number({ description: "Maximum seconds to wait; the subagents keep running." })),
-    }),
-
-    async execute(
-      _toolCallId: string,
-      rawParams: Record<string, unknown>,
-      signal: AbortSignal | undefined,
-      onUpdate: AgentToolUpdateCallback<AgentStatusDetails> | undefined,
-    ): Promise<ToolResult<AgentStatusDetails>> {
-      const params = rawParams as { ids?: unknown; wait?: unknown; timeout_s?: unknown };
-      const ids = (Array.isArray(params.ids) ? params.ids : [params.ids]).filter(
-        (x): x is string => typeof x === "string" && x.trim() !== "",
-      );
-      const wait = params.wait === "any" || params.wait === "all" ? params.wait : "none";
-      // A parent wait never blocks forever: 300 s default (design D7).
-      const timeoutS =
-        typeof params.timeout_s === "number" && params.timeout_s > 0
-          ? params.timeout_s
-          : wait !== "none"
-            ? DEFAULT_STATUS_WAIT_S
-            : undefined;
-
-      const records = ids
-        .map((id) => registry.lookup(id))
-        .filter((r): r is BackgroundRecord => typeof r !== "string");
-      // Idle = the current run finished; counts as done (D5).
-      const terminal = (r: BackgroundRecord) =>
-        (r.status === "idle" || isTerminalStatus(r.status)) && r.result !== undefined;
-      let timedOut = false;
-      let interrupted = false;
-      if (wait !== "none" && records.length > 0) {
-        const done = () => (wait === "all" ? records.every(terminal) : records.some(terminal));
-        const snapshot = (): AgentStatusDetails => ({
-          agents: readStatuses(pi, registry, ids, false),
-          counts: registry.counts(),
-        });
-        const res = await waitFor(registry, done, timeoutS !== undefined ? timeoutS * 1000 : undefined, signal, () => {
-          if (onUpdate) {
-            const d = snapshot();
-            onUpdate({ content: [{ type: "text", text: d.agents.map(statusBlock).join("\n") }], details: d });
-          }
-        });
-        timedOut = res.timedOut;
-        interrupted = res.interrupted;
-      }
-
-      const agents = readStatuses(pi, registry, ids, true);
-      const counts = registry.counts();
-      const notes = [
-        timedOut ? `(wait timed out after ${timeoutS}s; nothing was cancelled)` : "",
-        interrupted ? "(wait interrupted; the subagents keep running)" : "",
-        `Background: ${countsLine(counts)}.`,
-      ].filter(Boolean);
-      const text = boundText([...agents.map(statusBlock), ...notes].join("\n\n"), getResultLimits().resultMaxChars);
-      return {
-        content: [{ type: "text", text }],
-        details: { agents, counts, ...(timedOut ? { timedOut } : {}), ...(interrupted ? { interrupted } : {}) },
-      };
-    },
-  });
 }
 
 export function makeAgentMessagesTool(pi: ExtensionAPI, registry: BackgroundRegistry) {
@@ -403,7 +290,7 @@ export function makeAgentMessagesTool(pi: ExtensionAPI, registry: BackgroundRegi
       const hit = registry.lookup(id);
       if (typeof hit === "string") {
         return {
-          content: [{ type: "text", text: statusBlock({ id, status: hit }) }],
+          content: [{ type: "text", text: missLine(id, hit) }],
           details: { id, status: hit },
           isError: true,
         };
@@ -519,8 +406,11 @@ export function makeAgentCancelTool(registry: BackgroundRegistry, stopAgent: Sto
         return { id, outcome: stopAgent(record.agentId, "tool") ? ("stopped" as const) : ("already_finished" as const) };
       });
       const counts = registry.counts();
+      const progress = targets.flatMap(({ record }) => (record ? [progressLine(record)] : []));
       const text = results.length
-        ? `${results.map((r) => `${r.id}: ${r.outcome}`).join("\n")}\n\nBackground: ${countsLine(counts)}.`
+        ? [results.map((r) => `${r.id}: ${r.outcome}`).join("\n"), progress.join("\n"), `Background: ${countsLine(counts)}.`]
+            .filter(Boolean)
+            .join("\n\n")
         : `Nothing to cancel. Background: ${countsLine(counts)}.`;
       return { content: [{ type: "text", text }], details: { results, counts } };
     },

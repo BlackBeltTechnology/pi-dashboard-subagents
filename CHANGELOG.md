@@ -6,6 +6,18 @@ All notable changes to this package are documented here. Format follows
 
 ## [Unreleased]
 
+### Changed
+
+- **BREAKING: `AgentControl` `status` is folded into `wait`.** One action reports on and waits for background subagents: `wait {ids?, until?: "none" | "any" | "all", timeout_s?}`. `none` = snapshot, `any` (default) = first result or question, `all` = every covered child finished its run. Calling `status` returns an error with the migration (`status {ids}` → `wait {ids, until: "none"}`, `wait: "any"|"all"` → `until`). `details.agents` keeps the former per-agent shape. See change: agent-control-unified-wait.
+- **BREAKING: the mailbox is a view over the registry.** Pending = unread run results + undelivered questions; `wait` and the push consume through one read point, so a result is never delivered twice. Nothing is dropped any more: `subagents:mail_dropped` is no longer emitted (type kept, deprecated). `subagents:result_read` reports `via: "wait" | "push" | "messages"` (`"status"` is gone).
+- `wait` streams live progress while blocking (status, run, turn, activity, tokens, tail of the latest text; at most 1 update/s) and returns one block per child: progress line, then the full result or the question with its reply call.
+- `steer`, `reply` and `cancel` returns end with the progress line of every child they touched. Pushed and returned outcome lines show `· N turns · T tokens`.
+- `wait` `timeout_s` defaults to 300 and is capped at 600 (larger values are clamped and the return says so).
+
+### Fixed
+
+- `wait` no longer blocks for the whole `timeout_s` when no subagent is queued or running: it returns at once ("nothing to wait for"), also when `ids` match nothing, when a covered child is asking, or when the last covered child stops while waiting.
+
 ## [0.8.0] - 2026-11-12
 
 ### Added
